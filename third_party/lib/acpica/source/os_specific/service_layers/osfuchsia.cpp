@@ -12,13 +12,17 @@
 #include <pthread.h>
 
 #include <hw/inout.h>
+#include <pci/pio.h>
 #include <zircon/assert.h>
 #include <zircon/process.h>
 #include <zircon/syscalls.h>
 #include <zircon/thread_annotations.h>
 #include <zxcpp/new.h>
+#include <fbl/alloc_checker.h>
 #include <fbl/auto_lock.h>
 #include <fbl/intrusive_hash_table.h>
+#include <fbl/intrusive_double_list.h>
+#include <fbl/intrusive_single_list.h>
 #include <fbl/unique_ptr.h>
 
 #if !defined(__x86_64__) && !defined(__x86__)
@@ -37,11 +41,30 @@ ACPI_MODULE_NAME    ("oszircon")
 #define TRACEF(str, x...) do { printf("%s:%d: " str, __FUNCTION__, __LINE__, ## x); } while (0)
 #define LTRACEF(x...) do { if (LOCAL_TRACE) { TRACEF(x); } } while (0)
 
+/* Structures used for implementing AcpiOsExecute and
+ * AcpiOsWaitEventsComplete */
+struct AcpiOsTaskCtx : public fbl::DoublyLinkedListable<fbl::unique_ptr<AcpiOsTaskCtx>> {
+    ACPI_OSD_EXEC_CALLBACK func;
+    void *ctx;
+};
+
+/* Thread function for implementing AcpiOsExecute */
+static int AcpiOsExecuteTask(void *arg);
+/* Tear down the OsExecuteTask thread */
+static void ShutdownOsExecuteTask();
+
 /* Data used for implementing AcpiOsExecute and
  * AcpiOsWaitEventsComplete */
-static mtx_t os_execute_lock = MTX_INIT;
-static cnd_t os_execute_cond;
-static int os_execute_tasks = 0;
+static struct {
+    thrd_t thread;
+    cnd_t cond;
+    cnd_t idle_cond;
+    mtx_t lock = MTX_INIT;
+    bool shutdown = false;
+    bool idle = true;
+
+    fbl::DoublyLinkedList<fbl::unique_ptr<AcpiOsTaskCtx>> tasks;
+} os_execute_state;
 
 class AcpiOsMappingNode :
       public fbl::SinglyLinkedListable<fbl::unique_ptr<AcpiOsMappingNode>> {
@@ -100,9 +123,9 @@ static zx_status_t mmap_physical(zx_paddr_t phys, size_t size, uint32_t cache_po
         zx_handle_close(vmo);
         return st;
     }
-    st = zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size,
-                     ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE | ZX_VM_FLAG_MAP_RANGE,
-                     &vaddr);
+    st = zx_vmar_map(zx_vmar_root_self(),
+                     ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_MAP_RANGE,
+                     0, vmo, 0, size, &vaddr);
     if (st != ZX_OK) {
         zx_handle_close(vmo);
         return st;
@@ -177,12 +200,24 @@ void acpica_disable_noncontested_mode() {
  */
 ACPI_STATUS AcpiOsInitialize() {
     ACPI_STATUS status = thrd_status_to_acpi_status(
-            cnd_init(&os_execute_cond));
+            cnd_init(&os_execute_state.cond));
     if (status != AE_OK) {
         return status;
     }
+    status = thrd_status_to_acpi_status(cnd_init(&os_execute_state.idle_cond));
+    if (status != AE_OK) {
+        cnd_destroy(&os_execute_state.cond);
+        return status;
+    }
+
+    status = thrd_status_to_acpi_status(thrd_create(&os_execute_state.thread, AcpiOsExecuteTask,
+                                                    nullptr));
+    if (status != AE_OK) {
+        return status;
+    }
+
     /* TODO(teisenbe): be less permissive */
-    zx_mmap_device_io(root_resource_handle, 0, 65536);
+    zx_ioports_request(root_resource_handle, 0, 65536);
     return AE_OK;
 }
 
@@ -195,7 +230,9 @@ ACPI_STATUS AcpiOsInitialize() {
  * @return Termination status
  */
 ACPI_STATUS AcpiOsTerminate() {
-    cnd_destroy(&os_execute_cond);
+    ShutdownOsExecuteTask();
+    cnd_destroy(&os_execute_state.cond);
+    cnd_destroy(&os_execute_state.idle_cond);
 
     return AE_OK;
 }
@@ -206,14 +243,14 @@ ACPI_STATUS AcpiOsTerminate() {
  * @return The physical address of the RSDP
  */
 ACPI_PHYSICAL_ADDRESS AcpiOsGetRootPointer() {
-    ACPI_PHYSICAL_ADDRESS TableAddress = 0;
-    ACPI_STATUS status = AcpiFindRootPointer(&TableAddress);
-
-    uint32_t uefi_rsdp = (uint32_t)zx_acpi_uefi_rsdp(root_resource_handle);
-    if (uefi_rsdp != 0) {
-        return uefi_rsdp;
+    zx_paddr_t acpi_rsdp, smbios;
+    zx_status_t zx_status = zx_pc_firmware_tables(root_resource_handle, &acpi_rsdp, &smbios);
+    if (zx_status == ZX_OK && acpi_rsdp != 0) {
+        return acpi_rsdp;
     }
 
+    ACPI_PHYSICAL_ADDRESS TableAddress = 0;
+    ACPI_STATUS status = AcpiFindRootPointer(&TableAddress);
     if (status != AE_OK) {
         return 0;
     }
@@ -442,27 +479,39 @@ ACPI_THREAD_ID AcpiOsGetThreadId() {
     return (uintptr_t)thrd_current();
 }
 
-/* Structures used for implementing AcpiOsExecute and
- * AcpiOsWaitEventsComplete */
-struct acpi_os_task_ctx {
-    ACPI_OSD_EXEC_CALLBACK func;
-    void *ctx;
-};
+static int AcpiOsExecuteTask(void *arg) {
+    while (1)  {
+        fbl::unique_ptr<AcpiOsTaskCtx> task;
 
-static int acpi_os_task(void *raw_ctx) {
-    struct acpi_os_task_ctx *ctx = (struct acpi_os_task_ctx*)raw_ctx;
+        mtx_lock(&os_execute_state.lock);
+        while ((task = os_execute_state.tasks.pop_front()) == nullptr) {
+            os_execute_state.idle = true;
+            // If anything is waiting for the queue to empty, notify it.
+            cnd_signal(&os_execute_state.idle_cond);
 
-    ctx->func(ctx->ctx);
+            // If we're waiting to shutdown, do it now that there's no more work
+            if (os_execute_state.shutdown) {
+                mtx_unlock(&os_execute_state.lock);
+                return 0;
+            }
 
-    mtx_lock(&os_execute_lock);
-    os_execute_tasks--;
-    if (os_execute_tasks == 0) {
-        cnd_broadcast(&os_execute_cond);
+            cnd_wait(&os_execute_state.cond, &os_execute_state.lock);
+        }
+        os_execute_state.idle = false;
+        mtx_unlock(&os_execute_state.lock);
+
+        task->func(task->ctx);
     }
-    mtx_unlock(&os_execute_lock);
 
-    free(ctx);
     return 0;
+}
+
+static void ShutdownOsExecuteTask() {
+    mtx_lock(&os_execute_state.lock);
+    os_execute_state.shutdown = true;
+    mtx_unlock(&os_execute_state.lock);
+    cnd_broadcast(&os_execute_state.cond);
+    thrd_join(os_execute_state.thread, nullptr);
 }
 
 /**
@@ -496,34 +545,19 @@ ACPI_STATUS AcpiOsExecute(
         default: return AE_BAD_PARAMETER;
     }
 
-    struct acpi_os_task_ctx *ctx = (struct acpi_os_task_ctx*)malloc(sizeof(*ctx));
-    if (!ctx) {
+    fbl::AllocChecker ac;
+    fbl::unique_ptr<AcpiOsTaskCtx> task(new (&ac) AcpiOsTaskCtx);
+    if (!ac.check()) {
         return AE_NO_MEMORY;
     }
-    ctx->func = Function;
-    ctx->ctx = Context;
+    task->func = Function;
+    task->ctx = Context;
 
-    mtx_lock(&os_execute_lock);
-    os_execute_tasks++;
-    mtx_unlock(&os_execute_lock);
+    mtx_lock(&os_execute_state.lock);
+    os_execute_state.tasks.push_back(fbl::move(task));
+    mtx_unlock(&os_execute_state.lock);
+    cnd_signal(&os_execute_state.cond);
 
-    // TODO(teisenbe): Instead of spawning a thread each time for this,
-    // we should back this with a thread pool.
-    thrd_t thread;
-    ACPI_STATUS status = thrd_status_to_acpi_status(
-            thrd_create(&thread, acpi_os_task, ctx));
-    if (status != AE_OK) {
-        free(ctx);
-        mtx_lock(&os_execute_lock);
-        os_execute_tasks--;
-        if (os_execute_tasks == 0) {
-            cnd_broadcast(&os_execute_cond);
-        }
-        mtx_unlock(&os_execute_lock);
-        return status;
-    }
-
-    thrd_detach(thread);
     return AE_OK;
 }
 
@@ -534,11 +568,11 @@ ACPI_STATUS AcpiOsExecute(
  * AcpiOsExecute have completed.
  */
 void AcpiOsWaitEventsComplete(void) {
-    mtx_lock(&os_execute_lock);
-    while (os_execute_tasks > 0) {
-        cnd_wait(&os_execute_cond, &os_execute_lock);
+    mtx_lock(&os_execute_state.lock);
+    while (!os_execute_state.idle) {
+        cnd_wait(&os_execute_state.idle_cond, &os_execute_state.lock);
     }
-    mtx_unlock(&os_execute_lock);
+    mtx_unlock(&os_execute_state.lock);
 }
 
 /**
@@ -820,25 +854,26 @@ void AcpiOsReleaseLock(ACPI_SPINLOCK Handle, ACPI_CPU_FLAGS Flags) TA_REL(Handle
 
 // Wrapper structs for interfacing between our interrupt handler convention and
 // ACPICA's
-struct acpi_irq_thread_arg {
+struct AcpiIrqThread {
+    thrd_t thread;
     ACPI_OSD_HANDLER handler;
     zx_handle_t irq_handle;
     void *context;
 };
-static int acpi_irq_thread(void *arg) {
-    struct acpi_irq_thread_arg *real_arg = (struct acpi_irq_thread_arg *)arg;
+static int acpi_irq_thread(void* arg) {
+    auto real_arg = static_cast<AcpiIrqThread*>(arg);
     while (1) {
-        uint64_t slots;
-        zx_status_t status = zx_interrupt_wait(real_arg->irq_handle, &slots);
+        zx_status_t status = zx_interrupt_wait(real_arg->irq_handle, NULL);
         if (status != ZX_OK) {
-            continue;
+            break;
         }
-
         // TODO: Should we do something with the return value from the handler?
         real_arg->handler(real_arg->context);
     }
     return 0;
 }
+
+static fbl::unique_ptr<AcpiIrqThread> sci_irq;
 
 /**
  * @brief Install a handler for a hardware interrupt.
@@ -874,37 +909,28 @@ ACPI_STATUS AcpiOsInstallInterruptHandler(
 
     assert(InterruptLevel == 0x9); // SCI
 
-    struct acpi_irq_thread_arg *arg = (struct acpi_irq_thread_arg*)malloc(sizeof(*arg));
-    if (!arg) {
+    fbl::AllocChecker ac;
+    fbl::unique_ptr<AcpiIrqThread> arg(new (&ac) AcpiIrqThread());
+    if (!ac.check()) {
         return AE_NO_MEMORY;
     }
 
     zx_handle_t handle;
-    zx_status_t status = zx_interrupt_create(root_resource_handle, 0, &handle);
+    zx_status_t status = zx_interrupt_create(root_resource_handle, InterruptLevel,
+                        ZX_INTERRUPT_REMAP_IRQ, &handle);
     if (status != ZX_OK) {
-        free(arg);
         return AE_ERROR;
     }
-    status = zx_interrupt_bind(handle, 0, root_resource_handle, InterruptLevel,
-                               ZX_INTERRUPT_REMAP_IRQ);
-    if (status != ZX_OK) {
-        zx_handle_close(handle);
-        free(arg);
-        return AE_ERROR;
-    }
-
     arg->handler = Handler;
     arg->context = Context;
     arg->irq_handle = handle;
 
-    thrd_t thread;
-    int ret = thrd_create(&thread, acpi_irq_thread, arg);
+    int ret = thrd_create(&arg->thread, acpi_irq_thread, arg.get());
     if (ret != 0) {
-        free(arg);
         return AE_ERROR;
     }
-    thrd_detach(thread);
 
+    sci_irq = fbl::move(arg);
     return AE_OK;
 }
 
@@ -924,8 +950,12 @@ ACPI_STATUS AcpiOsInstallInterruptHandler(
 ACPI_STATUS AcpiOsRemoveInterruptHandler(
         UINT32 InterruptNumber,
         ACPI_OSD_HANDLER Handler) {
-    assert(false);
-    return AE_NOT_EXIST;
+    assert(InterruptNumber == 0x9); // SCI
+    assert(sci_irq);
+    zx_interrupt_destroy(sci_irq->irq_handle);
+    thrd_join(sci_irq->thread, nullptr);
+    sci_irq.reset();
+    return AE_OK;
 }
 
 /**
@@ -1080,19 +1110,33 @@ static ACPI_STATUS AcpiOsReadWritePciConfiguration(
     uint8_t dev = static_cast<uint8_t>(PciId->Device);
     uint8_t func = static_cast<uint8_t>(PciId->Function);
     uint8_t offset = static_cast<uint8_t>(Register);
-    uint8_t width = static_cast<uint8_t>(Width);
-    uint32_t val = *Value & 0xFFFFFFFF; // PIO access can only be 32 bits
-    zx_status_t status = zx_pci_cfg_pio_rw(root_resource_handle, bus, dev, func, offset,
-                                           &val, width, Write);
+    zx_status_t st;
+#ifdef ENABLE_USER_PCI
+    switch(Width) {
+    case 8u: 
+        (Write) ? st = pci_pio_write8(bus, dev, func, offset, static_cast<uint8_t>(*Value))
+                : st = pci_pio_read8(bus, dev, func, offset, reinterpret_cast<uint8_t*>(Value));
+        break;
+    case 16u:
+        (Write) ? st = pci_pio_write16(bus, dev, func, offset, static_cast<uint16_t>(*Value))
+                : st = pci_pio_read16(bus, dev, func, offset, reinterpret_cast<uint16_t*>(Value));
+        break;
+    // assume 32bit by default since 64 bit reads on IO ports are not a thing supported by the spec
+    default:
+        (Write) ? st = pci_pio_write32(bus, dev, func, offset, static_cast<uint32_t>(*Value))
+                : st = pci_pio_read32(bus, dev, func, offset, reinterpret_cast<uint32_t*>(Value));
+    }
+#else
+    st = zx_pci_cfg_pio_rw(root_resource_handle, bus, dev, func, offset,
+                           reinterpret_cast<uint32_t*>(Value), static_cast<uint8_t>(Width), Write);
 
-    *Value = val;
-
+#endif // ENABLE_USER_PCI
 #ifdef ACPI_DEBUG_OUTPUT
-    if (status != ZX_OK) {
-        printf("ACPIOS: pci rw error: %d\n", status);
+    if (st != ZX_OK) {
+        printf("ACPIOS: pci rw error: %d\n", st);
     }
 #endif // ACPI_DEBUG_OUTPUT
-    return (status == ZX_OK) ? AE_OK : AE_ERROR;
+    return (st == ZX_OK) ? AE_OK : AE_ERROR;
 #endif // __x86_64__
 
     return AE_NOT_IMPLEMENTED;

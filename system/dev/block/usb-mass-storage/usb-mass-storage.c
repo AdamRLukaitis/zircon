@@ -5,8 +5,9 @@
 #include <ddk/binding.h>
 #include <ddk/debug.h>
 #include <ddk/driver.h>
-#include <ddk/usb-request.h>
-#include <driver/usb.h>
+#include <ddk/protocol/usb.h>
+#include <ddk/usb/usb.h>
+#include <usb/usb-request.h>
 #include <zircon/assert.h>
 #include <zircon/hw/usb.h>
 #include <zircon/hw/usb-mass-storage.h>
@@ -33,24 +34,37 @@ static inline void txn_complete(ums_txn_t* txn, zx_status_t status) {
 }
 
 static zx_status_t ums_reset(ums_t* ums) {
-    // for all these control requests, data is null, length is 0 because nothing is passed back
-    // value and index not used for first command, though index is supposed to be set to interface number
-    // TODO: check interface number, see if index needs to be set
+    // UMS Reset Recovery. See section 5.3.4 of
+    // "Universal Serial Bus Mass Storage Class Bulk-Only Transport"
     DEBUG_PRINT(("UMS: performing reset recovery\n"));
+    // Step 1: Send  Bulk-Only Mass Storage Reset
     zx_status_t status = usb_control(&ums->usb, USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-                                     USB_REQ_RESET, 0x00, 0x00, NULL, 0, ZX_TIME_INFINITE, NULL);
-    status = usb_control(&ums->usb, USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-                         USB_REQ_CLEAR_FEATURE, FS_ENDPOINT_HALT, ums->bulk_in_addr, NULL, 0,
-                         ZX_TIME_INFINITE, NULL);
-    status = usb_control(&ums->usb, USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-                         USB_REQ_CLEAR_FEATURE, FS_ENDPOINT_HALT, ums->bulk_out_addr, NULL, 0,
-                         ZX_TIME_INFINITE, NULL);
-    return status;
+                                     USB_REQ_RESET, 0, ums->interface_number, NULL, 0,
+                                     ZX_TIME_INFINITE, NULL);
+    if (status != ZX_OK) {
+        DEBUG_PRINT(("UMS: USB_REQ_RESET failed %d\n", status));
+        return status;
+    }
+    // Step 2: Clear Feature HALT to the Bulk-In endpoint
+    status =  usb_clear_feature(&ums->usb, USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_ENDPOINT,
+                                USB_ENDPOINT_HALT, ums->bulk_in_addr, ZX_TIME_INFINITE);
+    if (status != ZX_OK) {
+        DEBUG_PRINT(("UMS: clear endpoint halt failed %d\n", status));
+        return status;
+    }
+    // Step 3: Clear Feature HALT to the Bulk-Out endpoint
+    status =  usb_clear_feature(&ums->usb, USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_ENDPOINT,
+                                USB_ENDPOINT_HALT, ums->bulk_out_addr, ZX_TIME_INFINITE);
+    if (status != ZX_OK) {
+        DEBUG_PRINT(("UMS: clear endpoint halt failed %d\n", status));
+        return status;
+    }
+    return ZX_OK;
 }
 
 static void ums_req_complete(usb_request_t* req, void* cookie) {
     if (cookie) {
-        completion_signal((completion_t *)cookie);
+        sync_completion_signal((sync_completion_t *)cookie);
     }
 }
 
@@ -76,18 +90,18 @@ static void ums_send_cbw(ums_t* ums, uint8_t lun, uint32_t transfer_length, uint
     // copy command_len bytes from the command passed in into the command_len
     memcpy(cbw->CBWCB, command, command_len);
 
-    completion_t completion = COMPLETION_INIT;
+    sync_completion_t completion = SYNC_COMPLETION_INIT;
     req->cookie = &completion;
     usb_request_queue(&ums->usb, req);
-    completion_wait(&completion, ZX_TIME_INFINITE);
+    sync_completion_wait(&completion, ZX_TIME_INFINITE);
 }
 
 static zx_status_t ums_read_csw(ums_t* ums, uint32_t* out_residue) {
-    completion_t completion = COMPLETION_INIT;
+    sync_completion_t completion = SYNC_COMPLETION_INIT;
     usb_request_t* csw_request = ums->csw_req;
     csw_request->cookie = &completion;
     usb_request_queue(&ums->usb, csw_request);
-    completion_wait(&completion, ZX_TIME_INFINITE);
+    sync_completion_wait(&completion, ZX_TIME_INFINITE);
 
     csw_status_t csw_error = ums_verify_csw(ums, csw_request, out_residue);
 
@@ -106,7 +120,7 @@ static zx_status_t ums_read_csw(ums_t* ums, uint32_t* out_residue) {
 
 static csw_status_t ums_verify_csw(ums_t* ums, usb_request_t* csw_request, uint32_t* out_residue) {
     ums_csw_t csw;
-    usb_request_copyfrom(csw_request, &csw, sizeof(csw), 0);
+    usb_request_copy_from(csw_request, &csw, sizeof(csw), 0);
 
     // check signature is "USBS"
     if (letoh32(csw.dCSWSignature) != CSW_SIGNATURE) {
@@ -154,7 +168,7 @@ static zx_status_t ums_inquiry(ums_t* ums, uint8_t lun, uint8_t* out_data) {
     // wait for CSW
     zx_status_t status = ums_read_csw(ums, NULL);
     if (status == ZX_OK) {
-        usb_request_copyfrom(ums->data_req, out_data, UMS_INQUIRY_TRANSFER_LENGTH, 0);
+        usb_request_copy_from(ums->data_req, out_data, UMS_INQUIRY_TRANSFER_LENGTH, 0);
     }
     return status;
 }
@@ -184,7 +198,7 @@ static zx_status_t ums_request_sense(ums_t* ums, uint8_t lun, uint8_t* out_data)
     // wait for CSW
     zx_status_t status = ums_read_csw(ums, NULL);
     if (status == ZX_OK) {
-        usb_request_copyfrom(ums->data_req, out_data, UMS_REQUEST_SENSE_TRANSFER_LENGTH, 0);
+        usb_request_copy_from(ums->data_req, out_data, UMS_REQUEST_SENSE_TRANSFER_LENGTH, 0);
     }
     return status;
 }
@@ -201,7 +215,7 @@ static zx_status_t ums_read_capacity10(ums_t* ums, uint8_t lun, scsi_read_capaci
 
     zx_status_t status = ums_read_csw(ums, NULL);
     if (status == ZX_OK) {
-        usb_request_copyfrom(ums->data_req, out_data, sizeof(*out_data), 0);
+        usb_request_copy_from(ums->data_req, out_data, sizeof(*out_data), 0);
     }
     return status;
 }
@@ -221,7 +235,7 @@ static zx_status_t ums_read_capacity16(ums_t* ums, uint8_t lun, scsi_read_capaci
 
     zx_status_t status = ums_read_csw(ums, NULL);
     if (status == ZX_OK) {
-        usb_request_copyfrom(ums->data_req, out_data, sizeof(*out_data), 0);
+        usb_request_copy_from(ums->data_req, out_data, sizeof(*out_data), 0);
     }
     return status;
 }
@@ -241,7 +255,7 @@ static zx_status_t ums_mode_sense6(ums_t* ums, uint8_t lun, scsi_mode_sense_6_da
 
     zx_status_t status = ums_read_csw(ums, NULL);
     if (status == ZX_OK) {
-        usb_request_copyfrom(ums->data_req, out_data, sizeof(*out_data), 0);
+        usb_request_copy_from(ums->data_req, out_data, sizeof(*out_data), 0);
     }
     return status;
 }
@@ -250,16 +264,16 @@ static zx_status_t ums_data_transfer(ums_t* ums, ums_txn_t* txn, zx_off_t offset
                                      uint8_t ep_address) {
     usb_request_t* req = &ums->data_transfer_req;
 
-    zx_status_t status = usb_req_init(&ums->usb, req, txn->op.rw.vmo, offset, length, ep_address);
+    zx_status_t status = usb_request_init(req, txn->op.rw.vmo, offset, length, ep_address);
     if (status != ZX_OK) {
         return status;
     }
     req->complete_cb = ums_req_complete;
 
-    completion_t completion = COMPLETION_INIT;
+    sync_completion_t completion = SYNC_COMPLETION_INIT;
     req->cookie = &completion;
     usb_request_queue(&ums->usb, req);
-    completion_wait(&completion, ZX_TIME_INFINITE);
+    sync_completion_wait(&completion, ZX_TIME_INFINITE);
 
     status = req->response.status;
     if (status == ZX_OK && req->response.actual != length) {
@@ -407,7 +421,7 @@ static void ums_unbind(void* ctx) {
     mtx_lock(&ums->txn_lock);
     ums->dead = true;
     mtx_unlock(&ums->txn_lock);
-    completion_signal(&ums->txn_completion);
+    sync_completion_signal(&ums->txn_completion);
 
     // wait for worker thread to finish before removing devices
     thrd_join(ums->worker_thread, NULL);
@@ -562,14 +576,14 @@ static int ums_worker_thread(void* arg) {
     bool wait = true;
     while (1) {
         if (wait) {
-            status = completion_wait(&ums->txn_completion, ZX_SEC(1));
+            status = sync_completion_wait(&ums->txn_completion, ZX_SEC(1));
             if (status == ZX_ERR_TIMED_OUT) {
                 if (ums_check_luns_ready(ums) != ZX_OK) {
                     return status;
                 }
                 continue;
             }
-            completion_reset(&ums->txn_completion);
+            sync_completion_reset(&ums->txn_completion);
         }
 
         mtx_lock(&ums->txn_lock);
@@ -663,6 +677,7 @@ static zx_status_t ums_bind(void* ctx, zx_device_t* device) {
         return ZX_ERR_NOT_SUPPORTED;
     }
 
+    uint8_t interface_number = intf->bInterfaceNumber;
     uint8_t bulk_in_addr = 0;
     uint8_t bulk_out_addr = 0;
     size_t bulk_in_max_packet = 0;
@@ -695,10 +710,17 @@ static zx_status_t ums_bind(void* ctx, zx_device_t* device) {
     zx_status_t status = usb_control(&usb, USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
                                      USB_REQ_GET_MAX_LUN, 0x00, 0x00, &max_lun, sizeof(max_lun),
                                      ZX_TIME_INFINITE, &out_length);
-    if (status != ZX_OK) {
+
+    if (status == ZX_ERR_IO_REFUSED) {
+        // Devices that do not support multiple LUNS may stall this command.
+        // See USB Mass Storage Class Spec. 3.2 Get Max LUN.
+        // Clear the stall.
+        usb_reset_endpoint(&usb, 0);
+        zxlogf(INFO, "Device does not support multiple LUNs\n");
+        max_lun = 0;
+    } else if (status != ZX_OK) {
         return status;
-    }
-    if (out_length != sizeof(max_lun)) {
+    } else if (out_length != sizeof(max_lun)) {
         return ZX_ERR_BAD_STATE;
     }
 
@@ -717,7 +739,7 @@ static zx_status_t ums_bind(void* ctx, zx_device_t* device) {
     }
 
     list_initialize(&ums->queued_txns);
-    completion_reset(&ums->txn_completion);
+    sync_completion_reset(&ums->txn_completion);
     mtx_init(&ums->txn_lock, mtx_plain);
 
     ums->usb_zxdev = device;
@@ -726,20 +748,24 @@ static zx_status_t ums_bind(void* ctx, zx_device_t* device) {
     ums->bulk_out_addr = bulk_out_addr;
     ums->bulk_in_max_packet = bulk_in_max_packet;
     ums->bulk_out_max_packet = bulk_out_max_packet;
+    ums->interface_number = interface_number;
 
     size_t max_in = usb_get_max_transfer_size(&usb, bulk_in_addr);
     size_t max_out = usb_get_max_transfer_size(&usb, bulk_out_addr);
     ums->max_transfer = (max_in < max_out ? max_in : max_out);
 
-    status = usb_req_alloc(&usb, &ums->cbw_req, sizeof(ums_cbw_t), bulk_out_addr);
+    status = usb_request_alloc(&ums->cbw_req, sizeof(ums_cbw_t), bulk_out_addr,
+                               sizeof(usb_request_t));
     if (status != ZX_OK) {
         goto fail;
     }
-    status = usb_req_alloc(&usb, &ums->data_req, PAGE_SIZE, bulk_in_addr);
+    status = usb_request_alloc(&ums->data_req, PAGE_SIZE, bulk_in_addr,
+                               sizeof(usb_request_t));
     if (status != ZX_OK) {
         goto fail;
     }
-    status = usb_req_alloc(&usb, &ums->csw_req, sizeof(ums_csw_t), bulk_in_addr);
+    status = usb_request_alloc(&ums->csw_req, sizeof(ums_csw_t), bulk_in_addr,
+                               sizeof(usb_request_t));
     if (status != ZX_OK) {
         goto fail;
     }

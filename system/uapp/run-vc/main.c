@@ -3,24 +3,24 @@
 // found in the LICENSE file.
 
 #include <fcntl.h>
-#include <launchpad/launchpad.h>
-#include <launchpad/vmo.h>
+#include <lib/fdio/io.h>
+#include <lib/fdio/spawn.h>
+#include <lib/fdio/util.h>
+#include <lib/fdio/watcher.h>
 #include <limits.h>
-#include <zircon/device/dmctl.h>
-#include <zircon/process.h>
-#include <zircon/processargs.h>
-#include <zircon/syscalls.h>
-#include <zircon/types.h>
-#include <fdio/io.h>
-#include <fdio/util.h>
-#include <fdio/watcher.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <zircon/device/dmctl.h>
+#include <zircon/process.h>
+#include <zircon/processargs.h>
+#include <zircon/status.h>
+#include <zircon/syscalls.h>
+#include <zircon/types.h>
 
-int main(int argc, char** argv) {
+int main(int argc, const char** argv) {
     int fd;
     int retry = 30;
 
@@ -43,46 +43,51 @@ int main(int argc, char** argv) {
     zx_object_wait_one(h0, ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED,
                        ZX_TIME_INFINITE, NULL);
 
-    uint32_t types[2];
-    zx_handle_t handles[2];
+    uint32_t types[FDIO_MAX_HANDLES];
+    zx_handle_t handles[FDIO_MAX_HANDLES];
     uint32_t dcount, hcount;
-    if (zx_channel_read(h0, 0, types, handles, sizeof(types), 2, &dcount, &hcount) < 0) {
+    if (zx_channel_read(h0, 0, types, handles,
+                        sizeof(types), FDIO_MAX_HANDLES, &dcount, &hcount) < 0) {
         return -1;
     }
-    if ((dcount != sizeof(types)) || (hcount != 2)) {
+    if (dcount / sizeof(uint32_t) != hcount) {
         return -1;
     }
     zx_handle_close(h0);
 
     // start shell if no arguments
     if (argc == 1) {
-        argv[0] = (char*) "/boot/bin/sh";
+        argv[0] = "/boot/bin/sh";
     } else {
         argv++;
-        argc--;
     }
 
-    char* pname = strrchr(argv[0], '/');
+    const char* pname = strrchr(argv[0], '/');
     if (pname == NULL) {
         pname = argv[0];
     } else {
         pname++;
     }
 
-    launchpad_t* lp;
-    launchpad_create(0, pname, &lp);
-    launchpad_clone(lp, LP_CLONE_FDIO_NAMESPACE | LP_CLONE_ENVIRON);
-    launchpad_add_handles(lp, 2, handles, types);
-    launchpad_set_args(lp, argc, (const char* const*) argv);
-    launchpad_load_from_file(lp, argv[0]);
+    uint32_t flags = FDIO_SPAWN_CLONE_ALL & ~FDIO_SPAWN_CLONE_STDIO;
 
-    zx_status_t status;
-    const char* errmsg;
-    if ((status = launchpad_go(lp, NULL, &errmsg)) < 0) {
-        fprintf(stderr, "error %d launching: %s\n", status, errmsg);
+    fdio_spawn_action_t actions[1 + FDIO_MAX_HANDLES] = {
+        {.action = FDIO_SPAWN_ACTION_SET_NAME, .name = {.data = pname}},
+    };
+    for (uint32_t i = 0; i < hcount; i++) {
+        actions[1 + i].action = FDIO_SPAWN_ACTION_ADD_HANDLE;
+        actions[1 + i].h.id = types[i];
+        actions[1 + i].h.handle = handles[i];
+    };
+
+    char err_msg[FDIO_SPAWN_ERR_MSG_MAX_LENGTH];
+    zx_status_t status = fdio_spawn_etc(ZX_HANDLE_INVALID, flags, argv[0], argv,
+                                  NULL, 1 + hcount, actions, NULL, err_msg);
+    if (status != ZX_OK) {
+        fprintf(stderr, "error %d (%s) launching: %s\n", status,
+                zx_status_get_string(status), err_msg);
         return -1;
     }
 
     return 0;
 }
-

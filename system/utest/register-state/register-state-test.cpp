@@ -10,6 +10,7 @@
 
 #if defined(__x86_64__)
 
+#include <cpuid.h>
 #include <x86intrin.h>
 
 static pthread_barrier_t g_barrier;
@@ -17,10 +18,8 @@ static pthread_barrier_t g_barrier;
 // Returns whether the CPU supports the {rd,wr}{fs,gs}base instructions.
 static bool x86_feature_fsgsbase() {
     uint32_t eax, ebx, ecx, edx;
-    __asm__("cpuid"
-            : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
-            : "a"(7), "c"(0));
-    return ebx & 1;
+    __cpuid(7, eax, ebx, ecx, edx);
+    return ebx & bit_FSGSBASE;
 }
 
 __attribute__((target("fsgsbase")))
@@ -52,7 +51,7 @@ static void* gs_base_test_thread(void* thread_arg) {
 // We do this by launching multiple threads that set gs_base to different
 // values.  After all the threads have set gs_base, the threads wake up and
 // check that gs_base was preserved.
-bool test_context_switch_of_gs_base() {
+bool TestContextSwitchOfGsBase() {
     BEGIN_TEST;
 
     // We run the rest of the test even if the fsgsbase instructions aren't
@@ -106,7 +105,7 @@ DEFINE_REGISTER_ACCESSOR(gs)
 // IRET instruction has the side effect of resetting these registers when
 // returning from the kernel to userland (but not when returning to kernel
 // code).
-bool test_segment_selectors_zeroed_on_interrupt() {
+bool TestSegmentSelectorsZeroedOnInterrupt() {
     BEGIN_TEST;
 
     // Disable this test because some versions of non-KVM QEMU don't
@@ -135,7 +134,7 @@ bool test_segment_selectors_zeroed_on_interrupt() {
 // Test that the kernel also resets the segment selector registers on a
 // context switch, to avoid leaking their values and to match what happens
 // on an interrupt.
-bool test_segment_selectors_zeroed_on_context_switch() {
+bool TestSegmentSelectorsZeroedOnContextSwitch() {
     BEGIN_TEST;
 
     set_ds(1);
@@ -157,9 +156,9 @@ bool test_segment_selectors_zeroed_on_context_switch() {
 }
 
 BEGIN_TEST_CASE(register_state_tests)
-RUN_TEST(test_context_switch_of_gs_base)
-RUN_TEST(test_segment_selectors_zeroed_on_interrupt)
-RUN_TEST(test_segment_selectors_zeroed_on_context_switch)
+RUN_TEST(TestContextSwitchOfGsBase)
+RUN_TEST(TestSegmentSelectorsZeroedOnInterrupt)
+RUN_TEST(TestSegmentSelectorsZeroedOnContextSwitch)
 END_TEST_CASE(register_state_tests)
 
 #endif

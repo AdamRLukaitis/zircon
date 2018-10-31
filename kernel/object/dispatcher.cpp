@@ -12,12 +12,10 @@
 #include <lib/ktrace.h>
 #include <lib/counters.h>
 #include <fbl/atomic.h>
-#include <fbl/auto_lock.h>
 #include <fbl/mutex.h>
 
 #include <object/tls_slots.h>
 
-using fbl::AutoLock;
 
 // kernel counters. The following counters never decrease.
 // counts the number of times a dispatcher has been created and destroyed.
@@ -45,44 +43,28 @@ zx_koid_t GenerateKernelObjectId() {
 // unwind the recursion.
 class SafeDeleter {
 public:
-    static SafeDeleter* Get() {
-        auto self = reinterpret_cast<SafeDeleter*>(tls_get(TLS_ENTRY_KOBJ_DELETER));
-        if (self == nullptr) {
-            fbl::AllocChecker ac;
-            self = new (&ac) SafeDeleter;
-            if (!ac.check())
-                return nullptr;
+    static void Delete(Dispatcher* kobj) {
+        auto deleter = reinterpret_cast<SafeDeleter*>(tls_get(TLS_ENTRY_KOBJ_DELETER));
+        if (deleter) {
+            // Delete() was called recursively.
+            deleter->pending_.push_front(kobj);
+        } else {
+            SafeDeleter deleter;
+            tls_set(TLS_ENTRY_KOBJ_DELETER, &deleter);
 
-            tls_set(TLS_ENTRY_KOBJ_DELETER, self);
-            tls_set_callback(TLS_ENTRY_KOBJ_DELETER, &CleanTLS);
-        }
-        return self;
-    }
+            do {
+                // This delete call can cause recursive calls to
+                // Dispatcher::fbl_recycle() and hence to Delete().
+                delete kobj;
 
-    void Delete(Dispatcher* kobj) {
-        if (level_ > 0) {
-            pending_.push_front(kobj);
-            return;
-        }
-        // The delete calls below can recurse here via fbl_recycle().
-        level_++;
-        delete kobj;
+                kobj = deleter.pending_.pop_front();
+            } while (kobj);
 
-        while ((kobj = pending_.pop_front()) != nullptr) {
-            delete kobj;
+            tls_set(TLS_ENTRY_KOBJ_DELETER, nullptr);
         }
-        level_--;
     }
 
 private:
-    static void CleanTLS(void* tls) {
-        delete reinterpret_cast<SafeDeleter*>(tls);
-    }
-
-    SafeDeleter() : level_(0) {}
-    ~SafeDeleter() { DEBUG_ASSERT(level_ == 0); }
-
-    int level_;
     fbl::SinglyLinkedList<Dispatcher*, Dispatcher::DeleterListTraits> pending_;
 };
 
@@ -93,14 +75,12 @@ Dispatcher::Dispatcher(zx_signals_t signals)
       handle_count_(0u),
       signals_(signals) {
 
-    kcounter_add(dispatcher_create_count, 1u);
+    kcounter_add(dispatcher_create_count, 1);
 }
 
 Dispatcher::~Dispatcher() {
-#if WITH_LIB_KTRACE
     ktrace(TAG_OBJECT_DELETE, (uint32_t)koid_, 0, 0, 0);
-#endif
-    kcounter_add(dispatcher_destroy_count, 1u);
+    kcounter_add(dispatcher_destroy_count, 1);
 }
 
 // The refcount of this object has reached zero: delete self
@@ -110,53 +90,27 @@ Dispatcher::~Dispatcher() {
 // can control the lifetime of others. For example events do
 // not fall in this category.
 void Dispatcher::fbl_recycle() {
-    auto deleter = SafeDeleter::Get();
-    if (likely(deleter != nullptr)) {
-        deleter->Delete(this);
-    } else {
-        // We failed to allocate the safe deleter. As an OOM
-        // case one is extremely unlikely but possible. Attempt
-        // to delete the dispatcher directly which very likely
-        // can be done without blowing the stack.
-        delete this;
-    }
+    SafeDeleter::Delete(this);
 }
 
 zx_status_t Dispatcher::add_observer(StateObserver* observer) {
-    if (!has_state_tracker())
+    if (!is_waitable())
         return ZX_ERR_NOT_SUPPORTED;
     AddObserver(observer, nullptr);
     return ZX_OK;
 }
 
-zx_status_t SoloDispatcher::user_signal(uint32_t clear_mask, uint32_t set_mask, bool peer) {
-    if (peer)
-        return ZX_ERR_NOT_SUPPORTED;
-
-    if (!has_state_tracker())
-        return ZX_ERR_NOT_SUPPORTED;
-
-    // Generic objects can set all USER_SIGNALs. Particular object
-    // types (events and eventpairs) may be able to set more.
-    auto allowed_signals = allowed_user_signals();
-    if ((set_mask & ~allowed_signals) || (clear_mask & ~allowed_signals))
-        return ZX_ERR_INVALID_ARGS;
-
-    UpdateState(clear_mask, set_mask);
-    return ZX_OK;
-}
-
 namespace {
 
-template <typename Func>
+template <typename Func, typename LockType>
 StateObserver::Flags CancelWithFunc(Dispatcher::ObserverList* observers,
-                                    fbl::Mutex* observer_lock, Func f) {
+                                    Lock<LockType>* observer_lock, Func f) {
     StateObserver::Flags flags = 0;
 
     Dispatcher::ObserverList obs_to_remove;
 
     {
-        AutoLock lock(observer_lock);
+        Guard<LockType> guard{observer_lock};
         for (auto it = observers->begin(); it != observers->end();) {
             StateObserver::Flags it_flags = f(it.CopyPointer());
             flags |= it_flags;
@@ -184,16 +138,16 @@ StateObserver::Flags CancelWithFunc(Dispatcher::ObserverList* observers,
 // the type of Mutex (either fbl::Mutex or fbl::NullLock), the thread
 // safety analysis is unable to prove that the accesses to |signals_|
 // and to |observers_| are always protected.
-template <typename Mutex>
+template <typename LockType>
 void Dispatcher::AddObserverHelper(StateObserver* observer,
                                    const StateObserver::CountInfo* cinfo,
-                                   Mutex* mutex) TA_NO_THREAD_SAFETY_ANALYSIS {
-    ZX_DEBUG_ASSERT(has_state_tracker());
+                                   Lock<LockType>* lock) TA_NO_THREAD_SAFETY_ANALYSIS {
+    ZX_DEBUG_ASSERT(is_waitable());
     DEBUG_ASSERT(observer != nullptr);
 
     StateObserver::Flags flags;
     {
-        AutoLock lock(mutex);
+        Guard<LockType> guard{lock};
 
         flags = observer->OnInitialize(signals_, cinfo);
         if (!(flags & StateObserver::kNeedRemoval))
@@ -201,10 +155,8 @@ void Dispatcher::AddObserverHelper(StateObserver* observer,
     }
     if (flags & StateObserver::kNeedRemoval)
         observer->OnRemoved();
-    if (flags & StateObserver::kWokeThreads)
-        thread_reschedule();
 
-    kcounter_add(dispatcher_observe_count, 1u);
+    kcounter_add(dispatcher_observe_count, 1);
 }
 
 void Dispatcher::AddObserver(StateObserver* observer, const StateObserver::CountInfo* cinfo) {
@@ -212,47 +164,41 @@ void Dispatcher::AddObserver(StateObserver* observer, const StateObserver::Count
 }
 
 void Dispatcher::AddObserverLocked(StateObserver* observer, const StateObserver::CountInfo* cinfo) {
-    fbl::NullLock mutex;
-    AddObserverHelper(observer, cinfo, &mutex);
+    // Type tag and local NullLock to make lockdep happy.
+    struct DispatcherAddObserverLocked {};
+    DECLARE_LOCK(DispatcherAddObserverLocked, fbl::NullLock) lock;
+
+    AddObserverHelper(observer, cinfo, &lock);
 }
 
 void Dispatcher::RemoveObserver(StateObserver* observer) {
-    ZX_DEBUG_ASSERT(has_state_tracker());
+    ZX_DEBUG_ASSERT(is_waitable());
 
-    AutoLock lock(get_lock());
+    Guard<fbl::Mutex> guard{get_lock()};
     DEBUG_ASSERT(observer != nullptr);
     observers_.erase(*observer);
 }
 
-bool Dispatcher::Cancel(Handle* handle) {
-    ZX_DEBUG_ASSERT(has_state_tracker());
+void Dispatcher::Cancel(const Handle* handle) {
+    ZX_DEBUG_ASSERT(is_waitable());
 
-    StateObserver::Flags flags = CancelWithFunc(&observers_, get_lock(),
-                                                [handle](StateObserver* obs) {
+    CancelWithFunc(&observers_, get_lock(), [handle](StateObserver* obs) {
         return obs->OnCancel(handle);
     });
 
-    kcounter_add(dispatcher_cancel_bh_count, 1u);
-
-    // We could request a reschedule if kWokeThreads is asserted,
-    // but cancellation is not likely to benefit from aggressive
-    // rescheduling.
-    return flags & StateObserver::kHandled;
+    kcounter_add(dispatcher_cancel_bh_count, 1);
 }
 
-bool Dispatcher::CancelByKey(Handle* handle, const void* port, uint64_t key) {
-    ZX_DEBUG_ASSERT(has_state_tracker());
+bool Dispatcher::CancelByKey(const Handle* handle, const void* port, uint64_t key) {
+    ZX_DEBUG_ASSERT(is_waitable());
 
     StateObserver::Flags flags = CancelWithFunc(&observers_, get_lock(),
                                                 [handle, port, key](StateObserver* obs) {
         return obs->OnCancelByKey(handle, port, key);
     });
 
-    kcounter_add(dispatcher_cancel_bk_count, 1u);
+    kcounter_add(dispatcher_cancel_bk_count, 1);
 
-    // We could request a reschedule if kWokeThreads is asserted,
-    // but cancellation is not likely to benefit from aggressive
-    // rescheduling.
     return flags & StateObserver::kHandled;
 }
 
@@ -260,15 +206,14 @@ bool Dispatcher::CancelByKey(Handle* handle, const void* port, uint64_t key) {
 // the type of Mutex (either fbl::Mutex or fbl::NullLock), the thread
 // safety analysis is unable to prove that the accesses to |signals_|
 // are always protected.
-template <typename Mutex>
+template <typename LockType>
 void Dispatcher::UpdateStateHelper(zx_signals_t clear_mask,
                                    zx_signals_t set_mask,
-                                   Mutex* mutex) TA_NO_THREAD_SAFETY_ANALYSIS {
-    StateObserver::Flags flags;
+                                   Lock<LockType>* lock) TA_NO_THREAD_SAFETY_ANALYSIS {
     Dispatcher::ObserverList obs_to_remove;
-
     {
-        AutoLock lock(mutex);
+        Guard<LockType> guard{lock};
+
         auto previous_signals = signals_;
         signals_ &= ~clear_mask;
         signals_ |= set_mask;
@@ -276,52 +221,60 @@ void Dispatcher::UpdateStateHelper(zx_signals_t clear_mask,
         if (previous_signals == signals_)
             return;
 
-        flags = UpdateInternalLocked(&obs_to_remove, signals_);
+        UpdateInternalLocked(&obs_to_remove, signals_);
     }
 
     while (!obs_to_remove.is_empty()) {
         obs_to_remove.pop_front()->OnRemoved();
     }
-
-    if (flags & StateObserver::kWokeThreads)
-        thread_reschedule();
 }
 
 void Dispatcher::UpdateState(zx_signals_t clear_mask,
                              zx_signals_t set_mask) {
-    ZX_DEBUG_ASSERT(has_state_tracker());
-
     UpdateStateHelper(clear_mask, set_mask, get_lock());
 }
 
 void Dispatcher::UpdateStateLocked(zx_signals_t clear_mask,
                                    zx_signals_t set_mask) {
-    ZX_DEBUG_ASSERT(has_state_tracker());
+    // Type tag and local NullLock to make lockdep happy.
+    struct DispatcherUpdateStateLocked {};
+    DECLARE_LOCK(DispatcherUpdateStateLocked, fbl::NullLock) lock;
+    UpdateStateHelper(clear_mask, set_mask, &lock);
+}
 
-    fbl::NullLock mutex;
-    UpdateStateHelper(clear_mask, set_mask, &mutex);
+void Dispatcher::UpdateInternalLocked(ObserverList* obs_to_remove, zx_signals_t signals) {
+    ZX_DEBUG_ASSERT(is_waitable());
+
+    for (auto it = observers_.begin(); it != observers_.end();) {
+        StateObserver::Flags it_flags = it->OnStateChange(signals);
+        if (it_flags & StateObserver::kNeedRemoval) {
+            auto to_remove = it;
+            ++it;
+            obs_to_remove->push_back(observers_.erase(to_remove));
+        } else {
+            ++it;
+        }
+    }
 }
 
 zx_status_t Dispatcher::SetCookie(CookieJar* cookiejar, zx_koid_t scope, uint64_t cookie) {
-    ZX_DEBUG_ASSERT(has_state_tracker());
-
     if (cookiejar == nullptr)
         return ZX_ERR_NOT_SUPPORTED;
 
-    AutoLock lock(get_lock());
+    Guard<fbl::Mutex> guard{get_lock()};
 
     if (cookiejar->scope_ == ZX_KOID_INVALID) {
         cookiejar->scope_ = scope;
         cookiejar->cookie_ = cookie;
 
-        kcounter_add(dispatcher_cookie_set_count, 1u);
+        kcounter_add(dispatcher_cookie_set_count, 1);
         return ZX_OK;
     }
 
     if (cookiejar->scope_ == scope) {
         cookiejar->cookie_ = cookie;
 
-        kcounter_add(dispatcher_cookie_reset_count, 1u);
+        kcounter_add(dispatcher_cookie_reset_count, 1);
         return ZX_OK;
     }
 
@@ -329,12 +282,10 @@ zx_status_t Dispatcher::SetCookie(CookieJar* cookiejar, zx_koid_t scope, uint64_
 }
 
 zx_status_t Dispatcher::GetCookie(CookieJar* cookiejar, zx_koid_t scope, uint64_t* cookie) {
-    ZX_DEBUG_ASSERT(has_state_tracker());
-
     if (cookiejar == nullptr)
         return ZX_ERR_NOT_SUPPORTED;
 
-    AutoLock lock(get_lock());
+    Guard<fbl::Mutex> guard{get_lock()};
 
     if (cookiejar->scope_ == scope) {
         *cookie = cookiejar->cookie_;
@@ -345,8 +296,6 @@ zx_status_t Dispatcher::GetCookie(CookieJar* cookiejar, zx_koid_t scope, uint64_
 }
 
 zx_status_t Dispatcher::InvalidateCookieLocked(CookieJar* cookiejar) {
-    ZX_DEBUG_ASSERT(has_state_tracker());
-
     if (cookiejar == nullptr)
         return ZX_ERR_NOT_SUPPORTED;
 
@@ -355,27 +304,7 @@ zx_status_t Dispatcher::InvalidateCookieLocked(CookieJar* cookiejar) {
 }
 
 zx_status_t Dispatcher::InvalidateCookie(CookieJar* cookiejar) {
-    AutoLock lock(get_lock());
+    Guard<fbl::Mutex> guard{get_lock()};
     return InvalidateCookieLocked(cookiejar);
 }
 
-StateObserver::Flags Dispatcher::UpdateInternalLocked(ObserverList* obs_to_remove, zx_signals_t signals) {
-    ZX_DEBUG_ASSERT(has_state_tracker());
-
-    StateObserver::Flags flags = 0;
-
-    for (auto it = observers_.begin(); it != observers_.end();) {
-        StateObserver::Flags it_flags = it->OnStateChange(signals);
-        flags |= it_flags;
-        if (it_flags & StateObserver::kNeedRemoval) {
-            auto to_remove = it;
-            ++it;
-            obs_to_remove->push_back(observers_.erase(to_remove));
-        } else {
-            ++it;
-        }
-    }
-
-    // Filter out NeedRemoval flag because we processed that here
-    return flags & (~StateObserver::kNeedRemoval);
-}

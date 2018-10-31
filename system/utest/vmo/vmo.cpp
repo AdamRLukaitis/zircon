@@ -18,6 +18,7 @@
 #include <fbl/algorithm.h>
 #include <fbl/atomic.h>
 #include <fbl/function.h>
+#include <lib/fzl/memory-probe.h>
 #include <pretty/hexdump.h>
 #include <unittest/unittest.h>
 
@@ -74,8 +75,9 @@ bool vmo_read_write_test() {
 
     // map it
     uintptr_t ptr;
-    status = zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, len,
-                         ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE, &ptr);
+    status = zx_vmar_map(zx_vmar_root_self(),
+                        ZX_VM_PERM_READ | ZX_VM_PERM_WRITE, 0, vmo, 0,
+                        len, &ptr);
     EXPECT_EQ(ZX_OK, status, "vm_map");
     EXPECT_NE(0u, ptr, "vm_map");
 
@@ -154,24 +156,23 @@ bool vmo_map_test() {
 
     // do a regular map
     ptr[0] = 0;
-    status = zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, PAGE_SIZE,
-                         ZX_VM_FLAG_PERM_READ, &ptr[0]);
+    status = zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ, 0, vmo, 0,
+                         PAGE_SIZE, &ptr[0]);
     EXPECT_EQ(ZX_OK, status, "map");
     EXPECT_NE(0u, ptr[0], "map address");
     //printf("mapped %#" PRIxPTR "\n", ptr[0]);
 
     // try to map something completely out of range without any fixed mapping, should succeed
     ptr[2] = UINTPTR_MAX;
-    status = zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, PAGE_SIZE,
-                         ZX_VM_FLAG_PERM_READ, &ptr[2]);
+    status = zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ, 0, vmo, 0,
+                         PAGE_SIZE, &ptr[2]);
     EXPECT_EQ(ZX_OK, status, "map");
     EXPECT_NE(0u, ptr[2], "map address");
 
     // try to map something completely out of range fixed, should fail
     uintptr_t map_addr;
-    status = zx_vmar_map(zx_vmar_root_self(), UINTPTR_MAX,
-                         vmo, 0, PAGE_SIZE,
-                         ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_SPECIFIC, &map_addr);
+    status = zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ | ZX_VM_SPECIFIC,
+                         UINTPTR_MAX, vmo, 0, PAGE_SIZE, &map_addr);
     EXPECT_EQ(ZX_ERR_INVALID_ARGS, status, "map");
 
     // cleanup
@@ -201,14 +202,12 @@ bool vmo_read_only_map_test() {
 
     // map it
     uintptr_t ptr;
-    status = zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, len,
-                         ZX_VM_FLAG_PERM_READ, &ptr);
+    status = zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ, 0, vmo, 0,
+                         len, &ptr);
     EXPECT_EQ(ZX_OK, status, "vm_map");
     EXPECT_NE(0u, ptr, "vm_map");
 
-    size_t sz;
-    auto sstatus = zx_cprng_draw((void*)ptr, 1, &sz);
-    EXPECT_LT(sstatus, 0, "write");
+    EXPECT_EQ(false, probe_for_write((void*)ptr), "write");
 
     status = zx_vmar_unmap(zx_vmar_root_self(), ptr, len);
     EXPECT_EQ(ZX_OK, status, "vm_unmap");
@@ -225,11 +224,6 @@ bool vmo_no_perm_map_test() {
 
     zx_status_t status;
     zx_handle_t vmo;
-    zx_handle_t channel[2];
-
-    // create a channel for testing read permissions via syscall failure
-    status = zx_channel_create(0, &channel[0], &channel[1]);
-    EXPECT_EQ(ZX_OK, status, "vm_channel_create");
 
     // allocate an object and read/write from it
     const size_t len = PAGE_SIZE;
@@ -238,31 +232,23 @@ bool vmo_no_perm_map_test() {
 
     // map it with read permissions
     uintptr_t ptr;
-    status = zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, len, ZX_VM_FLAG_PERM_READ, &ptr);
+    status = zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ, 0, vmo, 0, len, &ptr);
     EXPECT_EQ(ZX_OK, status, "vm_map");
     EXPECT_NE(0u, ptr, "vm_map");
 
     // protect it to no permissions
-    status = zx_vmar_protect(zx_vmar_root_self(), ptr, len, 0);
+    status = zx_vmar_protect(zx_vmar_root_self(), 0, ptr, len);
     EXPECT_EQ(ZX_OK, status, "vm_protect");
 
-    // test writing to the mapping
-    size_t sz;
-    status = zx_cprng_draw(reinterpret_cast<void*>(ptr), 1, &sz);
-    EXPECT_NE(status, ZX_OK, "write");
-
-    // test reading from the mapping
-    status = zx_channel_write(channel[0], 0, reinterpret_cast<void*>(ptr), 1, nullptr, 0);
-    EXPECT_NE(status, ZX_OK, "read");
+    // test reading writing to the mapping
+    EXPECT_EQ(false, probe_for_read(reinterpret_cast<void*>(ptr)), "read");
+    EXPECT_EQ(false, probe_for_write(reinterpret_cast<void*>(ptr)), "write");
 
     status = zx_vmar_unmap(zx_vmar_root_self(), ptr, len);
     EXPECT_EQ(ZX_OK, status, "vm_unmap");
 
     // close the handle
     EXPECT_EQ(ZX_OK, zx_handle_close(vmo), "handle_close");
-    EXPECT_EQ(ZX_OK, zx_handle_close(channel[0]), "handle_close");
-    EXPECT_EQ(ZX_OK, zx_handle_close(channel[1]), "handle_close");
-
     END_TEST;
 }
 
@@ -271,11 +257,6 @@ bool vmo_no_perm_protect_test() {
 
     zx_status_t status;
     zx_handle_t vmo;
-    zx_handle_t channel[2];
-
-    // create a channel for testing read permissions via syscall failure
-    status = zx_channel_create(0, &channel[0], &channel[1]);
-    EXPECT_EQ(ZX_OK, status, "vm_channel_create");
 
     // allocate an object and read/write from it
     const size_t len = PAGE_SIZE;
@@ -284,39 +265,30 @@ bool vmo_no_perm_protect_test() {
 
     // map it with no permissions
     uintptr_t ptr;
-    status = zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, len, 0, &ptr);
+    status = zx_vmar_map(zx_vmar_root_self(), 0, 0, vmo, 0, len, &ptr);
     EXPECT_EQ(ZX_OK, status, "vm_map");
     EXPECT_NE(0u, ptr, "vm_map");
 
     // test writing to the mapping
-    size_t sz;
-    status = zx_cprng_draw(reinterpret_cast<void*>(ptr), 1, &sz);
-    EXPECT_NE(status, ZX_OK, "write");
-
-    // test reading from the mapping
-    status = zx_channel_write(channel[0], 0, reinterpret_cast<void*>(ptr), 1, nullptr, 0);
-    EXPECT_NE(status, ZX_OK, "read");
+    EXPECT_EQ(false, probe_for_write(reinterpret_cast<void*>(ptr)), "write");
+    // test reading to the mapping
+    EXPECT_EQ(false, probe_for_read(reinterpret_cast<void*>(ptr)), "read");
 
     // protect it to read permissions and make sure it works as expected
-    status = zx_vmar_protect(zx_vmar_root_self(), ptr, len, ZX_VM_FLAG_PERM_READ);
+    status = zx_vmar_protect(zx_vmar_root_self(), ZX_VM_PERM_READ, ptr, len);
     EXPECT_EQ(ZX_OK, status, "vm_protect");
 
     // test writing to the mapping
-    status = zx_cprng_draw(reinterpret_cast<void*>(ptr), 1, &sz);
-    EXPECT_NE(status, ZX_OK, "write");
+    EXPECT_EQ(false, probe_for_write(reinterpret_cast<void*>(ptr)), "write");
 
     // test reading from the mapping
-    status = zx_channel_write(channel[0], 0, reinterpret_cast<void*>(ptr), 1, nullptr, 0);
-    EXPECT_EQ(status, ZX_OK, "read");
+    EXPECT_EQ(true, probe_for_read(reinterpret_cast<void*>(ptr)), "read");
 
     status = zx_vmar_unmap(zx_vmar_root_self(), ptr, len);
     EXPECT_EQ(ZX_OK, status, "vm_unmap");
 
     // close the handle
     EXPECT_EQ(ZX_OK, zx_handle_close(vmo), "handle_close");
-    EXPECT_EQ(ZX_OK, zx_handle_close(channel[0]), "handle_close");
-    EXPECT_EQ(ZX_OK, zx_handle_close(channel[1]), "handle_close");
-
     END_TEST;
 }
 
@@ -365,10 +337,17 @@ bool vmo_resize_test() {
 
     // map it
     uintptr_t ptr;
-    status = zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, len,
-                         ZX_VM_FLAG_PERM_READ, &ptr);
+    status = zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ, 0, vmo, 0,
+                         len, &ptr);
     EXPECT_EQ(ZX_OK, status, "vm_map");
     EXPECT_NE(ptr, 0, "vm_map");
+
+    // attempt to map expecting an non resizable vmo.
+    uintptr_t ptr2;
+    status = zx_vmar_map(
+        zx_vmar_root_self(), ZX_VM_PERM_READ | ZX_VM_REQUIRE_NON_RESIZABLE, 0,
+        vmo, 0, len, &ptr2);
+    EXPECT_EQ(ZX_ERR_NOT_SUPPORTED, status, "vm_map");
 
     // resize it with it mapped
     status = zx_vmo_set_size(vmo, size);
@@ -383,6 +362,113 @@ bool vmo_resize_test() {
     EXPECT_EQ(ZX_OK, status, "handle_close");
 
     END_TEST;
+}
+
+// Check that non-resizable VMOs cannot get resized.
+static bool vmo_no_resize_helper(zx_handle_t vmo, const size_t len) {
+    BEGIN_TEST;
+
+    EXPECT_NE(vmo, ZX_HANDLE_INVALID);
+
+    zx_status_t status;
+    status = zx_vmo_set_size(vmo, len + PAGE_SIZE);
+    EXPECT_EQ(ZX_ERR_UNAVAILABLE, status, "vm_object_set_size");
+
+    status = zx_vmo_set_size(vmo, len - PAGE_SIZE);
+    EXPECT_EQ(ZX_ERR_UNAVAILABLE, status, "vm_object_set_size");
+
+    size_t size;
+    status = zx_vmo_get_size(vmo, &size);
+    EXPECT_EQ(ZX_OK, status, "vm_object_get_size");
+    EXPECT_EQ(len, size, "vm_object_get_size");
+
+    uintptr_t ptr;
+    status = zx_vmar_map(
+        zx_vmar_root_self(), ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_REQUIRE_NON_RESIZABLE,
+        0, vmo, 0, len,
+        &ptr);
+    ASSERT_EQ(ZX_OK, status, "vm_map");
+    ASSERT_NE(ptr, 0, "vm_map");
+
+    status = zx_vmar_unmap(zx_vmar_root_self(), ptr, len);
+    EXPECT_EQ(ZX_OK, status, "unmap");
+
+    status = zx_handle_close(vmo);
+    EXPECT_EQ(ZX_OK, status, "handle_close");
+
+    END_TEST;
+}
+
+bool vmo_no_resize_test() {
+    const size_t len = PAGE_SIZE * 4;
+    zx_handle_t vmo = ZX_HANDLE_INVALID;
+
+    zx_vmo_create(len, ZX_VMO_NON_RESIZABLE, &vmo);
+    return vmo_no_resize_helper(vmo, len);
+}
+
+bool vmo_info_test() {
+    size_t len = PAGE_SIZE * 4;
+    zx_handle_t vmo = ZX_HANDLE_INVALID;
+    zx_info_vmo_t info;
+    zx_status_t status;
+
+    // Create a non-resizeable VMO, query the INFO on it
+    // and dump it.
+    status = zx_vmo_create(len, ZX_VMO_NON_RESIZABLE, &vmo);
+    EXPECT_EQ(ZX_OK, status, "vm_info_test: vmo_create");
+
+    status = zx_object_get_info(vmo, ZX_INFO_VMO, &info,
+                                sizeof(info), nullptr, nullptr);
+    EXPECT_EQ(ZX_OK, status, "vm_info_test: info_vmo");
+
+    status = zx_handle_close(vmo);
+    EXPECT_EQ(ZX_OK, status, "vm_info_test: handle_close");
+
+    EXPECT_EQ(info.size_bytes, len, "vm_info_test: info_vmo.size_bytes");
+    EXPECT_NE(info.create_options, (1u << 0),
+              "vm_info_test: info_vmo.create_options");
+    EXPECT_EQ(info.cache_policy,
+              ZX_CACHE_POLICY_CACHED,
+              "vm_info_test: info_vmo.cache_policy");
+//    printf("NON_Resizeable VMO, size = %lu, create_options = %ux\n",
+//           info.size_bytes, info.create_options);
+
+    // Create a resizeable uncached VMO, query the INFO on it and dump it.
+    len = PAGE_SIZE * 8;
+    zx_vmo_create(len, 0, &vmo);
+    EXPECT_EQ(ZX_OK, status, "vm_info_test: vmo_create");
+    zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_UNCACHED);
+
+    status = zx_object_get_info(vmo, ZX_INFO_VMO, &info,
+                                sizeof(info), nullptr, nullptr);
+    EXPECT_EQ(ZX_OK, status, "vm_info_test: info_vmo");
+
+    status = zx_handle_close(vmo);
+    EXPECT_EQ(ZX_OK, status, "vm_info_test: handle_close");
+
+    EXPECT_EQ(info.size_bytes, len, "vm_info_test: info_vmo.size_bytes");
+    EXPECT_EQ(info.create_options, (1u << 0),
+              "vm_info_test: info_vmo.create_options");
+    EXPECT_EQ(info.cache_policy,
+              ZX_CACHE_POLICY_UNCACHED,
+              "vm_info_test: info_vmo.cache_policy");
+//    printf("Resizeable VMO, size = %lu, create_options = %ux\n",
+//           info.size_bytes, info.create_options);
+
+    END_TEST;
+}
+
+bool vmo_no_resize_clone_test() {
+    const size_t len = PAGE_SIZE * 4;
+    zx_handle_t vmo = ZX_HANDLE_INVALID;
+    zx_handle_t clone = ZX_HANDLE_INVALID;
+
+    zx_vmo_create(len, 0, &vmo);
+    zx_vmo_clone(vmo,
+        ZX_VMO_CLONE_COPY_ON_WRITE | ZX_VMO_CLONE_NON_RESIZEABLE,
+        0, len, &clone);
+    return vmo_no_resize_helper(clone, len);
 }
 
 bool vmo_size_align_test() {
@@ -411,7 +497,8 @@ bool vmo_size_align_test() {
 bool vmo_resize_align_test() {
     BEGIN_TEST;
 
-    // resize a vmo with a particular size and test that the resulting size is aligned on a page boundary
+    // resize a vmo with a particular size and test that the resulting size is aligned on a page
+    // boundary.
     zx_handle_t vmo;
     zx_status_t status = zx_vmo_create(0, 0, &vmo);
     EXPECT_EQ(ZX_OK, status, "vm_object_create");
@@ -462,10 +549,12 @@ bool vmo_clone_size_align_test() {
     END_TEST;
 }
 
-static bool rights_test_map_helper(zx_handle_t vmo, size_t len, uint32_t flags, bool expect_success, zx_status_t fail_err_code, const char *msg) {
+static bool rights_test_map_helper(
+    zx_handle_t vmo, size_t len, uint32_t flags,
+    bool expect_success, zx_status_t fail_err_code, const char *msg) {
     uintptr_t ptr;
 
-    zx_status_t r = zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, len, flags,
+    zx_status_t r = zx_vmar_map(zx_vmar_root_self(), flags, 0, vmo, 0, len,
                                 &ptr);
     if (expect_success) {
         EXPECT_EQ(ZX_OK, r, msg);
@@ -549,71 +638,71 @@ bool vmo_rights_test() {
 
     // full perm test
     if (!rights_test_map_helper(vmo, len, 0, true, 0, "map_noperms")) return false;
-    if (!rights_test_map_helper(vmo, len, ZX_VM_FLAG_PERM_READ, true, 0, "map_read")) return false;
-    if (!rights_test_map_helper(vmo, len, ZX_VM_FLAG_PERM_WRITE, false, ZX_ERR_INVALID_ARGS, "map_write")) return false;
-    if (!rights_test_map_helper(vmo, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE, true, 0, "map_readwrite")) return false;
-    if (!rights_test_map_helper(vmo, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE | ZX_VM_FLAG_PERM_EXECUTE, true, 0, "map_readwriteexec")) return false;
-    if (!rights_test_map_helper(vmo, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_EXECUTE, true, 0, "map_readexec")) return false;
+    if (!rights_test_map_helper(vmo, len, ZX_VM_PERM_READ, true, 0, "map_read")) return false;
+    if (!rights_test_map_helper(vmo, len, ZX_VM_PERM_WRITE, false, ZX_ERR_INVALID_ARGS, "map_write")) return false;
+    if (!rights_test_map_helper(vmo, len, ZX_VM_PERM_READ | ZX_VM_PERM_WRITE, true, 0, "map_readwrite")) return false;
+    if (!rights_test_map_helper(vmo, len, ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_PERM_EXECUTE, true, 0, "map_readwriteexec")) return false;
+    if (!rights_test_map_helper(vmo, len, ZX_VM_PERM_READ | ZX_VM_PERM_EXECUTE, true, 0, "map_readexec")) return false;
 
     // try most of the permuations of mapping a vmo with various rights dropped
     vmo2 = ZX_HANDLE_INVALID;
     zx_handle_duplicate(vmo, ZX_RIGHT_READ | ZX_RIGHT_WRITE | ZX_RIGHT_EXECUTE, &vmo2);
     if (!rights_test_map_helper(vmo2, len, 0, false, ZX_ERR_ACCESS_DENIED, "map_noperms")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ, false, ZX_ERR_ACCESS_DENIED, "map_read")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_WRITE, false, ZX_ERR_ACCESS_DENIED, "map_write")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE, false, ZX_ERR_ACCESS_DENIED, "map_readwrite")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE | ZX_VM_FLAG_PERM_EXECUTE, false, ZX_ERR_ACCESS_DENIED, "map_readwriteexec")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_EXECUTE, false, ZX_ERR_ACCESS_DENIED, "map_readexec")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ, false, ZX_ERR_ACCESS_DENIED, "map_read")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_WRITE, false, ZX_ERR_ACCESS_DENIED, "map_write")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ | ZX_VM_PERM_WRITE, false, ZX_ERR_ACCESS_DENIED, "map_readwrite")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_PERM_EXECUTE, false, ZX_ERR_ACCESS_DENIED, "map_readwriteexec")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ | ZX_VM_PERM_EXECUTE, false, ZX_ERR_ACCESS_DENIED, "map_readexec")) return false;
     zx_handle_close(vmo2);
 
     vmo2 = ZX_HANDLE_INVALID;
     zx_handle_duplicate(vmo, ZX_RIGHT_READ | ZX_RIGHT_MAP, &vmo2);
     if (!rights_test_map_helper(vmo2, len, 0, true, 0, "map_noperms")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ, true, 0, "map_read")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_WRITE, false, ZX_ERR_INVALID_ARGS, "map_write")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE, false, ZX_ERR_ACCESS_DENIED, "map_readwrite")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE | ZX_VM_FLAG_PERM_EXECUTE, false, ZX_ERR_ACCESS_DENIED, "map_readwriteexec")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_EXECUTE, false, ZX_ERR_ACCESS_DENIED, "map_readexec")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ, true, 0, "map_read")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_WRITE, false, ZX_ERR_INVALID_ARGS, "map_write")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ | ZX_VM_PERM_WRITE, false, ZX_ERR_ACCESS_DENIED, "map_readwrite")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_PERM_EXECUTE, false, ZX_ERR_ACCESS_DENIED, "map_readwriteexec")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ | ZX_VM_PERM_EXECUTE, false, ZX_ERR_ACCESS_DENIED, "map_readexec")) return false;
     zx_handle_close(vmo2);
 
     vmo2 = ZX_HANDLE_INVALID;
     zx_handle_duplicate(vmo, ZX_RIGHT_WRITE | ZX_RIGHT_MAP, &vmo2);
     if (!rights_test_map_helper(vmo2, len, 0, true, 0, "map_noperms")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ, false, ZX_ERR_ACCESS_DENIED, "map_read")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_WRITE, false, ZX_ERR_INVALID_ARGS, "map_write")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE, false, ZX_ERR_ACCESS_DENIED, "map_readwrite")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE | ZX_VM_FLAG_PERM_EXECUTE, false, ZX_ERR_ACCESS_DENIED, "map_readwriteexec")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_EXECUTE, false, ZX_ERR_ACCESS_DENIED, "map_readexec")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ, false, ZX_ERR_ACCESS_DENIED, "map_read")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_WRITE, false, ZX_ERR_INVALID_ARGS, "map_write")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ | ZX_VM_PERM_WRITE, false, ZX_ERR_ACCESS_DENIED, "map_readwrite")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_PERM_EXECUTE, false, ZX_ERR_ACCESS_DENIED, "map_readwriteexec")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ | ZX_VM_PERM_EXECUTE, false, ZX_ERR_ACCESS_DENIED, "map_readexec")) return false;
     zx_handle_close(vmo2);
 
     vmo2 = ZX_HANDLE_INVALID;
     zx_handle_duplicate(vmo, ZX_RIGHT_READ | ZX_RIGHT_WRITE | ZX_RIGHT_MAP, &vmo2);
     if (!rights_test_map_helper(vmo2, len, 0, true, 0, "map_noperms")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ, true, 0, "map_read")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_WRITE, false, ZX_ERR_INVALID_ARGS, "map_write")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE, true, 0, "map_readwrite")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE | ZX_VM_FLAG_PERM_EXECUTE, false, ZX_ERR_ACCESS_DENIED, "map_readwriteexec")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_EXECUTE, false, ZX_ERR_ACCESS_DENIED, "map_readexec")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ, true, 0, "map_read")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_WRITE, false, ZX_ERR_INVALID_ARGS, "map_write")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ | ZX_VM_PERM_WRITE, true, 0, "map_readwrite")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_PERM_EXECUTE, false, ZX_ERR_ACCESS_DENIED, "map_readwriteexec")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ | ZX_VM_PERM_EXECUTE, false, ZX_ERR_ACCESS_DENIED, "map_readexec")) return false;
     zx_handle_close(vmo2);
 
     vmo2 = ZX_HANDLE_INVALID;
     zx_handle_duplicate(vmo, ZX_RIGHT_READ | ZX_RIGHT_EXECUTE | ZX_RIGHT_MAP, &vmo2);
     if (!rights_test_map_helper(vmo2, len, 0, true, 0, "map_noperms")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ, true, 0, "map_read")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_WRITE, false, ZX_ERR_INVALID_ARGS, "map_write")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE, false, ZX_ERR_ACCESS_DENIED, "map_readwrite")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE | ZX_VM_FLAG_PERM_EXECUTE, false, ZX_ERR_ACCESS_DENIED, "map_readwriteexec")) return false;
-    if (!rights_test_map_helper(vmo, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_EXECUTE, true, 0, "map_readexec")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ, true, 0, "map_read")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_WRITE, false, ZX_ERR_INVALID_ARGS, "map_write")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ | ZX_VM_PERM_WRITE, false, ZX_ERR_ACCESS_DENIED, "map_readwrite")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_PERM_EXECUTE, false, ZX_ERR_ACCESS_DENIED, "map_readwriteexec")) return false;
+    if (!rights_test_map_helper(vmo, len, ZX_VM_PERM_READ | ZX_VM_PERM_EXECUTE, true, 0, "map_readexec")) return false;
     zx_handle_close(vmo2);
 
     vmo2 = ZX_HANDLE_INVALID;
     zx_handle_duplicate(vmo, ZX_RIGHT_READ | ZX_RIGHT_WRITE | ZX_RIGHT_EXECUTE | ZX_RIGHT_MAP, &vmo2);
     if (!rights_test_map_helper(vmo2, len, 0, true, 0, "map_noperms")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ, true, 0, "map_read")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_WRITE, false, ZX_ERR_INVALID_ARGS, "map_write")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE, true, 0, "map_readwrite")) return false;
-    if (!rights_test_map_helper(vmo2, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE | ZX_VM_FLAG_PERM_EXECUTE, true, 0, "map_readwriteexec")) return false;
-    if (!rights_test_map_helper(vmo, len, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_EXECUTE, true, 0, "map_readexec")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ, true, 0, "map_read")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_WRITE, false, ZX_ERR_INVALID_ARGS, "map_write")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ | ZX_VM_PERM_WRITE, true, 0, "map_readwrite")) return false;
+    if (!rights_test_map_helper(vmo2, len, ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_PERM_EXECUTE, true, 0, "map_readwriteexec")) return false;
+    if (!rights_test_map_helper(vmo, len, ZX_VM_PERM_READ | ZX_VM_PERM_EXECUTE, true, 0, "map_readexec")) return false;
     zx_handle_close(vmo2);
 
     // test that we can get/set a property on it
@@ -659,22 +748,25 @@ bool vmo_commit_test() {
 
     // map it
     ptr = 0;
-    status = zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size,
-                         ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &ptr);
+    status = zx_vmar_map(zx_vmar_root_self(),
+                         ZX_VM_PERM_READ|ZX_VM_PERM_WRITE,
+                         0, vmo, 0, size, &ptr);
     EXPECT_EQ(ZX_OK, status, "map");
     EXPECT_NE(ptr, 0, "map address");
 
     // second mapping with an offset
     ptr2 = 0;
-    status = zx_vmar_map(zx_vmar_root_self(), 0, vmo, PAGE_SIZE, size,
-                         ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &ptr2);
+    status = zx_vmar_map(zx_vmar_root_self(),
+                         ZX_VM_PERM_READ|ZX_VM_PERM_WRITE,
+                         0, vmo, PAGE_SIZE, size, &ptr2);
     EXPECT_EQ(ZX_OK, status, "map2");
     EXPECT_NE(ptr2, 0, "map address2");
 
     // third mapping with a totally non-overlapping offset
     ptr3 = 0;
-    status = zx_vmar_map(zx_vmar_root_self(), 0, vmo, size * 2, size,
-                         ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &ptr3);
+    status = zx_vmar_map(zx_vmar_root_self(),
+                         ZX_VM_PERM_READ|ZX_VM_PERM_WRITE,
+                         0, vmo, size * 2, size, &ptr3);
     EXPECT_EQ(ZX_OK, status, "map3");
     EXPECT_NE(ptr3, 0, "map address3");
 
@@ -735,7 +827,7 @@ bool vmo_zero_page_test() {
     // make a few mappings of the vmo
     for (auto &p: ptr) {
         EXPECT_EQ(ZX_OK,
-                zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size, ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &p),
+                zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ|ZX_VM_PERM_WRITE, 0, vmo, 0, size, &p),
                 "map");
         EXPECT_NONNULL(ptr, "map address");
     }
@@ -841,7 +933,6 @@ bool vmo_clone_test_2() {
 
     zx_handle_t vmo;
     zx_handle_t clone_vmo[1];
-    //uintptr_t ptr;
 
     // create a vmo
     const size_t size = PAGE_SIZE * 4;
@@ -933,17 +1024,25 @@ bool vmo_clone_test_3() {
 
     // map it
     EXPECT_EQ(ZX_OK,
-            zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size, ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &ptr),
+            zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ|ZX_VM_PERM_WRITE, 0, vmo, 0, size, &ptr),
             "map");
     EXPECT_NE(ptr, 0, "map address");
     p = (volatile uint32_t *)ptr;
 
-    // clone it and map that
+    // clone it
     clone_vmo[0] = ZX_HANDLE_INVALID;
-    EXPECT_EQ(ZX_OK, zx_vmo_clone(vmo, ZX_VMO_CLONE_COPY_ON_WRITE, 0, size, &clone_vmo[0]), "vm_clone");
+    EXPECT_EQ(ZX_OK, zx_vmo_clone(vmo, ZX_VMO_CLONE_COPY_ON_WRITE, 0, size, &clone_vmo[0]),"vm_clone");
     EXPECT_NE(ZX_HANDLE_INVALID, clone_vmo[0], "vm_clone_handle");
+
+    // Attempt a non-resizable map fails.
+    EXPECT_EQ(ZX_ERR_NOT_SUPPORTED,
+        zx_vmar_map(zx_vmar_root_self(),
+            ZX_VM_PERM_READ|ZX_VM_PERM_WRITE|ZX_VM_REQUIRE_NON_RESIZABLE,
+            0, clone_vmo[0], 0, size, &clone_ptr), "map");
+
+    // Regular resizable mapping works.
     EXPECT_EQ(ZX_OK,
-            zx_vmar_map(zx_vmar_root_self(), 0, clone_vmo[0], 0, size, ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &clone_ptr),
+        zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ|ZX_VM_PERM_WRITE, 0, clone_vmo[0], 0, size, &clone_ptr),
             "map");
     EXPECT_NE(clone_ptr, 0, "map address");
     cp = (volatile uint32_t *)clone_ptr;
@@ -1004,7 +1103,7 @@ bool vmo_clone_decommit_test() {
 
     // map it
     EXPECT_EQ(ZX_OK,
-            zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size, ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &ptr),
+            zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ|ZX_VM_PERM_WRITE, 0, vmo, 0, size, &ptr),
             "map");
     EXPECT_NE(ptr, 0, "map address");
     p = (volatile uint32_t *)ptr;
@@ -1014,7 +1113,7 @@ bool vmo_clone_decommit_test() {
     EXPECT_EQ(ZX_OK, zx_vmo_clone(vmo, ZX_VMO_CLONE_COPY_ON_WRITE, 0, size, &clone_vmo), "vm_clone");
     EXPECT_NE(ZX_HANDLE_INVALID, clone_vmo, "vm_clone_handle");
     EXPECT_EQ(ZX_OK,
-            zx_vmar_map(zx_vmar_root_self(), 0, clone_vmo, 0, size, ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &clone_ptr),
+            zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ|ZX_VM_PERM_WRITE, 0, clone_vmo, 0, size, &clone_ptr),
             "map");
     EXPECT_NE(clone_ptr, 0, "map address");
     cp = (volatile uint32_t *)clone_ptr;
@@ -1071,7 +1170,7 @@ bool vmo_clone_commit_test() {
 
     // map it
     EXPECT_EQ(ZX_OK,
-            zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size, ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &ptr),
+            zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ|ZX_VM_PERM_WRITE, 0, vmo, 0, size, &ptr),
             "map");
     EXPECT_NE(ptr, 0, "map address");
     p = (volatile uint32_t *)ptr;
@@ -1081,7 +1180,7 @@ bool vmo_clone_commit_test() {
     EXPECT_EQ(ZX_OK, zx_vmo_clone(vmo, ZX_VMO_CLONE_COPY_ON_WRITE, 0, size, &clone_vmo), "vm_clone");
     EXPECT_NE(ZX_HANDLE_INVALID, clone_vmo, "vm_clone_handle");
     EXPECT_EQ(ZX_OK,
-            zx_vmar_map(zx_vmar_root_self(), 0, clone_vmo, 0, size, ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &clone_ptr),
+            zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ|ZX_VM_PERM_WRITE, 0, clone_vmo, 0, size,  &clone_ptr),
             "map");
     EXPECT_NE(clone_ptr, 0, "map address");
     cp = (volatile uint32_t *)clone_ptr;
@@ -1147,7 +1246,7 @@ bool vmo_cache_test() {
 
     // map the vmo, make sure policy doesn't set
     uintptr_t ptr;
-    EXPECT_EQ(ZX_OK, zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size, ZX_VM_FLAG_PERM_READ, &ptr));
+    EXPECT_EQ(ZX_OK, zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ, 0, vmo, 0, size, &ptr));
     EXPECT_EQ(ZX_ERR_BAD_STATE, zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_CACHED));
     EXPECT_EQ(ZX_OK, zx_vmar_unmap(zx_vmar_root_self(), ptr, size));
     EXPECT_EQ(ZX_OK, zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_CACHED));
@@ -1201,8 +1300,9 @@ bool vmo_cache_map_test() {
 
         // map it
         uintptr_t ptr;
-        EXPECT_EQ(ZX_OK, zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size,
-                  ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE | ZX_VM_FLAG_MAP_RANGE, &ptr));
+        EXPECT_EQ(ZX_OK, zx_vmar_map(zx_vmar_root_self(),
+                  ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_MAP_RANGE,
+                  0, vmo, 0, size, &ptr));
 
         volatile uint32_t *buf = (volatile uint32_t *)ptr;
 
@@ -1211,16 +1311,16 @@ bool vmo_cache_map_test() {
             buf[i] = 0;
 
         // write to it
-        zx_time_t wt = zx_clock_get(ZX_CLOCK_MONOTONIC);
+        zx_time_t wt = zx_clock_get_monotonic();
         for (size_t i = 0; i < size / 4; i++)
             buf[i] = 0;
-        wt = zx_clock_get(ZX_CLOCK_MONOTONIC) - wt;
+        wt = zx_clock_get_monotonic() - wt;
 
         // read from it
-        zx_time_t rt = zx_clock_get(ZX_CLOCK_MONOTONIC);
+        zx_time_t rt = zx_clock_get_monotonic();
         for (size_t i = 0; i < size / 4; i++)
             __UNUSED uint32_t hole = buf[i];
-        rt = zx_clock_get(ZX_CLOCK_MONOTONIC) - rt;
+        rt = zx_clock_get_monotonic() - rt;
 
         printf("took %" PRIu64 " nsec to write %s memory\n", wt, type);
         printf("took %" PRIu64 " nsec to read %s memory\n", rt, type);
@@ -1285,14 +1385,14 @@ bool vmo_cache_flush_test() {
 
     uintptr_t ptr_ro;
     EXPECT_EQ(ZX_OK,
-            zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size, ZX_VM_FLAG_PERM_READ, &ptr_ro),
+            zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ, 0, vmo, 0, size, &ptr_ro),
             "map");
     EXPECT_NE(ptr_ro, 0, "map address");
     void *pro = (void*)ptr_ro;
 
     uintptr_t ptr_rw;
     EXPECT_EQ(ZX_OK,
-            zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE, &ptr_rw),
+            zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ | ZX_VM_PERM_WRITE, 0, vmo, 0, size, &ptr_rw),
             "map");
     EXPECT_NE(ptr_rw, 0, "map address");
     void *prw = (void*)ptr_rw;
@@ -1349,7 +1449,7 @@ bool vmo_clone_test_4() {
 
     // map it
     EXPECT_EQ(ZX_OK,
-            zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size, ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &ptr),
+            zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ|ZX_VM_PERM_WRITE, 0, vmo, 0, size, &ptr),
             "map");
     EXPECT_NE(ptr, 0, "map address");
     p = (volatile size_t *)ptr;
@@ -1368,7 +1468,7 @@ bool vmo_clone_test_4() {
 
     // map the clone
     EXPECT_EQ(ZX_OK,
-            zx_vmar_map(zx_vmar_root_self(), 0, clone_vmo[0], 0, size, ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &clone_ptr),
+            zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ|ZX_VM_PERM_WRITE, 0, clone_vmo[0], 0, size, &clone_ptr),
             "map");
     EXPECT_NE(clone_ptr, 0, "map address");
     cp = (volatile size_t *)clone_ptr;
@@ -1485,6 +1585,95 @@ bool vmo_clone_rights_test() {
     END_TEST;
 }
 
+// Resizing a regular mapped VMO causes a fault.
+bool vmo_resize_hazard() {
+    BEGIN_TEST;
+
+    const size_t size = PAGE_SIZE * 2;
+    zx_handle_t vmo;
+    ASSERT_EQ(zx_vmo_create(size, 0, &vmo), ZX_OK);
+
+    uintptr_t ptr_rw;
+    EXPECT_EQ(ZX_OK, zx_vmar_map(
+            zx_vmar_root_self(), ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
+            0, vmo, 0, size, &ptr_rw), "map");
+
+    auto int_arr = reinterpret_cast<int*>(ptr_rw);
+    EXPECT_EQ(int_arr[1], 0);
+
+    EXPECT_EQ(ZX_OK, zx_vmo_set_size(vmo, 0u));
+
+    EXPECT_EQ(false, probe_for_read(&int_arr[1]), "read probe");
+    EXPECT_EQ(false, probe_for_write(&int_arr[1]), "write probe");
+
+    EXPECT_EQ(ZX_OK, zx_handle_close(vmo));
+    EXPECT_EQ(ZX_OK, zx_vmar_unmap(zx_vmar_root_self(), ptr_rw, size), "unmap");
+
+    END_TEST;
+}
+
+// Resizing a cloned VMO causes a fault.
+bool vmo_clone_resize_clone_hazard() {
+    BEGIN_TEST;
+
+    const size_t size = PAGE_SIZE * 2;
+    zx_handle_t vmo;
+    ASSERT_EQ(zx_vmo_create(size, 0, &vmo), ZX_OK);
+
+    zx_handle_t clone_vmo;
+    EXPECT_EQ(ZX_OK, zx_vmo_clone(
+        vmo, ZX_VMO_CLONE_COPY_ON_WRITE, 0, size, &clone_vmo), "vm_clone");
+
+    uintptr_t ptr_rw;
+    EXPECT_EQ(ZX_OK, zx_vmar_map(
+            zx_vmar_root_self(), ZX_VM_PERM_READ | ZX_VM_PERM_WRITE, 0,
+            clone_vmo, 0, size, &ptr_rw), "map");
+
+    auto int_arr = reinterpret_cast<int*>(ptr_rw);
+    EXPECT_EQ(int_arr[1], 0);
+
+    EXPECT_EQ(ZX_OK, zx_vmo_set_size(clone_vmo, 0u));
+
+    EXPECT_EQ(false, probe_for_read(&int_arr[1]), "read probe");
+    EXPECT_EQ(false, probe_for_write(&int_arr[1]), "write probe");
+
+    EXPECT_EQ(ZX_OK, zx_handle_close(vmo));
+    EXPECT_EQ(ZX_OK, zx_handle_close(clone_vmo));
+    EXPECT_EQ(ZX_OK, zx_vmar_unmap(zx_vmar_root_self(), ptr_rw, size), "unmap");
+    END_TEST;
+}
+
+// Resizing the parent VMO and accessing via a mapped VMO is ok.
+bool vmo_clone_resize_parent_ok() {
+    BEGIN_TEST;
+
+    const size_t size = PAGE_SIZE * 2;
+    zx_handle_t vmo;
+    ASSERT_EQ(zx_vmo_create(size, 0, &vmo), ZX_OK);
+
+    zx_handle_t clone_vmo;
+    EXPECT_EQ(ZX_OK, zx_vmo_clone(
+        vmo, ZX_VMO_CLONE_COPY_ON_WRITE, 0, size, &clone_vmo), "vm_clone");
+
+    uintptr_t ptr_rw;
+    EXPECT_EQ(ZX_OK, zx_vmar_map(
+            zx_vmar_root_self(), ZX_VM_PERM_READ | ZX_VM_PERM_WRITE, 0,
+            clone_vmo, 0, size, &ptr_rw), "map");
+
+    auto int_arr = reinterpret_cast<int*>(ptr_rw);
+    EXPECT_EQ(int_arr[1], 0);
+
+    EXPECT_EQ(ZX_OK, zx_vmo_set_size(vmo, 0u));
+
+    EXPECT_EQ(true, probe_for_read(&int_arr[1]), "read probe");
+    EXPECT_EQ(true, probe_for_write(&int_arr[1]), "write probe");
+
+    EXPECT_EQ(ZX_OK, zx_handle_close(vmo));
+    EXPECT_EQ(ZX_OK, zx_handle_close(clone_vmo));
+    EXPECT_EQ(ZX_OK, zx_vmar_unmap(zx_vmar_root_self(), ptr_rw, size), "unmap");
+    END_TEST;
+}
+
 bool vmo_unmap_coherency() {
     BEGIN_TEST;
 
@@ -1507,9 +1696,9 @@ bool vmo_unmap_coherency() {
 
     // do a regular map
     uintptr_t ptr = 0;
-    status = zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, len,
-                         ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE,
-                         &ptr);
+    status = zx_vmar_map(zx_vmar_root_self(),
+                         ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
+                         0, vmo, 0, len, &ptr);
     EXPECT_EQ(ZX_OK, status, "map");
     EXPECT_NE(0u, ptr, "map address");
 
@@ -1551,13 +1740,13 @@ bool vmo_unmap_coherency() {
 
     const zx_time_t max_duration = ZX_SEC(30);
     const zx_time_t max_wait = ZX_SEC(1);
-    zx_time_t start = zx_clock_get(ZX_CLOCK_MONOTONIC);
+    zx_time_t start = zx_clock_get_monotonic();
     for (;;) {
         // wait for it to loop at least once
-        zx_time_t t = zx_clock_get(ZX_CLOCK_MONOTONIC);
+        zx_time_t t = zx_clock_get_monotonic();
         size_t last_count = args.count.load();
         while (args.count.load() <= last_count) {
-            if (zx_clock_get(ZX_CLOCK_MONOTONIC) - t > max_wait) {
+            if (zx_clock_get_monotonic() - t > max_wait) {
                 UNITTEST_FAIL_TRACEF("looper appears stuck!\n");
                 break;
             }
@@ -1567,7 +1756,7 @@ bool vmo_unmap_coherency() {
         status = zx_vmo_op_range(vmo, ZX_VMO_OP_DECOMMIT, 0, len, nullptr, 0);
         EXPECT_EQ(0, status, "vm decommit");
 
-        if (zx_clock_get(ZX_CLOCK_MONOTONIC) - start > max_duration)
+        if (zx_clock_get_monotonic() - start > max_duration)
             break;
     }
 
@@ -1588,6 +1777,8 @@ RUN_TEST(vmo_read_only_map_test);
 RUN_TEST(vmo_no_perm_map_test);
 RUN_TEST(vmo_no_perm_protect_test);
 RUN_TEST(vmo_resize_test);
+RUN_TEST(vmo_no_resize_test);
+RUN_TEST(vmo_no_resize_clone_test);
 RUN_TEST(vmo_size_align_test);
 RUN_TEST(vmo_resize_align_test);
 RUN_TEST(vmo_clone_size_align_test);
@@ -1606,6 +1797,10 @@ RUN_TEST(vmo_clone_test_4);
 RUN_TEST(vmo_clone_decommit_test);
 RUN_TEST(vmo_clone_commit_test);
 RUN_TEST(vmo_clone_rights_test);
+RUN_TEST(vmo_resize_hazard);
+RUN_TEST(vmo_clone_resize_clone_hazard);
+RUN_TEST(vmo_clone_resize_parent_ok);
+RUN_TEST(vmo_info_test);
 RUN_TEST_LARGE(vmo_unmap_coherency);
 END_TEST_CASE(vmo_tests)
 

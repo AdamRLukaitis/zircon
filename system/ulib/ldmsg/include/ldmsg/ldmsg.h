@@ -15,13 +15,12 @@
 
 __BEGIN_CDECLS
 
-// See <zircon/loader.fidl> for the definition of these message ordinals.
+// See system/fidl/fuchsia-ldsvc/ldsvc.fidl for the definition of these message ordinals.
 #define LDMSG_OP_DONE                    1u
 #define LDMSG_OP_LOAD_OBJECT             2u
 #define LDMSG_OP_LOAD_SCRIPT_INTERPRETER 3u
 #define LDMSG_OP_CONFIG                  4u
 #define LDMSG_OP_CLONE                   5u
-#define LDMSG_OP_DEBUG_PRINT             6u
 #define LDMSG_OP_DEBUG_PUBLISH_DATA_SINK 7u
 #define LDMSG_OP_DEBUG_LOAD_CONFIG       8u
 

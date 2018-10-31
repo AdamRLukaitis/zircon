@@ -31,13 +31,13 @@
 #define USB_REQ_RESET               0xFF
 #define USB_REQ_GET_MAX_LUN         0xFE
 
-// fs = feature selector, don't really know much about control requests,
-// so not sure what that means
-#define FS_ENDPOINT_HALT            0x00
-
 // error codes for CSW processing
-typedef enum {CSW_SUCCESS, CSW_FAILED, CSW_PHASE_ERROR, CSW_INVALID,
-                CSW_TAG_MISMATCH} csw_status_t;
+typedef uint32_t csw_status_t;
+#define CSW_SUCCESS      ((csw_status_t)0)
+#define CSW_FAILED       ((csw_status_t)1)
+#define CSW_PHASE_ERROR  ((csw_status_t)2)
+#define CSW_INVALID      ((csw_status_t)3)
+#define CSW_TAG_MISMATCH ((csw_status_t)4)
 
 // signatures in header and status
 #define CBW_SIGNATURE               0x43425355

@@ -27,7 +27,8 @@ namespace fidl {
 
 class JSONGenerator {
 public:
-    explicit JSONGenerator(const flat::Library* library) : library_(library) {}
+    explicit JSONGenerator(const flat::Library* library)
+        : library_(library) {}
 
     ~JSONGenerator() = default;
 
@@ -35,29 +36,34 @@ public:
 
 private:
     enum class Position {
-        First,
-        Subsequent,
+        kFirst,
+        kSubsequent,
     };
 
     void GenerateEOF();
 
-    template <typename Iterator> void GenerateArray(Iterator begin, Iterator end);
+    template <typename Iterator>
+    void GenerateArray(Iterator begin, Iterator end);
 
-    template <typename Collection> void GenerateArray(const Collection& collection);
+    template <typename Collection>
+    void GenerateArray(const Collection& collection);
 
     void GenerateObjectPunctuation(Position position);
 
-    template <typename Callback> void GenerateObject(Callback callback);
+    template <typename Callback>
+    void GenerateObject(Callback callback);
 
     template <typename Type>
     void GenerateObjectMember(StringView key, const Type& value,
-                              Position position = Position::Subsequent);
+                              Position position = Position::kSubsequent);
 
-    template <typename T> void Generate(const std::unique_ptr<T>& value);
+    template <typename T>
+    void Generate(const std::unique_ptr<T>& value);
 
     void Generate(const flat::Decl* decl);
 
-    template <typename T> void Generate(const std::vector<T>& value);
+    template <typename T>
+    void Generate(const std::vector<T>& value);
 
     void Generate(bool value);
     void Generate(StringView value);
@@ -73,8 +79,8 @@ private:
     void Generate(const raw::Type& value);
     void Generate(const raw::Attribute& value);
     void Generate(const raw::AttributeList& value);
+    void Generate(const raw::Ordinal& value);
 
-    void Generate(const flat::Ordinal& value);
     void Generate(const flat::Name& value);
     void Generate(const flat::Type& value);
     void Generate(const flat::Constant& value);
@@ -82,18 +88,19 @@ private:
     void Generate(const flat::Enum& value);
     void Generate(const flat::Enum::Member& value);
     void Generate(const flat::Interface& value);
-    void Generate(const flat::Interface::Method& value);
+    void Generate(const flat::Interface::Method* value);
     void Generate(const flat::Interface::Method::Parameter& value);
     void Generate(const flat::Struct& value);
     void Generate(const flat::Struct::Member& value);
+    void Generate(const flat::Table& value);
+    void Generate(const flat::Table::Member& value);
     void Generate(const flat::Union& value);
     void Generate(const flat::Union::Member& value);
-    void
-    Generate(const std::pair<const StringView, std::unique_ptr<flat::Library>>& library_dependency);
+    void Generate(const flat::Library* library);
 
     void GenerateDeclarationsEntry(int count, const flat::Name& name, StringView decl);
     void GenerateDeclarationsMember(const flat::Library* library,
-                                    Position position = Position::Subsequent);
+                                    Position position = Position::kSubsequent);
 
     const flat::Library* library_;
     int indent_level_;

@@ -4,164 +4,146 @@
 
 #pragma once
 
-#include <lib/async/dispatcher.h>
-#include <lib/async/wait.h>
 #include <fbl/function.h>
-#include <fbl/macros.h>
+#include <lib/async/wait.h>
 
 namespace async {
 
-// C++ wrapper for a pending wait operation.
+// Holds context for an asynchronous wait and its handler, with RAII semantics.
+// Automatically cancels the wait when it goes out of scope.
 //
-// This class is thread-safe.
+// After successfully beginning the wait, the client is responsible for retaining
+// the structure in memory (and unmodified) until the wait's handler runs, the wait
+// is successfully canceled, or the dispatcher shuts down.  Thereafter, the wait
+// may be begun again or destroyed.
 //
-// Example usage:
+// This class must only be used with single-threaded asynchronous dispatchers
+// and must only be accessed on the dispatch thread since it lacks internal
+// synchronization of its state.
 //
-//   class Foo {
-//       Foo() { wait_.set_handler(fbl::BindMember(this, &Foo::Handle)); }
-//       async_wait_result_t Handle(...) { ... };
-//       async::Wait wait_;
-//   };
+// Concrete implementations: |async::Wait|, |async::WaitMethod|.
+// Please do not create subclasses of WaitBase outside of this library.
+class WaitBase {
+protected:
+    explicit WaitBase(zx_handle_t object, zx_signals_t trigger,
+                      async_wait_handler_t* handler);
+    ~WaitBase();
+
+    WaitBase(const WaitBase&) = delete;
+    WaitBase(WaitBase&&) = delete;
+    WaitBase& operator=(const WaitBase&) = delete;
+    WaitBase& operator=(WaitBase&&) = delete;
+
+public:
+    // Gets or sets the object to wait for signals on.
+    zx_handle_t object() const { return wait_.object; }
+    void set_object(zx_handle_t object) { wait_.object = object; }
+
+    // Gets or set of signals to wait for.
+    zx_signals_t trigger() const { return wait_.trigger; }
+    void set_trigger(zx_signals_t trigger) { wait_.trigger = trigger; }
+
+    // Returns true if the wait has begun and not yet completed or been canceled.
+    bool is_pending() const { return dispatcher_ != nullptr; }
+
+    // Begins asynchronously waiting for the object to receive one or more of
+    // the trigger signals.  Invokes the handler when the wait completes.
+    //
+    // The wait's handler will be invoked exactly once unless the wait is canceled.
+    // When the dispatcher is shutting down (being destroyed), the handlers of
+    // all remaining waits will be invoked with a status of |ZX_ERR_CANCELED|.
+    //
+    // Returns |ZX_OK| if the wait was successfully begun.
+    // Returns |ZX_ERR_ACCESS_DENIED| if the object does not have |ZX_RIGHT_WAIT|.
+    // Returns |ZX_ERR_BAD_STATE| if the dispatcher is shutting down.
+    // Returns |ZX_ERR_NOT_SUPPORTED| if not supported by the dispatcher.
+    zx_status_t Begin(async_dispatcher_t* dispatcher);
+
+    // Cancels the wait.
+    //
+    // If successful, the wait's handler will not run.
+    //
+    // Returns |ZX_OK| if the wait was pending and it has been successfully
+    // canceled; its handler will not run again and can be released immediately.
+    // Returns |ZX_ERR_NOT_FOUND| if there was no pending wait either because it
+    // already completed, or had not been started.
+    // Returns |ZX_ERR_NOT_SUPPORTED| if not supported by the dispatcher.
+    zx_status_t Cancel();
+
+protected:
+    template <typename T>
+    static T* Dispatch(async_wait* wait) {
+        static_assert(offsetof(WaitBase, wait_) == 0, "");
+        auto self = reinterpret_cast<WaitBase*>(wait);
+        self->dispatcher_ = nullptr;
+        return static_cast<T*>(self);
+    }
+
+private:
+    async_wait_t wait_;
+    async_dispatcher_t* dispatcher_ = nullptr;
+};
+
+// An asynchronous wait whose handler is bound to a |async::Wait::Handler| function.
 //
-// Note that when set_handler() is used with fbl::BindMember() (as in the
-// example above), async::WaitMethod should be used instead, if possible,
-// because it is more efficient.  Using async::WaitMethod will generate
-// less code and use fewer indirect jumps at run time for dispatching each
-// event.
-class Wait final : private async_wait_t {
+// Prefer using |async::WaitMethod| instead for binding to a fixed class member
+// function since it is more efficient to dispatch.
+class Wait final : public WaitBase {
 public:
     // Handles completion of asynchronous wait operations.
     //
-    // Reports the |status| of the wait.  If the status is |ZX_OK| then |signal|
-    // describes the signal which was received, otherwise |signal| is null.
-    //
-    // The result indicates whether the wait should be repeated; it may
-    // modify the wait's properties (such as the trigger) before returning.
-    //
-    // The result must be |ASYNC_WAIT_FINISHED| if |status| was not |ZX_OK|.
-    //
-    // It is safe for the handler to destroy itself when returning |ASYNC_WAIT_FINISHED|.
-    using Handler = fbl::Function<async_wait_result_t(async_t* async,
-                                                      zx_status_t status,
-                                                      const zx_packet_signal_t* signal)>;
+    // The |status| is |ZX_OK| if the wait was satisfied and |signal| is non-null.
+    // The |status| is |ZX_ERR_CANCELED| if the dispatcher was shut down before
+    // the task's handler ran or the task was canceled.
+    using Handler = fbl::Function<void(async_dispatcher_t* dispatcher,
+                                       async::Wait* wait,
+                                       zx_status_t status,
+                                       const zx_packet_signal_t* signal)>;
 
-    // Initializes the properties of the wait operation.
     explicit Wait(zx_handle_t object = ZX_HANDLE_INVALID,
-                  zx_signals_t trigger = ZX_SIGNAL_NONE, uint32_t flags = 0u);
-
-    // Destroys the wait operation.
-    //
-    // This object must not be destroyed until the wait has completed, been
-    // successfully canceled, or the asynchronous dispatcher itself has
-    // been destroyed.
+                  zx_signals_t trigger = ZX_SIGNAL_NONE,
+                  Handler handler = nullptr);
     ~Wait();
 
-    // Gets or sets the handler to invoke when the wait completes.
-    // Must be set before beginning the wait.
-    const Handler& handler() const { return handler_; }
     void set_handler(Handler handler) { handler_ = fbl::move(handler); }
-
-    // The object to wait for signals on.
-    zx_handle_t object() const { return async_wait_t::object; }
-    void set_object(zx_handle_t object) { async_wait_t::object = object; }
-
-    // The set of signals to wait for.
-    zx_signals_t trigger() const { return async_wait_t::trigger; }
-    void set_trigger(zx_signals_t trigger) { async_wait_t::trigger = trigger; }
-
-    // Valid flags: |ASYNC_FLAG_HANDLE_SHUTDOWN|.
-    uint32_t flags() const { return async_wait_t::flags; }
-    void set_flags(uint32_t flags) { async_wait_t::flags = flags; }
-
-    // Begins asynchronously waiting for the object to receive one or more of
-    // the trigger signals.
-    //
-    // See |async_begin_wait()| for details.
-    zx_status_t Begin(async_t* async);
-
-    // Cancels the wait.
-    //
-    // See |async_cancel_wait()| for details.
-    zx_status_t Cancel(async_t* async);
+    bool has_handler() const { return !!handler_; }
 
 private:
-    static async_wait_result_t CallHandler(async_t* async, async_wait_t* wait,
-                                           zx_status_t status, const zx_packet_signal_t* signal);
+    static void CallHandler(async_dispatcher_t* dispatcher, async_wait_t* wait,
+                            zx_status_t status, const zx_packet_signal_t* signal);
 
     Handler handler_;
-
-    DISALLOW_COPY_ASSIGN_AND_MOVE(Wait);
 };
 
-// C++ wrapper for a pending wait operation, for binding to a fixed class
-// member function.
+// An asynchronous wait whose handler is bound to a fixed class member function.
 //
-// This class is thread-safe.
+// Usage:
 //
-// Example usage:
-//
-//   class Foo {
-//       async_wait_result_t Handle(...) { ... };
-//       async::WaitMethod<Foo, &Foo::Handle> wait_{this};
-//   };
-//
-// async::WaitMethod should be used in preference to async::Wait when
-// possible, because it is more efficient when binding to class member
-// functions.
+// class Foo {
+//     void Handle(async_dispatcher_t* dispatcher, async::WaitBase* wait, zx_status_t status,
+//                 const zx_packet_signal_t* signal) { ... }
+//     async::WaitMethod<Foo, &Foo::Handle> wait_{this};
+// };
 template <class Class,
-          async_wait_result_t (Class::*method)(
-              async_t* async,
-              zx_status_t status,
-              const zx_packet_signal_t* signal)>
-class WaitMethod : private async_wait_t {
+          void (Class::*method)(async_dispatcher_t* dispatcher, async::WaitBase* wait, zx_status_t status,
+                                const zx_packet_signal_t* signal)>
+class WaitMethod final : public WaitBase {
 public:
-    explicit WaitMethod(Class* ptr,
+    explicit WaitMethod(Class* instance,
                         zx_handle_t object = ZX_HANDLE_INVALID,
-                        zx_signals_t trigger = ZX_SIGNAL_NONE,
-                        uint32_t flags = 0u)
-        : async_wait_t{{ASYNC_STATE_INIT}, &WaitMethod::CallHandler, object,
-                       trigger, flags, {}},
-          ptr_(ptr) {}
-
-    // The object to wait for signals on.
-    zx_handle_t object() const { return async_wait_t::object; }
-    void set_object(zx_handle_t object) { async_wait_t::object = object; }
-
-    // The set of signals to wait for.
-    zx_signals_t trigger() const { return async_wait_t::trigger; }
-    void set_trigger(zx_signals_t trigger) { async_wait_t::trigger = trigger; }
-
-    // Valid flags: |ASYNC_FLAG_HANDLE_SHUTDOWN|.
-    uint32_t flags() const { return async_wait_t::flags; }
-    void set_flags(uint32_t flags) { async_wait_t::flags = flags; }
-
-    // Begins asynchronously waiting for the object to receive one or more of
-    // the trigger signals.
-    //
-    // See |async_begin_wait()| for details.
-    zx_status_t Begin(async_t* async) {
-        return async_begin_wait(async, this);
-    }
-
-    // Cancels the wait.
-    //
-    // See |async_cancel_wait()| for details.
-    zx_status_t Cancel(async_t* async) {
-        return async_cancel_wait(async, this);
-    }
+                        zx_signals_t trigger = ZX_SIGNAL_NONE)
+        : WaitBase(object, trigger, &WaitMethod::CallHandler),
+          instance_(instance) {}
+    ~WaitMethod() = default;
 
 private:
-    static async_wait_result_t CallHandler(async_t* async,
-                                           async_wait_t* wait,
-                                           zx_status_t status,
-                                           const zx_packet_signal_t* signal) {
-        return (static_cast<WaitMethod*>(wait)->ptr_->*method)(
-            async, status, signal);
+    static void CallHandler(async_dispatcher_t* dispatcher, async_wait_t* wait,
+                            zx_status_t status, const zx_packet_signal_t* signal) {
+        auto self = Dispatch<WaitMethod>(wait);
+        (self->instance_->*method)(dispatcher, self, status, signal);
     }
 
-    Class* const ptr_;
-
-    DISALLOW_COPY_ASSIGN_AND_MOVE(WaitMethod);
+    Class* const instance_;
 };
 
 } // namespace async

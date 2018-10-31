@@ -4,10 +4,10 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
+#include <arch/ops.h>
 #include <arch/x86.h>
 #include <arch/x86/feature.h>
 #include <arch/x86/pvclock.h>
-#include <arch/ops.h>
 #include <kernel/atomic.h>
 #include <vm/physmap.h>
 #include <vm/pmm.h>
@@ -23,18 +23,19 @@ zx_status_t pvclock_init(void) {
     }
 
     paddr_t pa;
-    vm_page_t* boot_time_page = pmm_alloc_page(0, &pa);
-    if (boot_time_page == nullptr) {
-        return ZX_ERR_NO_MEMORY;
+    zx_status_t status = pmm_alloc_page(0, &pa);
+    if (status != ZX_OK) {
+        return status;
     }
+    arch_zero_page(paddr_to_physmap(pa));
     boot_time = static_cast<struct pvclock_boot_time*>(paddr_to_physmap(pa));
     write_msr(kKvmBootTime, pa);
 
-    vm_page_t* system_time_page = pmm_alloc_page(0, &pa);
-    if (system_time_page == nullptr) {
-        pmm_free_page(boot_time_page);
-        return ZX_ERR_NO_MEMORY;
+    status = pmm_alloc_page(0, &pa);
+    if (status != ZX_OK) {
+        return status;
     }
+    arch_zero_page(paddr_to_physmap(pa));
     system_time = static_cast<struct pvclock_system_time*>(paddr_to_physmap(pa));
     write_msr(kKvmSystemTimeMsr, pa | kSystemTimeEnable);
 
@@ -53,15 +54,15 @@ bool pvclock_is_present(void) {
     return false;
 }
 
-uint64_t pvclock_get_tsc_freq() {
-    if (system_time == nullptr) {
-        zx_status_t status = pvclock_init();
-        if (status != ZX_OK) {
-            return 0;
-        }
-    }
+bool pvclock_is_stable() {
+    bool is_stable = (system_time->flags & kKvmSystemTimeStable) ||
+                     x86_feature_test(X86_FEATURE_KVM_PVCLOCK_STABLE);
+    printf("pvclock: Clocksource is %sstable\n", (is_stable ? "" : "not "));
+    return is_stable;
+}
 
-    printf("Fetching TSC frequency from pvclock\n");
+uint64_t pvclock_get_tsc_freq() {
+    printf("pvclock: Fetching TSC frequency\n");
     uint32_t tsc_mul = 0;
     int8_t tsc_shift = 0;
     uint32_t pre_version = 0, post_version = 0;

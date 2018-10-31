@@ -28,7 +28,23 @@ typedef enum disk_format_type {
     DISK_FORMAT_FAT,
     DISK_FORMAT_BLOBFS,
     DISK_FORMAT_FVM,
+    DISK_FORMAT_ZXCRYPT,
+    DISK_FORMAT_COUNT_,
 } disk_format_t;
+
+static const char* disk_format_string_[DISK_FORMAT_COUNT_] = {
+        [DISK_FORMAT_UNKNOWN] = "unknown",
+        [DISK_FORMAT_GPT] = "gpt",
+        [DISK_FORMAT_MBR] = "mbr",
+        [DISK_FORMAT_MINFS] = "minfs",
+        [DISK_FORMAT_FAT] = "fat",
+        [DISK_FORMAT_BLOBFS] = "blobfs",
+        [DISK_FORMAT_FVM] = "fvm",
+        [DISK_FORMAT_ZXCRYPT] = "zxcrypt"};
+
+static inline const char* disk_format_string(disk_format_t fs_type) {
+    return disk_format_string_[fs_type];
+}
 
 #define HEADER_SIZE 4096
 
@@ -51,6 +67,11 @@ static const uint8_t fvm_magic[8] = {
     0x46, 0x56, 0x4d, 0x20, 0x50, 0x41, 0x52, 0x54,
 };
 
+static const uint8_t zxcrypt_magic[16] = {
+    0x5f, 0xe8, 0xf8, 0x00, 0xb3, 0x6d, 0x11, 0xe7,
+    0x80, 0x7a, 0x78, 0x63, 0x72, 0x79, 0x70, 0x74,
+};
+
 disk_format_t detect_disk_format(int fd);
 
 typedef struct mount_options {
@@ -62,25 +83,20 @@ typedef struct mount_options {
     // Create the mountpoint directory if it doesn't already exist.
     // Must be false if passed to "fmount".
     bool create_mountpoint;
+    // Enable journaling on the file system (if supported).
+    bool enable_journal;
 } mount_options_t;
 
-static const mount_options_t default_mount_options = {
-    .readonly = false,
-    .verbose_mount = false,
-    .collect_metrics = false,
-    .wait_until_ready = true,
-    .create_mountpoint = false,
-};
+extern const mount_options_t default_mount_options;
 
 typedef struct mkfs_options {
+    uint32_t fvm_data_slices;
     bool verbose;
 } mkfs_options_t;
 
-static const mkfs_options_t default_mkfs_options = {
-    .verbose = false,
-};
+extern const mkfs_options_t default_mkfs_options;
 
-#define NUM_MKFS_OPTIONS 1
+#define NUM_MKFS_OPTIONS 2
 
 typedef struct fsck_options {
     bool verbose;
@@ -92,25 +108,26 @@ typedef struct fsck_options {
 
 #define NUM_FSCK_OPTIONS 3
 
-static const fsck_options_t default_fsck_options = {
-    .verbose = false,
-    .never_modify = false,
-    .always_modify = false,
-    .force = false,
-};
+extern const fsck_options_t default_fsck_options;
 
 typedef zx_status_t (*LaunchCallback)(int argc, const char** argv,
                                       zx_handle_t* hnd, uint32_t* ids, size_t len);
 
-// Creates kernel logs, does not wait for process to terminate
-zx_status_t launch_logs_async(int argc, const char** argv, zx_handle_t* handles,
-                              uint32_t* types, size_t len);
-// Creates stdio logs, waits for process to terminate
+// Creates no logs, waits for process to terminate.
+zx_status_t launch_silent_sync(int argc, const char** argv, zx_handle_t* handles,
+                               uint32_t* types, size_t len);
+// Creates no logs, does not wait for process to terminate.
+zx_status_t launch_silent_async(int argc, const char** argv, zx_handle_t* handles,
+                                uint32_t* types, size_t len);
+// Creates stdio logs, waits for process to terminate.
 zx_status_t launch_stdio_sync(int argc, const char** argv, zx_handle_t* handles,
                               uint32_t* types, size_t len);
-// Creates stdio logs, does not wait for process to terminate
+// Creates stdio logs, does not wait for process to terminate.
 zx_status_t launch_stdio_async(int argc, const char** argv, zx_handle_t* handles,
                                uint32_t* types, size_t len);
+// Creates kernel logs, does not wait for process to terminate.
+zx_status_t launch_logs_async(int argc, const char** argv, zx_handle_t* handles,
+                              uint32_t* types, size_t len);
 
 // Given the following:
 //  - A device containing a filesystem image of a known format

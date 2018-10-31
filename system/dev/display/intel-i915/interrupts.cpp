@@ -2,11 +2,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include <ddk/debug.h>
 #include <zircon/syscalls.h>
 
 #include "intel-i915.h"
 #include "interrupts.h"
+#include "macros.h"
 #include "registers.h"
 
 namespace {
@@ -25,8 +25,7 @@ Interrupts::~Interrupts() {
 
 void Interrupts::Destroy() {
     if (irq_ != ZX_HANDLE_INVALID) {
-        zx_interrupt_signal(irq_.get(), ZX_INTERRUPT_SLOT_USER, 0);
-
+        zx_interrupt_destroy(irq_.get());
         thrd_join(irq_thread_, nullptr);
 
         irq_.reset();
@@ -35,12 +34,11 @@ void Interrupts::Destroy() {
 
 int Interrupts::IrqLoop() {
     for (;;) {
-        uint64_t slots;
-        if (zx_interrupt_wait(irq_.get(), &slots) != ZX_OK) {
-            zxlogf(TRACE, "i915: interrupt wait failed\n");
+        zx_time_t timestamp;
+        if (zx_interrupt_wait(irq_.get(), &timestamp) != ZX_OK) {
+            LOG_INFO("interrupt wait failed\n");
             break;
         }
-
         auto interrupt_ctrl =
                 registers::MasterInterruptControl::Get().ReadFrom(controller_->mmio_space());
         interrupt_ctrl.set_enable_mask(0);
@@ -69,11 +67,18 @@ int Interrupts::IrqLoop() {
         }
 
         if (interrupt_ctrl.de_pipe_c_int_pending()) {
-            HandlePipeInterrupt(registers::PIPE_C);
+            HandlePipeInterrupt(registers::PIPE_C, timestamp);
         } else if (interrupt_ctrl.de_pipe_b_int_pending()) {
-            HandlePipeInterrupt(registers::PIPE_B);
+            HandlePipeInterrupt(registers::PIPE_B, timestamp);
         } else if (interrupt_ctrl.de_pipe_a_int_pending()) {
-            HandlePipeInterrupt(registers::PIPE_A);
+            HandlePipeInterrupt(registers::PIPE_A, timestamp);
+        }
+
+        {
+            fbl::AutoLock lock(&lock_);
+            if (interrupt_ctrl.reg_value() & interrupt_mask_) {
+                interrupt_cb_.callback(interrupt_cb_.ctx, interrupt_ctrl.reg_value());
+            }
         }
 
         interrupt_ctrl.set_enable_mask(1);
@@ -82,19 +87,17 @@ int Interrupts::IrqLoop() {
     return 0;
 }
 
-void Interrupts::HandlePipeInterrupt(registers::Pipe pipe) {
+void Interrupts::HandlePipeInterrupt(registers::Pipe pipe, zx_time_t timestamp) {
     registers::PipeRegs regs(pipe);
     auto identity = regs.PipeDeInterrupt(regs.kIdentityReg).ReadFrom(controller_->mmio_space());
     identity.WriteTo(controller_->mmio_space());
 
     if (identity.vsync()) {
-        controller_->HandlePipeVsync(pipe);
+        controller_->HandlePipeVsync(pipe, timestamp);
     }
 }
 
 void Interrupts::EnablePipeVsync(registers::Pipe pipe, bool enable) {
-    pipe_vsyncs_[pipe] = enable;
-
     registers::PipeRegs regs(pipe);
     auto mask_reg = regs.PipeDeInterrupt(regs.kMaskReg).FromValue(0);
     mask_reg.set_vsync(!enable);
@@ -132,9 +135,22 @@ void Interrupts::EnableHotplugInterrupts() {
     }
 }
 
+zx_status_t Interrupts::SetInterruptCallback(const zx_intel_gpu_core_interrupt_t* callback,
+                                             uint32_t interrupt_mask) {
+    fbl::AutoLock lock(&lock_);
+    if (callback->callback != nullptr && interrupt_cb_.callback != nullptr) {
+        return ZX_ERR_ALREADY_BOUND;
+    }
+    interrupt_cb_ = *callback;
+    interrupt_mask_ = interrupt_mask;
+    return ZX_OK;
+}
+
 zx_status_t Interrupts::Init(Controller* controller) {
     controller_ = controller;
-    hwreg::RegisterIo* mmio_space = controller_->mmio_space();
+    ddk::MmioBuffer* mmio_space = controller_->mmio_space();
+
+    mtx_init(&lock_, mtx_plain);
 
     // Disable interrupts here, re-enable them in ::FinishInit()
     auto interrupt_ctrl = registers::MasterInterruptControl::Get().ReadFrom(mmio_space);
@@ -144,24 +160,24 @@ zx_status_t Interrupts::Init(Controller* controller) {
     uint32_t irq_cnt = 0;
     zx_status_t status = pci_query_irq_mode(controller_->pci(), ZX_PCIE_IRQ_MODE_LEGACY, &irq_cnt);
     if (status != ZX_OK || !irq_cnt) {
-        zxlogf(ERROR, "i915: Failed to find interrupts %d %d\n", status, irq_cnt);
+        LOG_ERROR("Failed to find interrupts (%d %d)\n", status, irq_cnt);
         return ZX_ERR_INTERNAL;
     }
 
     if ((status = pci_set_irq_mode(controller_->pci(), ZX_PCIE_IRQ_MODE_LEGACY, 1)) != ZX_OK) {
-        zxlogf(ERROR, "i915: Failed to set irq mode %d\n", status);
+        LOG_ERROR("Failed to set irq mode (%d)\n", status);
         return status;
     }
 
     if ((status = pci_map_interrupt(controller_->pci(), 0, irq_.reset_and_get_address())
             != ZX_OK)) {
-        zxlogf(ERROR, "i915: Failed to map interrupt %d\n", status);
+        LOG_ERROR("Failed to map interrupt (%d)\n", status);
         return status;
     }
 
     status = thrd_create_with_name(&irq_thread_, irq_handler, this, "i915-irq-thread");
     if (status != ZX_OK) {
-        zxlogf(ERROR, "i915: Failed to create irq thread\n");
+        LOG_ERROR("Failed to create irq thread\n");
         return status;
     }
 
@@ -177,11 +193,6 @@ void Interrupts::FinishInit() {
 
 void Interrupts::Resume() {
     EnableHotplugInterrupts();
-    for (unsigned i = 0; i < registers::kPipeCount; i++) {
-        if (pipe_vsyncs_[i]) {
-            EnablePipeVsync(static_cast<registers::Pipe>(i), true);
-        }
-    }
 }
 
 } // namespace i915

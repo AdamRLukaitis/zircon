@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <hwreg/bitfields.h>
+#include <hwreg/mmio.h>
 #include <zircon/compiler.h>
 
 #pragma once
@@ -57,47 +59,30 @@
     #define PCIE_CFG12_LTSSM_MASK             (0x1f << 10)
     #define PCIE_CFG12_LTSSM_UP               (0x11 << 10)
 
-#define ATU_REGION_COUNT                      (16)
-#define ATU_REGION_CTRL2_ENABLE               (1 << 31)
-#define ATU_CFG_SHIFT_MODE                    (1 << 28)
-#define ATU_PROGRAM_RETRIES                   (5)
-#define ATU_WAIT_ENABLE_TIMEOUT_US            (10000)
-#define ATU_MIN_REGION_SIZE                   (1024 * 64)       // 64 KiB
-
-#define PCIE_TLP_TYPE_MEM_RW                  (0x00)
-#define PCIE_TLP_TYPE_MEM_RD_LOCKED           (0x01)
-#define PCIE_TLP_TYPE_IO_RW                   (0x02)
-#define PCIE_TLP_TYPE_CFG0                    (0x04)
-#define PCIE_TLP_TYPE_CFG1                    (0x05)
-#define PCIE_ECAM_SIZE                        (0x1000)
-
 #define PCIE_HEADER_TYPE_MASK                 (0x7f)
 #define PCIE_HEADER_TYPE0                     (0x0)
 #define PCIE_HEADER_TYPE1                     (0x1)
 #define PCIE_HEADER_TYPE1                     (0x1)
 #define PCIE_HEADER_BUS_REG_OFF               (0x18)
 
-#define RST_PCIE_A       (0x1 << 1)
-#define RST_PCIE_B       (0x1 << 2)
-#define RST_PCIE_APB     (0x1 << 6)
-#define RST_PCIE_PHY     (0x1 << 7)
+#define PCI_CLASSREV                          (0x08)
+#define PCI_TYPE1_BAR0                        (0x10)
+#define PCI_TYPE1_BAR1                        (0x14)
+#define PCI_IO_BASE_LIMIT                     (0x1C)
+#define PCI_MEM_BASE_LIMIT                    (0x20)
+#define PCI_PFMEM_BASE_LIMIT                  (0x24)
 
-#define PCI_TYPE1_BAR0  (0x10)
-#define PCI_TYPE1_BAR1  (0x14)
+namespace pcie {
+namespace aml {
 
-typedef struct atu_ctrl_regs {
-    uint32_t region_ctrl1;
-    uint32_t region_ctrl2;
-    uint32_t unroll_lower_base;
-    uint32_t unroll_upper_base;
-    uint32_t unroll_limit;
-    uint32_t unroll_lower_target;
-    uint32_t unroll_upper_target;
-} __PACKED atu_ctrl_regs_t;
+class PciBusReg : public hwreg::RegisterBase<PciBusReg, uint32_t> {
+  public:
+    DEF_FIELD(31, 24, secondary_lat_timer);
+    DEF_FIELD(23, 16, subordinate_bus);
+    DEF_FIELD(15, 8, secondary_bus);
+    DEF_FIELD(7, 0, primary_bus);
+    static auto Get() {return hwreg::RegisterAddr<PciBusReg>(PCIE_HEADER_BUS_REG_OFF); }
+};
 
-typedef struct pci_bus_reg {
-    uint8_t primary_bus;
-    uint8_t secondary_bus;
-    uint8_t subordinate_bus;
-    uint8_t secondary_lat_timer;
-}  __PACKED pci_bus_reg_t;
+}  // namespace aml
+}  // namespace pcie

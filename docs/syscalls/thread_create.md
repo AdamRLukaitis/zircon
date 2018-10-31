@@ -9,8 +9,8 @@ thread_create - create a thread
 ```
 #include <zircon/syscalls.h>
 
-zx_status_t zx_thread_create(zx_handle_t process, const char* name,
-                             uint32_t name_len, uint32_t options, zx_handle_t* out);
+zx_status_t zx_thread_create(zx_handle_t process, const char* name, size_t name_size,
+                             uint32_t options, zx_handle_t* out);
 
 ```
 
@@ -32,6 +32,10 @@ new thread, which will become a child of that process.
 
 For thread lifecycle details see [thread object](../objects/thread.md).
 
+## RIGHTS
+
+TODO(ZX-2399)
+
 ## RETURN VALUE
 
 On success, **thread_create**() returns **ZX_OK** and a handle (via *out*)
@@ -47,7 +51,9 @@ returned.
 **ZX_ERR_INVALID_ARGS**  *name* or *out* was an invalid pointer, or *options* was
 non-zero.
 
-**ZX_ERR_NO_MEMORY**  (Temporary) Failure due to lack of memory.
+**ZX_ERR_NO_MEMORY**  Failure due to lack of memory.
+There is no good way for userspace to handle this (unlikely) error.
+In a future build this error will no longer occur.
 
 ## SEE ALSO
 

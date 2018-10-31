@@ -155,7 +155,19 @@ zx_status_t ThreadPool::CancelWaitOnPort(const zx::handle& handle, uint64_t key)
         return ZX_ERR_BAD_STATE;
     }
 
-    return port_.cancel(handle.get(), key);
+    return port_.cancel(handle, key);
+}
+
+zx_status_t ThreadPool::BindIrqToPort(const zx::handle& irq_handle, uint64_t key) {
+    ZX_DEBUG_ASSERT(irq_handle.is_valid());
+    fbl::AutoLock pool_lock(&pool_lock_);
+
+    if (!port_.is_valid()) {
+        DEBUG_LOG("BindIrqToPort failed, port handle is invalid\n");
+        return ZX_ERR_BAD_STATE;
+    }
+
+    return zx_interrupt_bind(irq_handle.get(), port_.get(), key, 0u);
 }
 
 void ThreadPool::PrintDebugPrefix() {
@@ -165,9 +177,9 @@ void ThreadPool::PrintDebugPrefix() {
 zx_status_t ThreadPool::Init() {
     ZX_DEBUG_ASSERT(!port_.is_valid());
 
-    zx_status_t res = zx::port::create(0, &port_);
+    zx_status_t res = zx::port::create(ZX_PORT_BIND_TO_INTERRUPT, &port_);
     if (res != ZX_OK) {
-        LOG("Failed to create therad pool port (res %d)!\n", res);
+        LOG("Failed to create thread pool port (res %d)!\n", res);
         return res;
     }
 
@@ -211,7 +223,7 @@ void ThreadPool::InternalShutdown() {
         fbl::AutoLock lock(&pool_lock_);
         for (__UNUSED const auto& thread : active_threads_) {
             __UNUSED zx_status_t res;
-            res = port_.queue(&pkt, sizeof(pkt));
+            res = port_.queue(&pkt);
             ZX_DEBUG_ASSERT(res == ZX_OK);
         }
     }
@@ -294,7 +306,7 @@ int ThreadPool::Thread::Main() {
 
         // Wait for there to be work to dispatch.  We should never encounter an
         // error, but if we do, shut down.
-        res = pool_->port().wait(zx::time::infinite(), &pkt, 0);
+        res = pool_->port().wait(zx::time::infinite(), &pkt);
         ZX_DEBUG_ASSERT(res == ZX_OK);
 
         // Is it time to exit?
@@ -302,7 +314,8 @@ int ThreadPool::Thread::Main() {
             break;
         }
 
-        if (pkt.type != ZX_PKT_TYPE_SIGNAL_ONE) {
+        if ((pkt.type != ZX_PKT_TYPE_SIGNAL_ONE) &&
+            (pkt.type != ZX_PKT_TYPE_INTERRUPT)) {
             LOG("Unexpected packet type (%u) in Thread pool!\n", pkt.type);
             continue;
         }

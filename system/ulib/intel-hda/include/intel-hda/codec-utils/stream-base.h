@@ -38,8 +38,9 @@ public:
     zx_status_t ProcessResponse(const CodecResponse& resp) __TA_EXCLUDES(obj_lock_);
     zx_status_t ProcessRequestStream(const ihda_proto::RequestStreamResp& resp)
         __TA_EXCLUDES(obj_lock_);
-    zx_status_t ProcessSetStreamFmt(const ihda_proto::SetStreamFmtResp& resp,
-                                    zx::channel&& ring_buffer_channel) __TA_EXCLUDES(obj_lock_);
+    virtual zx_status_t ProcessSetStreamFmt(const ihda_proto::SetStreamFmtResp& resp,
+                                            zx::channel&& ring_buffer_channel)
+        __TA_EXCLUDES(obj_lock_);
 
     uint32_t id()       const { return id_; }
     bool     is_input() const { return is_input_; }
@@ -56,6 +57,9 @@ protected:
     IntelHDAStreamBase(uint32_t id, bool is_input);
     virtual ~IntelHDAStreamBase();
 
+    void SetPersistentUniqueId(const audio_stream_unique_id_t& id)
+        __TA_EXCLUDES(obj_lock_);
+
     // Properties available to subclasses.
     uint8_t dma_stream_tag() const __TA_REQUIRES(obj_lock_) {
         return dma_stream_tag_;
@@ -69,11 +73,23 @@ protected:
         return parent_codec() != nullptr;
     }
 
+    fbl::Mutex* obj_lock() __TA_RETURN_CAPABILITY(obj_lock_) { return &obj_lock_; }
+
+    fbl::RefPtr<dispatcher::ExecutionDomain> domain() const { return default_domain_; }
+    fbl::RefPtr<dispatcher::Channel> stream_channel() const __TA_REQUIRES(obj_lock_) {
+        return stream_channel_;
+    }
+    uint32_t set_format_tid() const __TA_REQUIRES(obj_lock_) { return set_format_tid_; }
+    uint16_t encoded_fmt()    const __TA_REQUIRES(obj_lock_) { return encoded_fmt_; }
+
     // Methods callable from subclasses
     zx_status_t PublishDeviceLocked() __TA_REQUIRES(obj_lock_);
     void SetSupportedFormatsLocked(fbl::Vector<audio_proto::FormatRange>&& formats)
         __TA_REQUIRES(obj_lock_) {
         supported_formats_ = fbl::move(formats);
+    }
+    void SetFormatTidLocked(uint32_t set_format_tid) __TA_REQUIRES(obj_lock_) {
+        set_format_tid_ = set_format_tid;
     }
 
     // Overloads to control stream behavior.
@@ -96,6 +112,9 @@ protected:
     virtual void OnPlugDetectLocked(dispatcher::Channel* response_channel,
                                     const audio_proto::PlugDetectReq& req,
                                     audio_proto::PlugDetectResp* out_resp)
+        __TA_REQUIRES(obj_lock_);
+    virtual void  OnGetStringLocked(const audio_proto::GetStringReq& req,
+                                    audio_proto::GetStringResp* out_resp)
         __TA_REQUIRES(obj_lock_);
 
     // Debug logging
@@ -142,6 +161,14 @@ private:
                                    bool privileged,
                                    const audio_proto::PlugDetectReq& req)
         __TA_REQUIRES(obj_lock_);
+    zx_status_t DoGetUniqueIdLocked(dispatcher::Channel* channel,
+                                    bool privileged,
+                                    const audio_proto::GetUniqueIdReq& req)
+        __TA_REQUIRES(obj_lock_);
+    zx_status_t DoGetStringLocked(dispatcher::Channel* channel,
+                                  bool privileged,
+                                  const audio_proto::GetStringReq& req)
+        __TA_REQUIRES(obj_lock_);
 
     zx_status_t SetDMAStreamLocked(uint16_t id, uint8_t tag) __TA_REQUIRES(obj_lock_);
     zx_status_t DeviceIoctl(uint32_t op,
@@ -173,6 +200,7 @@ private:
     uint32_t set_format_tid_  __TA_GUARDED(obj_lock_) = AUDIO_INVALID_TRANSACTION_ID;
     uint16_t encoded_fmt_     __TA_GUARDED(obj_lock_);
     uint32_t unsol_tag_count_ __TA_GUARDED(obj_lock_) = 0;
+    audio_stream_unique_id_t persistent_unique_id_;
 
     static zx_status_t EncodeStreamFormat(const audio_proto::StreamSetFmtReq& fmt,
                                           uint16_t* encoded_fmt_out);

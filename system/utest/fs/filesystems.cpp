@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include <fvm/fvm.h>
+#include <fs-management/fvm.h>
 #include <fs-management/mount.h>
 #include <fs-management/ramdisk.h>
 #include <zircon/device/block.h>
@@ -21,16 +22,20 @@
 
 #include "filesystems.h"
 
-const char* test_root_path;
+const char* kTmpfsPath = "/fs-test-tmp";
+const char* kMountPath = "/fs-test-tmp/mount";
+
 bool use_real_disk = false;
+block_info_t test_disk_info;
 char test_disk_path[PATH_MAX];
+char* ramdisk_path;
 fs_info_t* test_info;
 
 static char fvm_disk_path[PATH_MAX];
 
 constexpr const char minfs_name[] = "minfs";
 constexpr const char memfs_name[] = "memfs";
-constexpr const char thinfs_name[] = "thinfs";
+constexpr const char thinfs_name[] = "FAT";
 
 const fsck_options_t test_fsck_options = {
     .verbose = false,
@@ -42,33 +47,40 @@ const fsck_options_t test_fsck_options = {
 #define FVM_DRIVER_LIB "/boot/driver/fvm.so"
 #define STRLEN(s) sizeof(s) / sizeof((s)[0])
 
-#define TEST_BLOCK_SIZE 512
-// This slice size is intentionally somewhat small, so
-// we can test increasing the size of a "single-slice"
-// inode table. We may want support for tests with configurable
-// slice sizes in the future.
-#define TEST_FVM_SLICE_SIZE (8 * (1 << 20))
+const test_disk_t default_test_disk = {
+    .block_count = TEST_BLOCK_COUNT_DEFAULT,
+    .block_size = TEST_BLOCK_SIZE_DEFAULT,
+    .slice_size = TEST_FVM_SLICE_SIZE_DEFAULT,
+};
 
 constexpr uint8_t kTestUniqueGUID[] = {
     0xFF, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
     0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
 };
-constexpr uint8_t kTestPartGUID[] = GUID_DATA_VALUE;
 
-void setup_fs_test(size_t disk_size, fs_test_type_t test_class) {
-    test_root_path = MOUNT_PATH;
-    int r = mkdir(test_root_path, 0755);
+constexpr uint8_t kTestPartGUID[] = {
+    0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    0xFF, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
+};
+
+void setup_fs_test(test_disk_t disk, fs_test_type_t test_class) {
+    int r = mkdir(kMountPath, 0755);
     if ((r < 0) && errno != EEXIST) {
         fprintf(stderr, "Could not create mount point for test filesystem\n");
         exit(-1);
     }
 
+    ramdisk_path = nullptr;
+
     if (!use_real_disk) {
-        size_t block_count = disk_size / TEST_BLOCK_SIZE;
-        if (create_ramdisk(TEST_BLOCK_SIZE, block_count, test_disk_path)) {
+        if (create_ramdisk(disk.block_size, disk.block_count, test_disk_path) != ZX_OK) {
             fprintf(stderr, "[FAILED]: Could not create ramdisk for test\n");
             exit(-1);
         }
+
+        test_disk_info.block_size = static_cast<uint32_t>(disk.block_size);
+        test_disk_info.block_count = disk.block_count;
+        ramdisk_path = test_disk_path;
     }
 
     if (test_class == FS_TEST_FVM) {
@@ -76,20 +88,22 @@ void setup_fs_test(size_t disk_size, fs_test_type_t test_class) {
         if (fd < 0) {
             fprintf(stderr, "[FAILED]: Could not open test disk\n");
             exit(-1);
-        } else if (fvm_init(fd, TEST_FVM_SLICE_SIZE) != ZX_OK) {
+        }
+        if (fvm_init(fd, disk.slice_size) != ZX_OK) {
             fprintf(stderr, "[FAILED]: Could not format disk with FVM\n");
             exit(-1);
-        } else if (ioctl_device_bind(fd, FVM_DRIVER_LIB, STRLEN(FVM_DRIVER_LIB)) < 0) {
+        }
+        if (ioctl_device_bind(fd, FVM_DRIVER_LIB, STRLEN(FVM_DRIVER_LIB)) < 0) {
             fprintf(stderr, "[FAILED]: Could not bind disk to FVM driver\n");
             exit(-1);
-        } else if (wait_for_driver_bind(test_disk_path, "fvm")) {
+        }
+        snprintf(fvm_disk_path, sizeof(fvm_disk_path), "%s/fvm", test_disk_path);
+        if (wait_for_device(fvm_disk_path, ZX_SEC(3)) != ZX_OK) {
             fprintf(stderr, "[FAILED]: FVM driver never appeared at %s\n", test_disk_path);
             exit(-1);
         }
 
         // Open "fvm" driver
-        strcpy(fvm_disk_path, test_disk_path);
-        strcat(fvm_disk_path, "/fvm");
         close(fd);
         int fvm_fd;
         if ((fvm_fd = open(fvm_disk_path, O_RDWR)) < 0) {
@@ -116,6 +130,11 @@ void setup_fs_test(size_t disk_size, fs_test_type_t test_class) {
             exit(-1);
         }
         close(fd);
+
+        // Restore the "fvm_disk_path" to the containing disk, so it can
+        // be destroyed when the test completes
+        fvm_disk_path[strlen(fvm_disk_path) - strlen("/fvm")] = 0;
+        ramdisk_path = fvm_disk_path;
     }
 
     if (test_info->mkfs(test_disk_path)) {
@@ -123,14 +142,14 @@ void setup_fs_test(size_t disk_size, fs_test_type_t test_class) {
         exit(-1);
     }
 
-    if (test_info->mount(test_disk_path, test_root_path)) {
+    if (test_info->mount(test_disk_path, kMountPath)) {
         fprintf(stderr, "[FAILED]: Error mounting filesystem\n");
         exit(-1);
     }
 }
 
 void teardown_fs_test(fs_test_type_t test_class) {
-    if (test_info->unmount(test_root_path)) {
+    if (test_info->unmount(kMountPath)) {
         fprintf(stderr, "[FAILED]: Error unmounting filesystem\n");
         exit(-1);
     }
@@ -141,10 +160,6 @@ void teardown_fs_test(fs_test_type_t test_class) {
     }
 
     if (test_class == FS_TEST_FVM) {
-        // Restore the "fvm_disk_path" to the containing disk, so it can
-        // be destroyed when the test completes
-        fvm_disk_path[strlen(fvm_disk_path) - strlen("/fvm")] = 0;
-
         if (use_real_disk) {
             if (fvm_destroy(fvm_disk_path) != ZX_OK) {
                 fprintf(stderr, "[FAILED]: Couldn't destroy FVM on test disk\n");
@@ -223,66 +238,87 @@ static int unlink_recursive(const char* path) {
 // filesystem.
 int mount_memfs(const char* disk_path, const char* mount_path) {
     struct stat st;
-    if (stat(test_root_path, &st)) {
-        if (mkdir(test_root_path, 0644) < 0) {
+    if (stat(kMountPath, &st)) {
+        if (mkdir(kMountPath, 0644) < 0) {
             return -1;
         }
     } else if (!S_ISDIR(st.st_mode)) {
         return -1;
     }
-    int r = unlink_recursive(test_root_path);
+    int r = unlink_recursive(kMountPath);
     return r;
 }
 
 int unmount_memfs(const char* mount_path) {
-    return unlink_recursive(test_root_path);
+    return unlink_recursive(kMountPath);
 }
 
-int mkfs_minfs(const char* disk_path) {
+static int mkfs_common(const char* disk_path, disk_format_t fs_type) {
     zx_status_t status;
-    if ((status = mkfs(disk_path, DISK_FORMAT_MINFS, launch_stdio_sync,
+    if ((status = mkfs(disk_path, fs_type, launch_stdio_sync,
                        &default_mkfs_options)) != ZX_OK) {
-        fprintf(stderr, "Could not mkfs filesystem");
+        fprintf(stderr, "Could not mkfs filesystem(%s)",
+                disk_format_string(fs_type));
         return -1;
     }
     return 0;
 }
 
-int fsck_minfs(const char* disk_path) {
+static int fsck_common(const char* disk_path, disk_format_t fs_type) {
     zx_status_t status;
-    if ((status = fsck(disk_path, DISK_FORMAT_MINFS, &test_fsck_options, launch_stdio_sync)) != ZX_OK) {
-        fprintf(stderr, "fsck on MinFS failed");
+    if ((status = fsck(disk_path, fs_type, &test_fsck_options,
+                       launch_stdio_sync)) != ZX_OK) {
+        fprintf(stderr, "fsck on %s failed", disk_format_string(fs_type));
         return -1;
     }
     return 0;
 }
 
-int mount_minfs(const char* disk_path, const char* mount_path) {
+static int mount_common(const char* disk_path, const char* mount_path,
+                        disk_format_t fs_type) {
     int fd = open(disk_path, O_RDWR);
+
     if (fd < 0) {
         fprintf(stderr, "Could not open disk: %s\n", disk_path);
         return -1;
     }
 
-    // fd consumed by mount. By default, mount waits until the filesystem is ready to accept
-    // commands.
+    // fd consumed by mount. By default, mount waits until the filesystem is
+    // ready to accept commands.
     zx_status_t status;
-    if ((status = mount(fd, mount_path, DISK_FORMAT_MINFS, &default_mount_options,
+    if ((status = mount(fd, mount_path, fs_type, &default_mount_options,
                         launch_stdio_async)) != ZX_OK) {
-        fprintf(stderr, "Could not mount filesystem\n");
+        fprintf(stderr, "Could not mount %s filesystem\n",
+                disk_format_string(fs_type));
         return status;
     }
 
     return 0;
 }
 
-int unmount_minfs(const char* mount_path) {
+static int unmount_common(const char* mount_path) {
     zx_status_t status = umount(mount_path);
     if (status != ZX_OK) {
         fprintf(stderr, "Failed to unmount filesystem\n");
         return status;
     }
     return 0;
+}
+
+int mkfs_minfs(const char* disk_path) {
+    return mkfs_common(disk_path, DISK_FORMAT_MINFS);
+}
+
+int fsck_minfs(const char* disk_path) {
+    return fsck_common(disk_path, DISK_FORMAT_MINFS);
+}
+
+int mount_minfs(const char* disk_path, const char* mount_path) {
+    return mount_common(disk_path, mount_path, DISK_FORMAT_MINFS);
+}
+
+int unmount_minfs(const char* mount_path) {
+    return unmount_common(mount_path);
 }
 
 bool should_test_thinfs(void) {
@@ -291,50 +327,19 @@ bool should_test_thinfs(void) {
 }
 
 int mkfs_thinfs(const char* disk_path) {
-    zx_status_t status;
-    if ((status = mkfs(disk_path, DISK_FORMAT_FAT, launch_stdio_sync,
-                       &default_mkfs_options)) != ZX_OK) {
-        fprintf(stderr, "Could not mkfs filesystem");
-        return -1;
-    }
-    return 0;
+    return mkfs_common(disk_path, DISK_FORMAT_FAT);
 }
 
 int fsck_thinfs(const char* disk_path) {
-    zx_status_t status;
-    if ((status = fsck(disk_path, DISK_FORMAT_FAT, &test_fsck_options, launch_stdio_sync)) != ZX_OK) {
-        fprintf(stderr, "fsck on FAT failed");
-        return -1;
-    }
-    return 0;
+    return fsck_common(disk_path, DISK_FORMAT_FAT);
 }
 
 int mount_thinfs(const char* disk_path, const char* mount_path) {
-    int fd = open(disk_path, O_RDWR);
-    if (fd < 0) {
-        fprintf(stderr, "Could not open disk: %s\n", disk_path);
-        return -1;
-    }
-
-    // fd consumed by mount. By default, mount waits until the filesystem is ready to accept
-    // commands.
-    zx_status_t status;
-    if ((status = mount(fd, mount_path, DISK_FORMAT_FAT, &default_mount_options,
-                        launch_stdio_async)) != ZX_OK) {
-        fprintf(stderr, "Could not mount filesystem\n");
-        return status;
-    }
-
-    return 0;
+    return mount_common(disk_path, mount_path, DISK_FORMAT_FAT);
 }
 
 int unmount_thinfs(const char* mount_path) {
-    zx_status_t status = umount(mount_path);
-    if (status != ZX_OK) {
-        fprintf(stderr, "Failed to unmount filesystem\n");
-        return status;
-    }
-    return 0;
+    return unmount_common(mount_path);
 }
 
 fs_info_t FILESYSTEMS[NUM_FILESYSTEMS] = {

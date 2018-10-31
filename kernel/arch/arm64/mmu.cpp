@@ -54,6 +54,15 @@ static_assert(((long)KERNEL_ASPACE_BASE >> MMU_KERNEL_SIZE_SHIFT) == -1, "");
 static_assert(MMU_KERNEL_SIZE_SHIFT <= 48, "");
 static_assert(MMU_KERNEL_SIZE_SHIFT >= 25, "");
 
+// Static relocated base to prepare for KASLR. Used at early boot and by gdb
+// script to know the target relocated address.
+// TODO(SEC-31): Choose it randomly.
+#if DISABLE_KASLR
+uint64_t kernel_relocated_base = KERNEL_BASE;
+#else
+uint64_t kernel_relocated_base = 0xffffffff10000000;
+#endif
+
 // The main translation table.
 pte_t arm64_kernel_translation_table[MMU_KERNEL_PAGE_TABLE_ENTRIES_TOP] __ALIGNED(MMU_KERNEL_PAGE_TABLE_ENTRIES_TOP * 8);
 
@@ -148,9 +157,7 @@ static pte_t mmu_flags_to_s1_pte_attr(uint flags) {
         attr |= MMU_PTE_ATTR_DEVICE;
         break;
     default:
-        // Invalid user-supplied flag.
-        DEBUG_ASSERT(false);
-        return ZX_ERR_INVALID_ARGS;
+        PANIC_UNIMPLEMENTED;
     }
 
     switch (flags & (ARCH_MMU_FLAG_PERM_USER | ARCH_MMU_FLAG_PERM_WRITE)) {
@@ -171,7 +178,6 @@ static pte_t mmu_flags_to_s1_pte_attr(uint flags) {
     if (!(flags & ARCH_MMU_FLAG_PERM_EXECUTE)) {
         attr |= MMU_PTE_ATTR_UXN | MMU_PTE_ATTR_PXN;
     }
-
     if (flags & ARCH_MMU_FLAG_NS) {
         attr |= MMU_PTE_ATTR_NON_SECURE;
     }
@@ -179,22 +185,111 @@ static pte_t mmu_flags_to_s1_pte_attr(uint flags) {
     return attr;
 }
 
+static void s1_pte_attr_to_mmu_flags(pte_t pte, uint* mmu_flags) {
+    switch (pte & MMU_PTE_ATTR_ATTR_INDEX_MASK) {
+    case MMU_PTE_ATTR_STRONGLY_ORDERED:
+        *mmu_flags |= ARCH_MMU_FLAG_UNCACHED;
+        break;
+    case MMU_PTE_ATTR_DEVICE:
+        *mmu_flags |= ARCH_MMU_FLAG_UNCACHED_DEVICE;
+        break;
+    case MMU_PTE_ATTR_NORMAL_UNCACHED:
+        *mmu_flags |= ARCH_MMU_FLAG_WRITE_COMBINING;
+        break;
+    case MMU_PTE_ATTR_NORMAL_MEMORY:
+        *mmu_flags |= ARCH_MMU_FLAG_CACHED;
+        break;
+    default:
+        PANIC_UNIMPLEMENTED;
+    }
+
+    *mmu_flags |= ARCH_MMU_FLAG_PERM_READ;
+    switch (pte & MMU_PTE_ATTR_AP_MASK) {
+    case MMU_PTE_ATTR_AP_P_RW_U_NA:
+        *mmu_flags |= ARCH_MMU_FLAG_PERM_WRITE;
+        break;
+    case MMU_PTE_ATTR_AP_P_RW_U_RW:
+        *mmu_flags |= ARCH_MMU_FLAG_PERM_USER | ARCH_MMU_FLAG_PERM_WRITE;
+        break;
+    case MMU_PTE_ATTR_AP_P_RO_U_NA:
+        break;
+    case MMU_PTE_ATTR_AP_P_RO_U_RO:
+        *mmu_flags |= ARCH_MMU_FLAG_PERM_USER;
+        break;
+    }
+
+    if (!((pte & MMU_PTE_ATTR_UXN) && (pte & MMU_PTE_ATTR_PXN))) {
+        *mmu_flags |= ARCH_MMU_FLAG_PERM_EXECUTE;
+    }
+    if (pte & MMU_PTE_ATTR_NON_SECURE) {
+        *mmu_flags |= ARCH_MMU_FLAG_NS;
+    }
+}
+
 static pte_t mmu_flags_to_s2_pte_attr(uint flags) {
-    DEBUG_ASSERT((flags & ARCH_MMU_FLAG_CACHE_MASK) == ARCH_MMU_FLAG_CACHED);
-    // Only the inner-shareable, normal memory type is supported.
-    pte_t attr = MMU_PTE_ATTR_AF | MMU_PTE_ATTR_SH_INNER_SHAREABLE | MMU_S2_PTE_ATTR_NORMAL_MEMORY;
+    pte_t attr = MMU_PTE_ATTR_AF;
+
+    switch (flags & ARCH_MMU_FLAG_CACHE_MASK) {
+    case ARCH_MMU_FLAG_CACHED:
+        attr |= MMU_S2_PTE_ATTR_NORMAL_MEMORY | MMU_PTE_ATTR_SH_INNER_SHAREABLE;
+        break;
+    case ARCH_MMU_FLAG_WRITE_COMBINING:
+        attr |= MMU_S2_PTE_ATTR_NORMAL_UNCACHED | MMU_PTE_ATTR_SH_INNER_SHAREABLE;
+        break;
+    case ARCH_MMU_FLAG_UNCACHED:
+        attr |= MMU_S2_PTE_ATTR_STRONGLY_ORDERED;
+        break;
+    case ARCH_MMU_FLAG_UNCACHED_DEVICE:
+        attr |= MMU_S2_PTE_ATTR_DEVICE;
+        break;
+    default:
+        PANIC_UNIMPLEMENTED;
+    }
 
     if (flags & ARCH_MMU_FLAG_PERM_WRITE) {
         attr |= MMU_S2_PTE_ATTR_S2AP_RW;
     } else {
         attr |= MMU_S2_PTE_ATTR_S2AP_RO;
     }
-
     if (!(flags & ARCH_MMU_FLAG_PERM_EXECUTE)) {
         attr |= MMU_S2_PTE_ATTR_XN;
     }
 
     return attr;
+}
+
+static void s2_pte_attr_to_mmu_flags(pte_t pte, uint* mmu_flags) {
+    switch (pte & MMU_S2_PTE_ATTR_ATTR_INDEX_MASK) {
+    case MMU_S2_PTE_ATTR_STRONGLY_ORDERED:
+        *mmu_flags |= ARCH_MMU_FLAG_UNCACHED;
+        break;
+    case MMU_S2_PTE_ATTR_DEVICE:
+        *mmu_flags |= ARCH_MMU_FLAG_UNCACHED_DEVICE;
+        break;
+    case MMU_S2_PTE_ATTR_NORMAL_UNCACHED:
+        *mmu_flags |= ARCH_MMU_FLAG_WRITE_COMBINING;
+        break;
+    case MMU_S2_PTE_ATTR_NORMAL_MEMORY:
+        *mmu_flags |= ARCH_MMU_FLAG_CACHED;
+        break;
+    default:
+        PANIC_UNIMPLEMENTED;
+    }
+
+    *mmu_flags |= ARCH_MMU_FLAG_PERM_READ;
+    switch (pte & MMU_PTE_ATTR_AP_MASK) {
+    case MMU_S2_PTE_ATTR_S2AP_RO:
+        break;
+    case MMU_S2_PTE_ATTR_S2AP_RW:
+        *mmu_flags |= ARCH_MMU_FLAG_PERM_WRITE;
+        break;
+    default:
+        PANIC_UNIMPLEMENTED;
+    }
+
+    if (pte & MMU_S2_PTE_ATTR_XN) {
+        *mmu_flags |= ARCH_MMU_FLAG_PERM_EXECUTE;
+    }
 }
 
 zx_status_t ArmArchVmAspace::Query(vaddr_t vaddr, paddr_t* paddr, uint* mmu_flags) {
@@ -280,39 +375,10 @@ zx_status_t ArmArchVmAspace::QueryLocked(vaddr_t vaddr, paddr_t* paddr, uint* mm
         *paddr = pte_addr + vaddr_rem;
     if (mmu_flags) {
         *mmu_flags = 0;
-        if (pte & MMU_PTE_ATTR_NON_SECURE)
-            *mmu_flags |= ARCH_MMU_FLAG_NS;
-        switch (pte & MMU_PTE_ATTR_ATTR_INDEX_MASK) {
-        case MMU_PTE_ATTR_STRONGLY_ORDERED:
-            *mmu_flags |= ARCH_MMU_FLAG_UNCACHED;
-            break;
-        case MMU_PTE_ATTR_DEVICE:
-            *mmu_flags |= ARCH_MMU_FLAG_UNCACHED_DEVICE;
-            break;
-        case MMU_PTE_ATTR_NORMAL_UNCACHED:
-            *mmu_flags |= ARCH_MMU_FLAG_WRITE_COMBINING;
-            break;
-        case MMU_PTE_ATTR_NORMAL_MEMORY:
-            break;
-        default:
-            PANIC_UNIMPLEMENTED;
-        }
-        *mmu_flags |= ARCH_MMU_FLAG_PERM_READ;
-        switch (pte & MMU_PTE_ATTR_AP_MASK) {
-        case MMU_PTE_ATTR_AP_P_RW_U_NA:
-            *mmu_flags |= ARCH_MMU_FLAG_PERM_WRITE;
-            break;
-        case MMU_PTE_ATTR_AP_P_RW_U_RW:
-            *mmu_flags |= ARCH_MMU_FLAG_PERM_USER | ARCH_MMU_FLAG_PERM_WRITE;
-            break;
-        case MMU_PTE_ATTR_AP_P_RO_U_NA:
-            break;
-        case MMU_PTE_ATTR_AP_P_RO_U_RO:
-            *mmu_flags |= ARCH_MMU_FLAG_PERM_USER;
-            break;
-        }
-        if (!((pte & MMU_PTE_ATTR_UXN) && (pte & MMU_PTE_ATTR_PXN))) {
-            *mmu_flags |= ARCH_MMU_FLAG_PERM_EXECUTE;
+        if (flags_ & ARCH_ASPACE_FLAG_GUEST) {
+            s2_pte_attr_to_mmu_flags(pte, mmu_flags);
+        } else {
+            s1_pte_attr_to_mmu_flags(pte, mmu_flags);
         }
     }
     LTRACEF("va 0x%lx, paddr 0x%lx, flags 0x%x\n",
@@ -321,37 +387,19 @@ zx_status_t ArmArchVmAspace::QueryLocked(vaddr_t vaddr, paddr_t* paddr, uint* mm
 }
 
 zx_status_t ArmArchVmAspace::AllocPageTable(paddr_t* paddrp, uint page_size_shift) {
-    size_t size = 1UL << page_size_shift;
-
-    DEBUG_ASSERT(page_size_shift <= MMU_MAX_PAGE_SIZE_SHIFT);
-
     LTRACEF("page_size_shift %u\n", page_size_shift);
 
-    if (size > PAGE_SIZE) {
-        size_t count = size / PAGE_SIZE;
-        size_t ret = pmm_alloc_contiguous(count, PMM_ALLOC_FLAG_KMAP,
-                                          static_cast<uint8_t>(page_size_shift), paddrp, NULL);
-        if (ret != count)
-            return ZX_ERR_NO_MEMORY;
+    // currently we only support allocating a single page
+    DEBUG_ASSERT(page_size_shift == PAGE_SIZE_SHIFT);
 
-        pt_pages_ += count;
-    } else if (size == PAGE_SIZE) {
-        void* vaddr = pmm_alloc_kpage(paddrp, NULL);
-        if (!vaddr)
-            return ZX_ERR_NO_MEMORY;
-
-        pt_pages_++;
-    } else {
-        void* vaddr = memalign(size, size);
-        if (!vaddr)
-            return ZX_ERR_NO_MEMORY;
-        *paddrp = vaddr_to_paddr(vaddr);
-        if (*paddrp == 0) {
-            free(vaddr);
-            return ZX_ERR_NO_MEMORY;
-        }
-        pt_pages_++;
+    vm_page_t* page;
+    zx_status_t status = pmm_alloc_page(0, &page, paddrp);
+    if (status != ZX_OK) {
+        return status;
     }
+
+    page->state = VM_PAGE_STATE_MMU;
+    pt_pages_++;
 
     LOCAL_KTRACE0("page table alloc");
 
@@ -360,25 +408,21 @@ zx_status_t ArmArchVmAspace::AllocPageTable(paddr_t* paddrp, uint page_size_shif
 }
 
 void ArmArchVmAspace::FreePageTable(void* vaddr, paddr_t paddr, uint page_size_shift) {
-    DEBUG_ASSERT(page_size_shift <= MMU_MAX_PAGE_SIZE_SHIFT);
-
     LTRACEF("vaddr %p paddr 0x%lx page_size_shift %u\n", vaddr, paddr, page_size_shift);
 
-    size_t size = 1U << page_size_shift;
+    // currently we only support freeing a single page
+    DEBUG_ASSERT(page_size_shift == PAGE_SIZE_SHIFT);
+
     vm_page_t* page;
 
     LOCAL_KTRACE0("page table free");
 
-    if (size == PAGE_SIZE) {
-        page = paddr_to_vm_page(paddr);
-        if (!page)
-            panic("bad page table paddr 0x%lx\n", paddr);
-        pmm_free_page(page);
-    } else if (size < PAGE_SIZE) {
-        free(vaddr);
-    } else {
-        PANIC_UNIMPLEMENTED;
+    page = paddr_to_vm_page(paddr);
+    if (!page) {
+        panic("bad page table paddr 0x%lx\n", paddr);
     }
+    pmm_free_page(page);
+
     pt_pages_--;
 }
 
@@ -1023,9 +1067,14 @@ zx_status_t ArmArchVmAspace::Init(vaddr_t base, size_t size, uint flags) {
         size_ = size;
 
         paddr_t pa;
-        volatile pte_t* va = static_cast<volatile pte_t*>(pmm_alloc_kpage(&pa, NULL));
-        if (!va)
-            return ZX_ERR_NO_MEMORY;
+        vm_page_t* page;
+        zx_status_t status = pmm_alloc_page(0, &page, &pa);
+        if (status != ZX_OK) {
+            return status;
+        }
+        page->state = VM_PAGE_STATE_MMU;
+
+        volatile pte_t* va = static_cast<volatile pte_t*>(paddr_to_physmap(pa));
 
         tt_virt_ = va;
         tt_phys_ = pa;

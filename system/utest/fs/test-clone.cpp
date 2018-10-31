@@ -10,14 +10,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <fdio/limits.h>
-#include <fdio/util.h>
+#include <lib/fdio/limits.h>
+#include <lib/fdio/util.h>
 #include <unittest/unittest.h>
 #include <zircon/syscalls.h>
 
 #include "filesystems.h"
 
-bool test_clone_simple(void) {
+bool TestCloneSimple(void) {
     BEGIN_TEST;
 
     int fd = open("::file", O_RDWR | O_CREAT, 0644);
@@ -36,6 +36,11 @@ bool test_clone_simple(void) {
     memset(output, 'a', sizeof(output));
     ASSERT_EQ(write(fd, output, sizeof(output)), sizeof(output));
 
+    // TODO(ZX-510): Make seek behavior across dup consistent
+    // among filesystems. Currently, this seek is necessary
+    // for thinfs, but not for minfs/memfs.
+    ASSERT_EQ(lseek(fd, 0, SEEK_SET), 0);
+
     // ... Should be visible to the other fd.
     char input[5];
     ASSERT_EQ(read(fd2, input, sizeof(input)), sizeof(input));
@@ -49,5 +54,5 @@ bool test_clone_simple(void) {
 }
 
 RUN_FOR_ALL_FILESYSTEMS(clone_tests,
-    RUN_TEST_MEDIUM(test_clone_simple)
+    RUN_TEST_MEDIUM(TestCloneSimple)
 )

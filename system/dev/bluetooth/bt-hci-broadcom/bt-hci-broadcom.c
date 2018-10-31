@@ -7,23 +7,29 @@
 #include <ddk/debug.h>
 #include <ddk/device.h>
 #include <ddk/driver.h>
+#include <ddk/platform-defs.h>
 #include <ddk/protocol/bt-hci.h>
-#include <ddk/protocol/platform-defs.h>
 #include <ddk/protocol/serial.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
 #include <zircon/device/bt-hci.h>
+#include <zircon/device/serial.h>
 #include <zircon/status.h>
 #include <zircon/threads.h>
 
 // TODO: how can we parameterize this?
 #define TARGET_BAUD_RATE    2000000
 
-#define FIRMWARE_PATH "/system/lib/firmware/bcm-bt-firmware.bin"
+#define FIRMWARE_PATH "BCM4345C4.bin"
 
 #define FIRMWARE_DOWNLOAD_DELAY ZX_MSEC(50)
+
+// Hardcoded. Better to paramaterize on chipset.
+// Broadcom chips need a few hundred msec delay
+// after firmware load
+#define BAUD_RATE_SWITCH_DELAY ZX_MSEC(200)
 
 typedef struct {
     uint16_t opcode;
@@ -186,7 +192,7 @@ static zx_status_t bcm_hci_set_baud_rate(bcm_hci_t* hci, uint32_t baud_rate) {
     bcm_set_baud_rate_cmd_t command = {
         .header = {
             .opcode =  BCM_SET_BAUD_RATE_CMD,
-            .parameter_total_size = sizeof(bcm_set_baud_rate_cmd_t) - sizeof(hci_command_header_t), 
+            .parameter_total_size = sizeof(bcm_set_baud_rate_cmd_t) - sizeof(hci_command_header_t),
         },
         .unused = 0,
         .baud_rate = htole32(baud_rate),
@@ -279,7 +285,8 @@ static int bcm_hci_start_thread(void* arg) {
                 goto fail;
             }
 
-            // switch baud rate to TARGET_BAUD_RATE
+            // switch baud rate to TARGET_BAUD_RATE after DELAY
+            zx_nanosleep(zx_deadline_after(BAUD_RATE_SWITCH_DELAY));
             status = bcm_hci_set_baud_rate(hci, TARGET_BAUD_RATE);
             if (status != ZX_OK) {
                 goto fail;

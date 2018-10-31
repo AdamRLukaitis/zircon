@@ -13,7 +13,7 @@
 
 class DummyIommu final : public Iommu {
 public:
-    static zx_status_t Create(fbl::unique_ptr<const uint8_t[]> desc, uint32_t desc_len,
+    static zx_status_t Create(fbl::unique_ptr<const uint8_t[]> desc, size_t desc_len,
                               fbl::RefPtr<Iommu>* out);
 
     bool IsValidBusTxnId(uint64_t bus_txn_id) const final;
@@ -21,12 +21,15 @@ public:
     zx_status_t Map(uint64_t bus_txn_id, const fbl::RefPtr<VmObject>& vmo,
                     uint64_t offset, size_t size, uint32_t perms,
                     dev_vaddr_t* vaddr, size_t* mapped_len) final;
+    zx_status_t MapContiguous(uint64_t bus_txn_id, const fbl::RefPtr<VmObject>& vmo,
+                              uint64_t offset, size_t size, uint32_t perms,
+                              dev_vaddr_t* vaddr, size_t* mapped_len) final;
     zx_status_t Unmap(uint64_t bus_txn_id, dev_vaddr_t vaddr, size_t size) final;
 
     zx_status_t ClearMappingsForBusTxnId(uint64_t bus_txn_id) final;
 
-    uint64_t minimum_contiguity(uint64_t bus_txn_id) const final;
-    uint64_t aspace_size(uint64_t bus_txn_id) const final;
+    uint64_t minimum_contiguity(uint64_t bus_txn_id) final;
+    uint64_t aspace_size(uint64_t bus_txn_id) final;
 
     ~DummyIommu() final;
 

@@ -72,7 +72,7 @@ protected:
 // Provides type-safe access to operations on a handle.
 template <typename T> class object : public object_base {
 public:
-    constexpr object() : object_base(ZX_HANDLE_INVALID) {}
+    constexpr object() = default;
 
     explicit object(zx_handle_t value) : object_base(value) {}
 
@@ -106,8 +106,7 @@ public:
         zx_status_t status = zx_handle_replace(value_, rights, &h);
         // We store ZX_HANDLE_INVALID to value_ before calling reset on result
         // in case result == this.
-        if (status == ZX_OK)
-            value_ = ZX_HANDLE_INVALID;
+        value_ = ZX_HANDLE_INVALID;
         result->reset(h);
         return status;
     }
@@ -128,10 +127,6 @@ public:
         static_assert(object_traits<T>::supports_wait, "Object is not waitable.");
         return zx_object_wait_many(wait_items, count, deadline.get());
     }
-
-    // TODO(abarth): Not all of these methods apply to every type of object. We
-    // should sort out which ones apply where and limit them to the interfaces
-    // where they work.
 
     zx_status_t signal(uint32_t clear_mask, uint32_t set_mask) const {
         static_assert(object_traits<T>::supports_user_signal,
@@ -154,10 +149,13 @@ public:
     }
 
     zx_status_t get_child(uint64_t koid, zx_rights_t rights,
-                          object<T>* result) const {
-        zx_handle_t h = ZX_HANDLE_INVALID;
-        zx_status_t status = zx_object_get_child(value_, koid, rights, &h);
-        result->reset(h);
+                          object<void>* result) const {
+        // Allow for |result| and |this| being the same container, though that
+        // can only happen for |T=void|, due to strict aliasing.
+        object<void> h;
+        zx_status_t status = zx_object_get_child(
+            value_, koid, rights, h.reset_and_get_address());
+        result->reset(h.release());
         return status;
     }
 
@@ -171,12 +169,12 @@ public:
         return zx_object_set_property(get(), property, value, size);
     }
 
-    zx_status_t get_cookie(zx_handle_t scope, uint64_t *cookie) const {
-        return zx_object_get_cookie(get(), scope, cookie);
+    zx_status_t get_cookie(const object_base& scope, uint64_t *cookie) const {
+        return zx_object_get_cookie(get(), scope.get(), cookie);
     }
 
-    zx_status_t set_cookie(zx_handle_t scope, uint64_t cookie) const {
-        return zx_object_set_cookie(get(), scope, cookie);
+    zx_status_t set_cookie(const object_base& scope, uint64_t cookie) const {
+        return zx_object_set_cookie(get(), scope.get(), cookie);
     }
 
 private:
@@ -198,19 +196,19 @@ template <typename T> bool operator!=(const object<T>& a, const object<T>& b) {
 }
 
 template <typename T> bool operator<(const object<T>& a, const object<T>& b) {
-  return a.get() < b.get();
+    return a.get() < b.get();
 }
 
 template <typename T> bool operator>(const object<T>& a, const object<T>& b) {
-  return a.get() > b.get();
+    return a.get() > b.get();
 }
 
 template <typename T> bool operator<=(const object<T>& a, const object<T>& b) {
-  return !(a.get() > b.get());
+    return !(a.get() > b.get());
 }
 
 template <typename T> bool operator>=(const object<T>& a, const object<T>& b) {
-  return !(a.get() < b.get());
+    return !(a.get() < b.get());
 }
 
 template <typename T> bool operator==(zx_handle_t a, const object<T>& b) {
@@ -222,19 +220,19 @@ template <typename T> bool operator!=(zx_handle_t a, const object<T>& b) {
 }
 
 template <typename T> bool operator<(zx_handle_t a, const object<T>& b) {
-  return a < b.get();
+    return a < b.get();
 }
 
 template <typename T> bool operator>(zx_handle_t a, const object<T>& b) {
-  return a > b.get();
+    return a > b.get();
 }
 
 template <typename T> bool operator<=(zx_handle_t a, const object<T>& b) {
-  return !(a > b.get());
+    return !(a > b.get());
 }
 
 template <typename T> bool operator>=(zx_handle_t a, const object<T>& b) {
-  return !(a < b.get());
+    return !(a < b.get());
 }
 
 template <typename T> bool operator==(const object<T>& a, zx_handle_t b) {
@@ -246,55 +244,68 @@ template <typename T> bool operator!=(const object<T>& a, zx_handle_t b) {
 }
 
 template <typename T> bool operator<(const object<T>& a, zx_handle_t b) {
-  return a.get() < b;
+    return a.get() < b;
 }
 
 template <typename T> bool operator>(const object<T>& a, zx_handle_t b) {
-  return a.get() > b;
+    return a.get() > b;
 }
 
 template <typename T> bool operator<=(const object<T>& a, zx_handle_t b) {
-  return !(a.get() > b);
+    return !(a.get() > b);
 }
 
 template <typename T> bool operator>=(const object<T>& a, zx_handle_t b) {
-  return !(a.get() < b);
+    return !(a.get() < b);
 }
 
 // Wraps a handle to an object to provide type-safe access to its operations
 // but does not take ownership of it.  The handle is not closed when the
 // wrapper is destroyed.
 //
-// All instances of unowned<T> must be const.  They cannot be stored, copied,
-// or moved but can be passed by reference in the form of a const T& or used
-// as a temporary.
+// All use of unowned<object<T>> as an object<T> is via a dereference operator,
+// as illustrated below:
 //
 // void do_something(const zx::event& event);
 //
 // void example(zx_handle_t event_handle) {
-//     do_something(zx::unowned<event>::wrap(event_handle));
+//     do_something(*zx::unowned<event>(event_handle));
 // }
 //
 // Convenience aliases are provided for all object types, for example:
 //
-// zx::unowned_event::wrap(handle).signal(..)
-
+// zx::unowned_event(handle)->signal(..)
 template <typename T>
-class unowned final : public T {
+class unowned final {
 public:
-    unowned(unowned&& other) : T(other.release()) {}
+    explicit unowned(zx_handle_t h) : value_(h) {}
+    explicit unowned(const T& owner) : unowned(owner.get()) {}
+    explicit unowned(unowned& other) : unowned(*other) {}
+    constexpr unowned() = default;
+    unowned(unowned&& other) = default;
 
-    ~unowned() {
-        zx_handle_t h = this->release();
+    ~unowned() { release_value(); }
+
+    unowned& operator=(unowned& other) {
+        *this = unowned(other);
+        return *this;
+    }
+    unowned& operator=(unowned&& other) {
+        release_value();
+        value_ = static_cast<T&&>(other.value_);
+        return *this;
+    }
+
+    const T& operator*() const { return value_; }
+    const T* operator->() const { return &value_; }
+
+private:
+    void release_value() {
+        zx_handle_t h = value_.release();
         static_cast<void>(h);
     }
 
-    static const unowned wrap(zx_handle_t h) { return unowned(h); }
-
-private:
-    friend T;
-
-    explicit unowned(zx_handle_t h) : T(h) {}
+    T value_;
 };
 
 } // namespace zx

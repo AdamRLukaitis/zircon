@@ -22,8 +22,7 @@ typedef struct {
 
 zx_status_t zx_channel_call(zx_handle_t handle, uint32_t options,
                             zx_time_t deadline, zx_channel_call_args_t* args,
-                            uint32_t* actual_bytes, uint32_t* actual_handles,
-                            zx_status_t* read_status);
+                            uint32_t* actual_bytes, uint32_t* actual_handles);
 ```
 
 ## DESCRIPTION
@@ -38,9 +37,13 @@ The write and read phases of this operation behave like **channel_write**() and
 **channel_read**() with the difference that their parameters are provided via the
 *zx_channel_call_args_t* structure.
 
-The first four bytes (i.e., a leading **zx_txid_t**) of
-*wr_bytes* are considered to be the transaction id (txid).  If there
-are fewer than four bytes, the txid is considered to be zero.
+The first four bytes of the written and read back messages are treated as a
+transaction ID of type **zx_txid_t**.  The kernel generates a txid for the
+written message, replacing that part of the message as read from userspace.
+The kernel generated txid will be between 0x80000000 and 0xFFFFFFFF, and will
+not collide with any txid from any other **channel_call**() in progress against
+this channel endpoint.  If the written message has a length of fewer than four
+bytes, an error is reported.
 
 When the outbound message is written, simultaneously an interest is registered
 for inbound messages of the matching txid.
@@ -55,6 +58,12 @@ inbound message queue, cause **ZX_CHANNEL_READABLE** to be signaled, etc.
 Inbound messages that are too large to fit in *rd_num_bytes* and *rd_num_handles*
 are discarded and **ZX_ERR_BUFFER_TOO_SMALL** is returned in that case.
 
+As with **zx_channel_write**(), the handles in *handles* are always consumed by
+**zx_channel_call**() and no longer exist in the calling process.
+
+## RIGHTS
+
+TODO(ZX-2399)
 
 ## RETURN VALUE
 
@@ -62,30 +71,16 @@ are discarded and **ZX_ERR_BUFFER_TOO_SMALL** is returned in that case.
 count of handles in the reply message are returned via *actual_bytes* and
 *actual_handles*, respectively.
 
-The special return value **ZX_ERR_CALL_FAILED** indicates that the message was
-sent, but an error occurred while waiting for a response.  This is necessary
-to disambiguate errors like **ZX_ERR_PEER_CLOSED** which could have occurred
-while attempting the write (in which case the caller would still own any handles
-passed via *handles*) or while waiting (in which case the caller would no longer
-own any of the handles).  The return parameter *read_status* is used to indicate
-the specific error that occurred during the wait or read phase when **ZX_ERR_CALL_FAILED**
-is returned.
-
-In the event of **ZX_OK**, **ZX_ERR_TIMED_OUT**, or **ZX_ERR_CALL_FAILED**, the
-handles in *handles* have been sent in a message to the other endpoint of the
-Channel and no longer exist in the calling process.  In the event of any other
-return values, the handles in *handles* remain in the calling process, unchanged.
-
 ## ERRORS
 
-**ZX_ERR_BAD_HANDLE**  *handle* is not a valid handle or any element in
-*handles* is not a valid handle.
+**ZX_ERR_BAD_HANDLE**  *handle* is not a valid handle, any element in
+*handles* is not a valid handle, or there are duplicates among the handles
+in the *handles* array.
 
 **ZX_ERR_WRONG_TYPE**  *handle* is not a channel handle.
 
 **ZX_ERR_INVALID_ARGS**  any of the provided pointers are invalid or null,
-or there are duplicates among the handles in the *handles* array,
-or *options* is nonzero.
+or *wr_num_bytes* is less than four, or *options* is nonzero.
 
 **ZX_ERR_ACCESS_DENIED**  *handle* does not have **ZX_RIGHT_WRITE** or
 any element in *handles* does not have **ZX_RIGHT_TRANSFER**.
@@ -95,11 +90,9 @@ closed while waiting for the reply.
 
 **ZX_ERR_CANCELED**  *handle* was closed while waiting for a reply.
 
-**ZX_ERR_CALL_FAILED**  The write phase of the call succeeded, but an error occurred
-while or after waiting for the response.  The specific error is returned via
-*read_status* if it is non-null.
-
-**ZX_ERR_NO_MEMORY**  (Temporary) Failure due to lack of memory.
+**ZX_ERR_NO_MEMORY**  Failure due to lack of memory.
+There is no good way for userspace to handle this (unlikely) error.
+In a future build this error will no longer occur.
 
 **ZX_ERR_OUT_OF_RANGE**  *wr_num_bytes* or *wr_num_handles* are larger than the
 largest allowable size for channel messages.
@@ -109,6 +102,26 @@ to contain the reply message.
 
 **ZX_ERR_NOT_SUPPORTED**  one of the handles in *handles* was *handle*
 (the handle to the channel being written to).
+
+## NOTES
+
+The facilities provided by **channel_call**() can interoperate with message dispatchers
+using **channel_read**() and **channel_write**() directly, provided the following rules
+are observed:
+
+1. A server receiving synchronous messages via **channel_read**() should ensure that the
+txid of incoming messages is reflected back in outgoing responses via **channel_write**()
+so that clients using **channel_call**() can correctly route the replies.
+
+2. A client sending messages via **channel_write**() that will be replied to should ensure
+that it uses txids between 0 and 0x7FFFFFFF only, to avoid colliding with other threads
+communicating via **channel_call**().
+
+If a **channel_call**() returns due to **ZX_ERR_TIMED_OUT**, if the server eventually replies,
+at some point in the future, the reply *could* match another outbound request (provided about
+2^31 **channel_call**()s have happened since the original request.  This syscall is designed
+around the expectation that timeouts are generally fatal and clients do not expect to continue
+communications on a channel that is timing out.
 
 ## SEE ALSO
 

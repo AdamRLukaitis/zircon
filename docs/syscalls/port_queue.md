@@ -10,7 +10,7 @@ port_queue - queue a packet to an port
 #include <zircon/syscalls.h>
 #include <zircon/syscalls/port.h>
 
-zx_status_t zx_port_queue(zx_handle_t handle, const zx_port_packet_t* packet, size_t count);
+zx_status_t zx_port_queue(zx_handle_t handle, const zx_port_packet_t* packet);
 
 ```
 
@@ -18,8 +18,6 @@ zx_status_t zx_port_queue(zx_handle_t handle, const zx_port_packet_t* packet, si
 
 **port_queue**() queues a *packet* to the port specified
 by *handle*.
-
-The **count** argument should be set to one. A value of zero is also accepted as a deprecated feature.
 
 ```
 typedef struct zx_port_packet {
@@ -47,19 +45,26 @@ typedef union zx_packet_user {
 
 ```
 
+## RIGHTS
+
+TODO(ZX-2399)
+
 ## RETURN VALUE
 
 **port_queue**() returns **ZX_OK** on successful queue of a packet.
 
 ## ERRORS
 
-**ZX_ERR_INVALID_ARGS**  *handle* isn't a valid port handle, or
-*packet* is an invalid pointer.
+**ZX_ERR_BAD_HANDLE** *handle* isn't a valid handle
 
-**ZX_ERR_WRONG_TYPE** *count* is not zero or one, or *handle* is not a port
-handle.
+**ZX_ERR_INVALID_ARGS** *packet* is an invalid pointer.
 
-**ZX_ERR_ACCESS_DENIED**  *handle* does not have **ZX_RIGHT_WRITE**.
+**ZX_ERR_WRONG_TYPE** *handle* is not a port handle.
+
+**ZX_ERR_ACCESS_DENIED** *handle* does not have **ZX_RIGHT_WRITE**.
+
+**ZX_ERR_SHOULD_WAIT** the port has too many pending packets. Once a thread
+has drained some packets a new **port_queue**() call will likely succeed.
 
 ## NOTES
 

@@ -12,17 +12,20 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <fbl/unique_fd.h>
 #include <zircon/compiler.h>
 #include <zircon/syscalls.h>
 #include <unittest/unittest.h>
 
 #include "filesystems.h"
 
+namespace {
+
 // Certain filesystems delay creation of internal structures
 // until the file is initially accessed. Test that we can
 // actually mmap properly before the file has otherwise been
 // accessed.
-bool test_mmap_empty(void) {
+bool TestMmapEmpty(void) {
     BEGIN_TEST;
     if (!test_info->supports_mmap) {
         return true;
@@ -46,7 +49,7 @@ bool test_mmap_empty(void) {
 
 // Test that a file's writes are properly propagated to
 // a read-only buffer.
-bool test_mmap_readable(void) {
+bool TestMmapReadable(void) {
     BEGIN_TEST;
     if (!test_info->supports_mmap) {
         return true;
@@ -82,7 +85,7 @@ bool test_mmap_readable(void) {
 
 // Test that a mapped buffer's writes are properly propagated
 // to the file.
-bool test_mmap_writable(void) {
+bool TestMmapWritable(void) {
     BEGIN_TEST;
     if (!test_info->supports_mmap) {
         return true;
@@ -134,7 +137,7 @@ bool test_mmap_writable(void) {
 
 // Test that the mapping of a file remains usable even after
 // the file has been closed / unlinked / renamed.
-bool test_mmap_unlinked(void) {
+bool TestMmapUnlinked(void) {
     BEGIN_TEST;
     if (!test_info->supports_mmap) {
         return true;
@@ -169,7 +172,7 @@ bool test_mmap_unlinked(void) {
 }
 
 // Test that MAP_SHARED propagates updates to the file
-bool test_mmap_shared(void) {
+bool TestMmapShared(void) {
     BEGIN_TEST;
     if (!test_info->supports_mmap) {
         return true;
@@ -229,7 +232,7 @@ bool test_mmap_shared(void) {
 
 // Test that MAP_PRIVATE keeps all copies of the buffer
 // separate
-bool test_mmap_private(void) {
+bool TestMmapPrivate(void) {
     BEGIN_TEST;
     if (!test_info->supports_mmap) {
         return true;
@@ -281,7 +284,7 @@ bool test_mmap_private(void) {
 
 // Test that mmap fails with appropriate error codes when
 // we expect.
-bool test_mmap_evil(void) {
+bool TestMmapEvil(void) {
     BEGIN_TEST;
     if (!test_info->supports_mmap) {
         return true;
@@ -364,6 +367,145 @@ bool test_mmap_evil(void) {
     END_TEST;
 }
 
+bool TestMmapTruncateAccess(void) {
+    BEGIN_TEST;
+    if (!test_info->supports_mmap) {
+        return true;
+    }
+
+    fbl::unique_fd fd(open("::mmap_truncate", O_CREAT | O_RDWR));
+    ASSERT_TRUE(fd);
+
+    constexpr size_t kPageCount = 5;
+    char buf[PAGE_SIZE * kPageCount];
+    memset(buf, 'a', sizeof(buf));
+    ASSERT_EQ(write(fd.get(), buf, sizeof(buf)), sizeof(buf));
+
+    // Map all pages and validate their contents.
+    void* addr = mmap(NULL, sizeof(buf), PROT_READ | PROT_WRITE, MAP_SHARED, fd.get(), 0);
+    ASSERT_NE(addr, MAP_FAILED);
+    ASSERT_EQ(memcmp(addr, buf, sizeof(buf)), 0);
+
+    constexpr size_t kHalfPage = PAGE_SIZE / 2;
+    for (size_t i = (kPageCount * 2) - 1; i > 0; i--) {
+        // Shrink the underlying file.
+        size_t new_size = kHalfPage * i;
+        ASSERT_EQ(ftruncate(fd.get(), new_size), 0);
+        ASSERT_EQ(memcmp(addr, buf, new_size), 0);
+
+        // Accessing beyond the end of the file, but within the mapping, is
+        // undefined behavior on other platforms. However, on Fuchsia, this
+        // behavior is explicitly memory-safe.
+        char buf_beyond[PAGE_SIZE * kPageCount - new_size];
+        memset(buf_beyond, 'b', sizeof(buf_beyond));
+        void* beyond = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) + new_size);
+        memset(beyond, 'b', sizeof(buf_beyond));
+        ASSERT_EQ(memcmp(buf_beyond, beyond, sizeof(buf_beyond)), 0);
+    }
+
+    ASSERT_EQ(munmap(addr, sizeof(buf)), 0);
+    ASSERT_EQ(unlink("::mmap_truncate"), 0);
+
+    END_TEST;
+}
+
+bool TestMmapTruncateExtend(void) {
+    BEGIN_TEST;
+    if (!test_info->supports_mmap) {
+        return true;
+    }
+
+    fbl::unique_fd fd(open("::mmap_truncate_extend", O_CREAT | O_RDWR));
+    ASSERT_TRUE(fd);
+
+    constexpr size_t kPageCount = 5;
+    char buf[PAGE_SIZE * kPageCount];
+    memset(buf, 'a', sizeof(buf));
+    ASSERT_EQ(write(fd.get(), buf, sizeof(buf)), sizeof(buf));
+
+    // Map all pages and validate their contents.
+    void* addr = mmap(NULL, sizeof(buf), PROT_READ | PROT_WRITE, MAP_SHARED, fd.get(), 0);
+    ASSERT_NE(addr, MAP_FAILED);
+    ASSERT_EQ(memcmp(addr, buf, sizeof(buf)), 0);
+
+    constexpr size_t kHalfPage = PAGE_SIZE / 2;
+
+    ASSERT_EQ(ftruncate(fd.get(), 0), 0);
+    memset(buf, 0, sizeof(buf));
+
+    // Even though we trample over the "out-of-bounds" part of the mapping,
+    // ensure it is filled with zeroes as we truncate-extend it.
+    for (size_t i = 1; i < kPageCount * 2; i++) {
+        size_t new_size = kHalfPage * i;
+
+        // Fill "out-of-bounds" with invalid data.
+        char buf_beyond[PAGE_SIZE * kPageCount - new_size];
+        memset(buf_beyond, 'b', sizeof(buf_beyond));
+        void* beyond = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) + new_size);
+        memset(beyond, 'b', sizeof(buf_beyond));
+        ASSERT_EQ(memcmp(buf_beyond, beyond, sizeof(buf_beyond)), 0);
+
+        // Observe that the truncate extension fills the file with zeroes.
+        ASSERT_EQ(ftruncate(fd.get(), new_size), 0);
+        ASSERT_EQ(memcmp(buf, addr, new_size), 0);
+    }
+
+    ASSERT_EQ(munmap(addr, sizeof(buf)), 0);
+    ASSERT_EQ(unlink("::mmap_truncate_extend"), 0);
+
+    END_TEST;
+}
+
+bool TestMmapTruncateWriteExtend(void) {
+    BEGIN_TEST;
+    if (!test_info->supports_mmap) {
+        return true;
+    }
+
+    fbl::unique_fd fd(open("::mmap_write_extend", O_CREAT | O_RDWR));
+    ASSERT_TRUE(fd);
+
+    constexpr size_t kPageCount = 5;
+    char buf[PAGE_SIZE * kPageCount];
+    memset(buf, 'a', sizeof(buf));
+    ASSERT_EQ(write(fd.get(), buf, sizeof(buf)), sizeof(buf));
+
+    // Map all pages and validate their contents.
+    void* addr = mmap(NULL, sizeof(buf), PROT_READ | PROT_WRITE, MAP_SHARED, fd.get(), 0);
+    ASSERT_NE(addr, MAP_FAILED);
+    ASSERT_EQ(memcmp(addr, buf, sizeof(buf)), 0);
+
+    constexpr size_t kHalfPage = PAGE_SIZE / 2;
+
+    ASSERT_EQ(ftruncate(fd.get(), 0), 0);
+    memset(buf, 0, sizeof(buf));
+
+    // Even though we trample over the "out-of-bounds" part of the mapping,
+    // ensure it is filled with zeroes as we truncate-extend it.
+    for (size_t i = 1; i < kPageCount * 2; i++) {
+        size_t new_size = kHalfPage * i;
+
+        // Fill "out-of-bounds" with invalid data.
+        char buf_beyond[PAGE_SIZE * kPageCount - new_size];
+        memset(buf_beyond, 'b', sizeof(buf_beyond));
+        void* beyond = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) + new_size);
+        memset(beyond, 'b', sizeof(buf_beyond));
+        ASSERT_EQ(memcmp(buf_beyond, beyond, sizeof(buf_beyond)), 0);
+
+        // Observe that write extension fills the file with zeroes.
+        off_t offset = static_cast<off_t>(new_size - 1);
+        ASSERT_EQ(lseek(fd.get(), offset, SEEK_SET), offset);
+        char zero = 0;
+        ASSERT_EQ(write(fd.get(), &zero, 1), 1);
+        ASSERT_EQ(memcmp(buf, addr, new_size), 0);
+    }
+
+    ASSERT_EQ(munmap(addr, sizeof(buf)), 0);
+    ASSERT_EQ(unlink("::mmap_write_extend"), 0);
+
+    END_TEST;
+}
+
 enum RW {
     Read,
     Write,
@@ -409,7 +551,7 @@ bool mmap_crash(int prot, int flags, RW rw) {
     END_HELPER;
 }
 
-bool test_mmap_death(void) {
+bool TestMmapDeath(void) {
     BEGIN_TEST;
     if (!test_info->supports_mmap) {
         return true;
@@ -439,13 +581,18 @@ bool test_mmap_death(void) {
     END_TEST;
 }
 
+}  // namespace
+
 RUN_FOR_ALL_FILESYSTEMS(fs_mmap_tests,
-    RUN_TEST_MEDIUM(test_mmap_empty)
-    RUN_TEST_MEDIUM(test_mmap_readable)
-    RUN_TEST_MEDIUM(test_mmap_writable)
-    RUN_TEST_MEDIUM(test_mmap_unlinked)
-    RUN_TEST_MEDIUM(test_mmap_shared)
-    RUN_TEST_MEDIUM(test_mmap_private)
-    RUN_TEST_MEDIUM(test_mmap_evil)
-    RUN_TEST_ENABLE_CRASH_HANDLER(test_mmap_death)
+    RUN_TEST_MEDIUM(TestMmapEmpty)
+    RUN_TEST_MEDIUM(TestMmapReadable)
+    RUN_TEST_MEDIUM(TestMmapWritable)
+    RUN_TEST_MEDIUM(TestMmapUnlinked)
+    RUN_TEST_MEDIUM(TestMmapShared)
+    RUN_TEST_MEDIUM(TestMmapPrivate)
+    RUN_TEST_MEDIUM(TestMmapEvil)
+    RUN_TEST_MEDIUM(TestMmapTruncateAccess)
+    RUN_TEST_MEDIUM(TestMmapTruncateExtend)
+    RUN_TEST_MEDIUM(TestMmapTruncateWriteExtend)
+    RUN_TEST_ENABLE_CRASH_HANDLER(TestMmapDeath)
 )

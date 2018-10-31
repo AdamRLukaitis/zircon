@@ -8,14 +8,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <zircon/device/usb-device.h>
-#include <zircon/device/usb-virt-bus.h>
+#include <lib/fdio/util.h>
+#include <zircon/device/usb-peripheral.h>
+#include <zircon/hw/usb.h>
 #include <zircon/hw/usb-cdc.h>
+#include <zircon/usb/peripheral/c/fidl.h>
+#include <zircon/syscalls.h>
+#include <zircon/types.h>
+
 
 #include <zircon/types.h>
 
-#define DEV_VIRTUAL_USB "/dev/misc/usb-virtual-bus"
-#define DEV_USB_DEVICE_DIR  "/dev/class/usb-device"
+#define DEV_USB_PERIPHERAL_DIR  "/dev/class/usb-peripheral"
 
 #define GOOGLE_VID      0x18D1
 #define GOOGLE_CDC_PID  0xA020
@@ -25,6 +29,8 @@
 #define CDC_PRODUCT_STRING  "CDC Ethernet"
 #define UMS_PRODUCT_STRING  "USB Mass Storage"
 #define SERIAL_STRING       "12345678"
+
+typedef zircon_usb_peripheral_FunctionDescriptor usb_function_descriptor_t;
 
 const usb_function_descriptor_t cdc_function_desc = {
     .interface_class = USB_CLASS_COMM,
@@ -59,9 +65,7 @@ static const usb_function_t ums_function = {
     .pid = GOOGLE_UMS_PID,
 };
 
-static usb_device_descriptor_t device_desc = {
-    .bLength = sizeof(usb_device_descriptor_t),
-    .bDescriptorType = USB_DT_DEVICE,
+static zircon_usb_peripheral_DeviceDescriptor device_desc = {
     .bcdUSB = htole16(0x0200),
     .bDeviceClass = 0,
     .bDeviceSubClass = 0,
@@ -75,16 +79,16 @@ static usb_device_descriptor_t device_desc = {
 
 static int open_usb_device(void) {
     struct dirent* de;
-    DIR* dir = opendir(DEV_USB_DEVICE_DIR);
+    DIR* dir = opendir(DEV_USB_PERIPHERAL_DIR);
     if (!dir) {
-        printf("Error opening %s\n", DEV_USB_DEVICE_DIR);
+        printf("Error opening %s\n", DEV_USB_PERIPHERAL_DIR);
         return -1;
     }
 
     while ((de = readdir(dir)) != NULL) {
        char devname[128];
 
-        snprintf(devname, sizeof(devname), "%s/%s", DEV_USB_DEVICE_DIR, de->d_name);
+        snprintf(devname, sizeof(devname), "%s/%s", DEV_USB_PERIPHERAL_DIR, de->d_name);
         int fd = open(devname, O_RDWR);
         if (fd < 0) {
             printf("Error opening %s\n", devname);
@@ -99,100 +103,98 @@ static int open_usb_device(void) {
     return -1;
 }
 
-static zx_status_t device_init(int fd, const usb_function_t* function) {
+static zx_status_t device_init(zx_handle_t svc, const usb_function_t* function) {
+    zx_status_t status2;
+
     device_desc.idVendor = htole16(function->vid);
     device_desc.idProduct = htole16(function->pid);
 
     // allocate string descriptors
-    zx_status_t status = ioctl_usb_device_alloc_string_desc(fd, MANUFACTURER_STRING,
-                                                            strlen(MANUFACTURER_STRING) + 1,
-                                                            &device_desc.iManufacturer);
-    if (status < 0) {
-        fprintf(stderr, "ioctl_usb_device_alloc_string_desc failed: %d\n", status);
+    zx_status_t status = zircon_usb_peripheral_DeviceAllocStringDesc(svc, MANUFACTURER_STRING,
+                                                                     strlen(MANUFACTURER_STRING) + 1,
+                                                                     &status2, &device_desc.iManufacturer);
+    if (status == ZX_OK) status = status2;
+    if (status != ZX_OK) {
+        fprintf(stderr, "zircon_usb_peripheral_DeviceAllocStringDesc failed: %d\n", status);
         return status;
     }
-    status = ioctl_usb_device_alloc_string_desc(fd, function->product_string,
-                                                strlen(function->product_string) + 1,
-                                                &device_desc.iProduct);
-    if (status < 0) {
-        fprintf(stderr, "ioctl_usb_device_alloc_string_desc failed: %d\n", status);
+    status = zircon_usb_peripheral_DeviceAllocStringDesc(svc, function->product_string,
+                                                         strlen(function->product_string) + 1,
+                                                         &status2, &device_desc.iProduct);
+    if (status == ZX_OK) status = status2;
+    if (status != ZX_OK) {
+        fprintf(stderr, "zircon_usb_peripheral_DeviceAllocStringDesc failed: %d\n", status);
         return status;
     }
-    status = ioctl_usb_device_alloc_string_desc(fd, SERIAL_STRING, strlen(SERIAL_STRING) + 1,
-                                                &device_desc.iSerialNumber);
-    if (status < 0) {
-        fprintf(stderr, "ioctl_usb_device_alloc_string_desc failed: %d\n", status);
+    status = zircon_usb_peripheral_DeviceAllocStringDesc(svc, SERIAL_STRING, strlen(SERIAL_STRING) + 1,
+                                                         &status2, &device_desc.iSerialNumber);
+    if (status == ZX_OK) status = status2;
+    if (status != ZX_OK) {
+        fprintf(stderr, "zircon_usb_peripheral_DeviceAllocStringDesc failed: %d\n", status);
         return status;
     }
 
     // set device descriptor
-    status = ioctl_usb_device_set_device_desc(fd, &device_desc);
-    if (status < 0) {
-        fprintf(stderr, "ioctl_usb_device_set_device_desc failed: %d\n", status);
+    status = zircon_usb_peripheral_DeviceSetDeviceDescriptor(svc, &device_desc, &status2);
+    if (status == ZX_OK) status = status2;
+    if (status != ZX_OK) {
+        fprintf(stderr, "zircon_usb_peripheral_DeviceSetDeviceDescriptor failed: %d\n", status);
         return status;
     }
 
-
-    status = ioctl_usb_device_add_function(fd, function->desc);
-    if (status < 0) {
-        fprintf(stderr, "ioctl_usb_device_add_function failed: %d\n", status);
+    status = zircon_usb_peripheral_DeviceAddFunction(svc, function->desc, &status2);
+    if (status == ZX_OK) status = status2;
+    if (status != ZX_OK) {
+        fprintf(stderr, "zircon_usb_peripheral_DeviceAddFunction failed: %d\n", status);
         return status;
     }
 
-    status = ioctl_usb_device_bind_functions(fd);
-    if (status < 0) {
-        fprintf(stderr, "ioctl_usb_device_bind_functions failed: %d\n", status);
+    status = zircon_usb_peripheral_DeviceBindFunctions(svc, &status2);
+    if (status == ZX_OK) status = status2;
+    if (status != ZX_OK) {
+        fprintf(stderr, "zircon_usb_peripheral_DeviceBindFunctions failed: %d\n", status);
     }
 
     return status;
 }
 
-static int device_command(int argc, const char** argv) {
-    int fd = open_usb_device();
-    if (fd < 0) {
-        fprintf(stderr, "could not find a device in %s\n", DEV_USB_DEVICE_DIR);
-        return fd;
-    }
-
+static int peripheral_command(zx_handle_t svc, int argc, const char* argv[]) {
     if (argc != 2) {
         goto usage;
     }
 
-    zx_status_t status = ZX_OK;
+    zx_status_t status, status2;
+
     const char* command = argv[1];
     if (!strcmp(command, "reset")) {
-        status = ioctl_usb_device_clear_functions(fd);
+        status = zircon_usb_peripheral_DeviceClearFunctions(svc, &status2);
+        if (status == ZX_OK) status = status2;
     } else if (!strcmp(command, "init-cdc")) {
-        status = device_init(fd, &cdc_function);
+        status = device_init(svc, &cdc_function);
     } else if (!strcmp(command, "init-ums")) {
-        status = device_init(fd, &ums_function); 
+        status = device_init(svc, &ums_function);
      } else {
         goto usage;
     }
 
-    close(fd);
     return status == ZX_OK ? 0 : -1;
 
 usage:
-    close(fd);
     fprintf(stderr, "usage: usbctl device [reset|init-ums]\n");
     return -1;
 }
 
-static int mode_command(int argc, const char** argv) {
+static int mode_command(zx_handle_t svc, int argc, const char* argv[]) {
     zx_status_t status = ZX_OK;
-
-    int fd = open_usb_device();
-    if (fd < 0) {
-        return fd;
-    }
+    zx_status_t status2;
 
     if (argc == 1) {
         // print current mode
         usb_mode_t mode;
-        status = ioctl_usb_device_get_mode(fd, &mode);
-        if (status < 0) {
-            fprintf(stderr, "ioctl_usb_device_get_mode failed: %d\n", status);
+        status = zircon_usb_peripheral_DeviceGetMode(svc, &status2, &mode);
+        if (status == ZX_OK) status = status2;
+        if (status != ZX_OK) {
+            fprintf(stderr, "zircon_usb_peripheral_DeviceGetMode failed: %d\n", status);
         } else {
             switch (mode) {
             case USB_MODE_NONE:
@@ -201,8 +203,8 @@ static int mode_command(int argc, const char** argv) {
             case USB_MODE_HOST:
                 printf("HOST\n");
                 break;
-            case USB_MODE_DEVICE:
-                printf("DEVICE\n");
+            case USB_MODE_PERIPHERAL:
+                printf("PERIPHERAL\n");
                 break;
             case USB_MODE_OTG:
                 printf("OTG\n");
@@ -218,8 +220,8 @@ static int mode_command(int argc, const char** argv) {
             mode = USB_MODE_NONE;
         } else if (strcasecmp(argv[1], "host") == 0) {
             mode = USB_MODE_HOST;
-        } else if (strcasecmp(argv[1], "device") == 0) {
-            mode = USB_MODE_DEVICE;
+        } else if (strcasecmp(argv[1], "peripheral") == 0) {
+            mode = USB_MODE_PERIPHERAL;
         } else if (strcasecmp(argv[1], "otg") == 0) {
             mode = USB_MODE_OTG;
         } else {
@@ -228,79 +230,35 @@ static int mode_command(int argc, const char** argv) {
         }
 
         if (status == ZX_OK) {
-            status = ioctl_usb_device_set_mode(fd, &mode);
-            if (status < 0) {
-                fprintf(stderr, "ioctl_usb_device_set_mode failed: %d\n", status);
+            status = zircon_usb_peripheral_DeviceSetMode(svc, mode, &status2);
+            if (status == ZX_OK) status = status2;
+            if (status != ZX_OK) {
+                fprintf(stderr, "zircon_usb_peripheral_DeviceSetMode failed: %d\n", status);
             }
         }
     }
 
-    close(fd);
     return status;
-}
-
-
-static int virtual_command(int argc, const char** argv) {
-    int fd = open(DEV_VIRTUAL_USB, O_RDWR);
-    if (fd < 0) {
-        fprintf(stderr, "could not open %s\n", DEV_VIRTUAL_USB);
-        return fd;
-    }
-
-    if (argc != 2) {
-        goto usage;
-    }
-
-    zx_status_t status = ZX_OK;
-    const char* command = argv[1];
-    if (!strcmp(command, "enable")) {
-        int enabled = 1;
-        status = ioctl_usb_virt_bus_enable(fd, &enabled);
-    } else if (!strcmp(command, "disable")) {
-        int enabled = 0;
-        status = ioctl_usb_virt_bus_enable(fd, &enabled);
-    } else if (!strcmp(command, "connect")) {
-        int connected = 1;
-        status = ioctl_usb_virt_bus_set_connected(fd, &connected);
-    } else if (!strcmp(command, "disconnect")) {
-        int connected = 0;
-        status = ioctl_usb_virt_bus_set_connected(fd, &connected);
-    } else {
-        goto usage;
-    }
-
-    close(fd);
-    return status == ZX_OK ? 0 : -1;
-
-usage:
-    close(fd);
-    fprintf(stderr, "usage: usbctl virtual [enable|disable|connect|disconnect]\n");
-    return -1;
 }
 
 typedef struct {
     const char* name;
-    int (*command)(int argc, const char* argv[]);
+    int (*command)(zx_handle_t svc, int argc, const char* argv[]);
     const char* description;
 } usbctl_command_t;
 
 static usbctl_command_t commands[] = {
     {
-        "device",
-        device_command,
-        "device [reset|init-cdc|init-ums] resets the device or "
+        "peripheral",
+        peripheral_command,
+        "peripheral [reset|init-cdc|init-ums] resets the peripheral or "
         "initializes the UMS function"
     },
     {
         "mode",
         mode_command,
-        "mode [none|host|device|otg] sets the current USB mode. "
+        "mode [none|host|peripheral|otg] sets the current USB mode. "
         "Returns the current mode if no additional arugment is provided."
-    },
-    {
-        "virtual",
-        virtual_command,
-        "virtual [enable|disable|connect|disconnect] - controls USB virtual bus"
     },
     { NULL, NULL, NULL },
 };
@@ -321,15 +279,34 @@ int main(int argc, const char** argv) {
         return -1;
     }
 
+    int fd = open_usb_device();
+    if (fd < 0) {
+        fprintf(stderr, "could not find a device in %s\n", DEV_USB_PERIPHERAL_DIR);
+        return fd;
+    }
+
+    zx_handle_t svc;
+    zx_status_t status = fdio_get_service_handle(fd, &svc);
+    if (status != ZX_OK) {
+        close(fd);
+        return status;
+    }
+
     const char* command_name = argv[1];
     usbctl_command_t* command = commands;
     while (command->name) {
         if (!strcmp(command_name, command->name)) {
-            return command->command(argc - 1, argv + 1);
+            status = command->command(svc, argc - 1, argv + 1);
+            goto done;
         }
         command++;
     }
-
+    // if we fall through, print usage
     usage();
-    return -1;
+    status = ZX_ERR_INVALID_ARGS;
+
+done:
+    zx_handle_close(svc);
+    close(fd);
+    return status;
 }

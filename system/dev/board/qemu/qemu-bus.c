@@ -14,17 +14,18 @@
 #include <ddk/debug.h>
 #include <ddk/device.h>
 #include <ddk/driver.h>
+#include <ddk/platform-defs.h>
 #include <ddk/protocol/platform-bus.h>
-#include <ddk/protocol/platform-defs.h>
 
 #include <zircon/process.h>
 #include <zircon/syscalls.h>
 #include <zircon/assert.h>
 
+#include "qemu-test.h"
 #include "qemu-virt.h"
 
 typedef struct {
-    platform_bus_protocol_t pbus;
+    pbus_protocol_t pbus;
 } qemu_bus_t;
 
 static zx_status_t qemu_pci_init(void) {
@@ -58,7 +59,7 @@ static zx_status_t qemu_pci_init(void) {
     }
     arg->num_irqs = 0;
     arg->addr_window_count = 1;
-    arg->addr_windows[0].is_mmio = true;
+    arg->addr_windows[0].cfg_space_type = PCI_CFG_SPACE_TYPE_MMIO;
     arg->addr_windows[0].has_ecam = true;
     arg->addr_windows[0].base = PCIE_ECAM_BASE_PHYS;
     arg->addr_windows[0].size = PCIE_ECAM_SIZE;
@@ -98,7 +99,7 @@ static const pbus_dev_t pl031_dev = {
     .vid = PDEV_VID_GENERIC,
     .pid = PDEV_PID_GENERIC,
     .did = PDEV_DID_RTC_PL031,
-    .mmios = pl031_mmios,
+    .mmio_list = pl031_mmios,
     .mmio_count = countof(pl031_mmios),
 };
 
@@ -109,7 +110,7 @@ static zx_status_t qemu_bus_bind(void* ctx, zx_device_t* parent) {
         return ZX_ERR_NO_MEMORY;
     }
 
-    if (device_get_protocol(parent, ZX_PROTOCOL_PLATFORM_BUS, &bus->pbus) != ZX_OK) {
+    if (device_get_protocol(parent, ZX_PROTOCOL_PBUS, &bus->pbus) != ZX_OK) {
         free(bus);
         return ZX_ERR_NOT_SUPPORTED;
     }
@@ -143,18 +144,23 @@ static zx_status_t qemu_bus_bind(void* ctx, zx_device_t* parent) {
         .vid = PDEV_VID_GENERIC,
         .pid = PDEV_PID_GENERIC,
         .did = PDEV_DID_KPCI,
-        .btis = pci_btis,
+        .bti_list = pci_btis,
         .bti_count = countof(pci_btis),
     };
 
-    status = pbus_device_add(&bus->pbus, &pci_dev, 0);
+    status = pbus_device_add(&bus->pbus, &pci_dev);
     if (status != ZX_OK) {
         zxlogf(ERROR, "qemu_bus_bind could not add pci_dev: %d\n", status);
     }
 
-    status = pbus_device_add(&bus->pbus, &pl031_dev, 0);
+    status = pbus_device_add(&bus->pbus, &pl031_dev);
     if (status != ZX_OK) {
         zxlogf(ERROR, "qemu_bus_bind could not add pl031: %d\n", status);
+    }
+
+    status = qemu_test_init(&bus->pbus);
+    if (status != ZX_OK) {
+        zxlogf(ERROR, "qemu_bus_bind: qemu_test_init failed: %d\n", status);
     }
 
     return ZX_OK;
@@ -171,7 +177,7 @@ static zx_driver_ops_t qemu_bus_driver_ops = {
 };
 
 ZIRCON_DRIVER_BEGIN(qemu_bus, qemu_bus_driver_ops, "zircon", "0.1", 3)
-    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_PLATFORM_BUS),
+    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_PBUS),
     BI_ABORT_IF(NE, BIND_PLATFORM_DEV_VID, PDEV_VID_QEMU),
     BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_PID, PDEV_PID_QEMU),
 ZIRCON_DRIVER_END(qemu_bus)

@@ -7,8 +7,9 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
-#if WITH_DEV_PCIE
+#if WITH_KERNEL_PCIE
 
+#include <dev/interrupt.h>
 #include <dev/pcie_bus_driver.h>
 #include <dev/pcie_platform.h>
 #include <fbl/limits.h>
@@ -29,19 +30,19 @@ public:
     zx_status_t AllocMsiBlock(uint requested_irqs,
                               bool can_target_64bit,
                               bool is_msix,
-                              pcie_msi_block_t* out_block) override {
-        return x86_alloc_msi_block(requested_irqs, can_target_64bit, is_msix, out_block);
+                              msi_block_t* out_block) override {
+        return msi_alloc_block(requested_irqs, can_target_64bit, is_msix, out_block);
     }
 
-    void FreeMsiBlock(pcie_msi_block_t* block) override {
-        x86_free_msi_block(block);
+    void FreeMsiBlock(msi_block_t* block) override {
+        msi_free_block(block);
     }
 
-    void RegisterMsiHandler(const pcie_msi_block_t* block,
+    void RegisterMsiHandler(const msi_block_t* block,
                             uint msi_id,
                             int_handler handler,
                             void* ctx) override {
-        x86_register_msi_handler(block, msi_id, handler, ctx);
+        msi_register_handler(block, msi_id, handler, ctx);
     }
 };
 
@@ -139,4 +140,4 @@ static void x86_pcie_init_hook(uint level) {
 
 LK_INIT_HOOK(x86_pcie_init, x86_pcie_init_hook, LK_INIT_LEVEL_PLATFORM);
 
-#endif // WITH_DEV_PCIE
+#endif // WITH_KERNEL_PCIE

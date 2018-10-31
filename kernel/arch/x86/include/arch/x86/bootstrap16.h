@@ -35,8 +35,9 @@ extern void x86_bootstrap16_end(void);
 
 // Entry point used for secondary CPU initialization
 extern void _x86_secondary_cpu_long_mode_entry(void);
-// Entry point used for suspend-to-RAM resume vector.  Note that
-// this does not restore %rdi.
+
+// Entry point used for suspend-to-RAM resume vector.
+// Note that this does not restore %rdi, and it touches below the saved %rsp.
 extern void _x86_suspend_wakeup(void);
 
 __END_CDECLS
@@ -84,9 +85,9 @@ struct __PACKED x86_ap_bootstrap_data {
     // Per-cpu data
     struct __PACKED {
         // Virtual address of base of initial kstack
-        uint64_t kstack_base;
+        vaddr_t kstack_base;
         // Virtual address of initial thread_t
-        uint64_t thread;
+        thread_t* thread;
     } per_cpu[SMP_MAX_CPUS - 1];
 };
 

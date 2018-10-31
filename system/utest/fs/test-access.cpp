@@ -12,10 +12,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <lib/fdio/limits.h>
+#include <lib/fdio/util.h>
+#include <unittest/unittest.h>
+#include <zircon/syscalls.h>
+
 #include "filesystems.h"
 #include "misc.h"
 
-bool test_access_readable(void) {
+bool TestAccessReadable(void) {
     BEGIN_TEST;
 
     const char* filename = "::alpha";
@@ -51,7 +56,7 @@ bool test_access_readable(void) {
     END_TEST;
 }
 
-bool test_access_writable(void) {
+bool TestAccessWritable(void) {
     BEGIN_TEST;
 
     const char* filename = "::alpha";
@@ -84,7 +89,7 @@ bool test_access_writable(void) {
     END_TEST;
 }
 
-bool test_access_badflags(void) {
+bool TestAccessBadflags(void) {
     BEGIN_TEST;
 
     const char* filename = "::foobar";
@@ -101,7 +106,7 @@ bool test_access_badflags(void) {
     END_TEST;
 }
 
-bool test_access_directory(void) {
+bool TestAccessDirectory(void) {
     BEGIN_TEST;
 
     const char* filename = "::foobar";
@@ -125,7 +130,7 @@ bool test_access_directory(void) {
     END_TEST;
 }
 
-bool test_access_opath(void) {
+bool TestAccessOpath(void) {
     BEGIN_TEST;
 
     const char* dirname = "::foo";
@@ -227,10 +232,45 @@ bool test_access_opath(void) {
     END_TEST;
 }
 
+// This test case was created to prevent a regression of a
+// file descriptor refcounting bug: files opened with "O_PATH"
+// do not cause the underlying object to be opened, and files
+// opened without "O_PATH" do cause the underlying object to
+// be opened. Cloning the object should not invalidate the
+// internal file descriptor count.
+bool TestOpathFdcount(void) {
+    BEGIN_TEST;
+
+    const char* dirname = "::foo";
+    int fd;
+    zx_handle_t handles[FDIO_MAX_HANDLES];
+    uint32_t types[FDIO_MAX_HANDLES];
+    zx_status_t r;
+
+    // Opened with O_PATH, cloned, and closed before clone.
+    ASSERT_EQ(mkdir(dirname, 0666), 0);
+    ASSERT_GE((fd = open(dirname, O_PATH | O_DIRECTORY)), 0);
+    ASSERT_GT((r = fdio_clone_fd(fd, 0, handles, types)), 0);
+    ASSERT_EQ(close(fd), 0);
+    ASSERT_EQ(zx_handle_close_many(handles, r), ZX_OK);
+    ASSERT_EQ(rmdir(dirname), 0);
+
+    // Opened with O_PATH, cloned, and closed after clone.
+    ASSERT_EQ(mkdir(dirname, 0666), 0);
+    ASSERT_GE((fd = open(dirname, O_PATH | O_DIRECTORY)), 0);
+    ASSERT_GT((r = fdio_clone_fd(fd, 0, handles, types)), 0);
+    ASSERT_EQ(zx_handle_close_many(handles, r), ZX_OK);
+    ASSERT_EQ(close(fd), 0);
+    ASSERT_EQ(rmdir(dirname), 0);
+
+    END_TEST;
+}
+
 RUN_FOR_ALL_FILESYSTEMS(access_tests,
-    RUN_TEST_MEDIUM(test_access_readable)
-    RUN_TEST_MEDIUM(test_access_writable)
-    RUN_TEST_MEDIUM(test_access_badflags)
-    RUN_TEST_MEDIUM(test_access_directory)
-    RUN_TEST_MEDIUM(test_access_opath)
+    RUN_TEST_MEDIUM(TestAccessReadable)
+    RUN_TEST_MEDIUM(TestAccessWritable)
+    RUN_TEST_MEDIUM(TestAccessBadflags)
+    RUN_TEST_MEDIUM(TestAccessDirectory)
+    RUN_TEST_MEDIUM(TestAccessOpath)
+    RUN_TEST_MEDIUM(TestOpathFdcount)
 )

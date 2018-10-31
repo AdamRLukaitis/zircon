@@ -9,7 +9,7 @@ object_wait_many - wait for signals on multiple objects
 ```
 #include <zircon/syscalls.h>
 
-zx_status_t zx_object_wait_many(zx_wait_item_t* items, uint32_t count, zx_time_t deadline);
+zx_status_t zx_object_wait_many(zx_wait_item_t* items, size_t count, zx_time_t deadline);
 
 typedef struct {
     zx_handle_t handle;
@@ -21,14 +21,17 @@ typedef struct {
 ## DESCRIPTION
 
 **object_wait_many**() is a blocking syscall which causes the caller to
-wait until at least one of the specified signals is pending on one of
-the specified *items*, or until *deadline* passes, whichever comes first.
+wait until either the *deadline* passes or at least one of the specified
+signals is asserted by the object to which the associated handle refers.
+If an object is already asserting at least one of the specified signals,
+the wait ends immediately.
 
 The caller must provide *count* zx_wait_item_ts in the *items* array,
 containing the handle and signals bitmask to wait for for each item.
 
 The *deadline* parameter specifies a deadline with respect to
-**ZX_CLOCK_MONOTONIC**.  **ZX_TIME_INFINITE** is a special value meaning wait forever.
+**ZX_CLOCK_MONOTONIC**.  **ZX_TIME_INFINITE** is a special value meaning wait
+forever.
 
 Upon return, the *pending* field of *items* is filled with bitmaps indicating
 which signals are pending for each item.
@@ -41,13 +44,17 @@ once the last message in its queue is read).
 The maximum number of items that may be waited upon is **ZX_WAIT_MANY_MAX_ITEMS**,
 which is 8.  To wait on more things at once use [Ports](../objects/port.md).
 
+## RIGHTS
+
+TODO(ZX-2399)
+
 ## RETURN VALUE
 
 **object_wait_many**() returns **ZX_OK** if any of *waitfor* signals were
 observed on their respective object before *deadline* passed.
 
 In the event of **ZX_ERR_TIMED_OUT**, *items* may reflect state changes
-that occurred after the deadline pased, but before the syscall returned.
+that occurred after the deadline passed, but before the syscall returned.
 
 In the event of **ZX_ERR_CANCELED**, one or more of the items being waited
 upon have had their handles closed, and the *pending* field for those items
@@ -75,7 +82,9 @@ observed on any of the specified handles.
 **ZX_ERR_NOT_SUPPORTED**  One of the *items* contains a handle that cannot
 be waited one (for example, a Port handle).
 
-**ZX_ERR_NO_MEMORY** (Temporary) failure due to lack of memory.
+**ZX_ERR_NO_MEMORY**  Failure due to lack of memory.
+There is no good way for userspace to handle this (unlikely) error.
+In a future build this error will no longer occur.
 
 ## BUGS
 

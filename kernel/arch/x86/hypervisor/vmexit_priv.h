@@ -157,7 +157,7 @@ enum class InterruptionType : uint8_t {
 };
 
 // X2APIC MSR addresses from Volume 3, Section 10.12.1.2.
-enum class X2ApicMsr : uint64_t {
+enum class X2ApicMsr : uint32_t {
     ID                  = 0x802,
     VERSION             = 0x803,
     EOI                 = 0x80b,
@@ -229,6 +229,17 @@ enum class CrAccessType : uint8_t {
     LMSW                = 3u,
 };
 
+enum VmCallStatus : int64_t {
+    OK                  = 0,
+    FAULT               = -14,
+    OP_NOT_SUPPORTED    = -95,
+    NO_SYS              = -1000,
+};
+
+enum class VmCallType : uint64_t {
+    CLOCK_PAIRING       = 9u,
+};
+
 // clang-format on
 
 typedef struct zx_port_packet zx_port_packet_t;
@@ -286,6 +297,14 @@ struct IoInfo {
     uint16_t port;
 
     IoInfo(uint64_t qualification);
+};
+
+// Stores VMCALL type and arguments.
+struct VmCallInfo {
+    VmCallType type;
+    uint64_t arg[4];
+
+    VmCallInfo(const GuestState* guest_state);
 };
 
 // Interrupt command register.

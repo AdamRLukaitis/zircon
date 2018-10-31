@@ -8,7 +8,7 @@
 
 #include <err.h>
 #include <stdint.h>
-#include <stdint.h>
+#include <string.h>
 
 #include <fbl/auto_lock.h>
 #include <fbl/canary.h>
@@ -20,9 +20,11 @@
 #include <fbl/ref_ptr.h>
 #include <fbl/unique_ptr.h>
 
+#include <kernel/lockdep.h>
 #include <kernel/spinlock.h>
 #include <object/state_observer.h>
 
+#include <zircon/compiler.h>
 #include <zircon/syscalls/object.h>
 #include <zircon/types.h>
 
@@ -52,7 +54,7 @@ DECLARE_DISPTAG(PciDeviceDispatcher, ZX_OBJ_TYPE_PCI_DEVICE)
 DECLARE_DISPTAG(LogDispatcher, ZX_OBJ_TYPE_LOG)
 DECLARE_DISPTAG(SocketDispatcher, ZX_OBJ_TYPE_SOCKET)
 DECLARE_DISPTAG(ResourceDispatcher, ZX_OBJ_TYPE_RESOURCE)
-DECLARE_DISPTAG(EventPairDispatcher, ZX_OBJ_TYPE_EVENT_PAIR)
+DECLARE_DISPTAG(EventPairDispatcher, ZX_OBJ_TYPE_EVENTPAIR)
 DECLARE_DISPTAG(JobDispatcher, ZX_OBJ_TYPE_JOB)
 DECLARE_DISPTAG(VmAddressRegionDispatcher, ZX_OBJ_TYPE_VMAR)
 DECLARE_DISPTAG(FifoDispatcher, ZX_OBJ_TYPE_FIFO)
@@ -63,6 +65,7 @@ DECLARE_DISPTAG(IommuDispatcher, ZX_OBJ_TYPE_IOMMU)
 DECLARE_DISPTAG(BusTransactionInitiatorDispatcher, ZX_OBJ_TYPE_BTI)
 DECLARE_DISPTAG(ProfileDispatcher, ZX_OBJ_TYPE_PROFILE)
 DECLARE_DISPTAG(PinnedMemoryTokenDispatcher, ZX_OBJ_TYPE_PMT)
+DECLARE_DISPTAG(SuspendTokenDispatcher, ZX_OBJ_TYPE_SUSPEND_TOKEN)
 
 #undef DECLARE_DISPTAG
 
@@ -77,7 +80,7 @@ DECLARE_DISPTAG(PinnedMemoryTokenDispatcher, ZX_OBJ_TYPE_PMT)
 // it might be necessary to implement a destruction pattern that avoids
 // deep recursion since the kernel stack is very limited.
 //
-// You rarely derive directly from this class; instead consider deriving
+// You don't derive directly from this class; instead derive
 // from SoloDispatcher or PeeredDispatcher.
 class Dispatcher : private fbl::RefCounted<Dispatcher>,
                    private fbl::Recyclable<Dispatcher> {
@@ -114,7 +117,7 @@ public:
         return handle_count_;
     }
 
-    // The following are only to be called when |has_state_tracker| reports true.
+    // The following are only to be called when |is_waitable| reports true.
 
     using ObserverList = fbl::DoublyLinkedList<StateObserver*, StateObserverListTraits>;
 
@@ -129,48 +132,44 @@ public:
     // Called when observers of the handle's state (e.g., waits on the handle) should be
     // "cancelled", i.e., when a handle (for the object that owns this StateTracker) is being
     // destroyed or transferred. Returns true if at least one observer was found.
-    bool Cancel(Handle* handle);
+    void Cancel(const Handle* handle);
 
     // Like Cancel() but issued via via zx_port_cancel().
-    bool CancelByKey(Handle* handle, const void* port, uint64_t key);
+    bool CancelByKey(const Handle* handle, const void* port, uint64_t key);
 
-    // Accessors for CookieJars
-    // These live with the state tracker so they can make use of the state tracker's
-    // lock (since not all objects have their own locks, but all Dispatchers that are
-    // cookie-capable have state trackers)
+    // Dispatchers that support get/set cookie must provide
+    // a CookieJar for those cookies to be stored in.
+    virtual CookieJar* get_cookie_jar() { return nullptr; }
+
+    // Accessors for CookieJars.
     zx_status_t SetCookie(CookieJar* cookiejar, zx_koid_t scope, uint64_t cookie);
     zx_status_t GetCookie(CookieJar* cookiejar, zx_koid_t scope, uint64_t* cookie);
-    zx_status_t InvalidateCookie(CookieJar *cookiejar);
-    zx_status_t InvalidateCookieLocked(CookieJar *cookiejar) TA_REQ(get_lock());
+    zx_status_t InvalidateCookie(CookieJar* cookiejar);
+    zx_status_t InvalidateCookieLocked(CookieJar* cookiejar) TA_REQ(get_lock());
 
     // Interface for derived classes.
 
     virtual zx_obj_type_t get_type() const = 0;
 
-    virtual bool has_state_tracker() const { return false; }
-
     virtual zx_status_t add_observer(StateObserver* observer);
 
-    virtual zx_status_t user_signal(uint32_t clear_mask, uint32_t set_mask, bool peer) = 0;
+    virtual zx_status_t user_signal_self(uint32_t clear_mask, uint32_t set_mask) = 0;
+    virtual zx_status_t user_signal_peer(uint32_t clear_mask, uint32_t set_mask) = 0;
 
-    // This can be overriden by e.g. Events to allow for more signals.
-    virtual zx_signals_t allowed_user_signals() const { return ZX_USER_SIGNAL_ALL; }
+    virtual void on_zero_handles() {}
 
-    virtual void on_zero_handles() { }
-
-    virtual zx_koid_t get_related_koid() const { return 0ULL; }
+    virtual zx_koid_t get_related_koid() const = 0;
+    virtual bool is_waitable() const = 0;
 
     // get_name() will return a null-terminated name of ZX_MAX_NAME_LEN - 1 or fewer
     // characters.  For objects that don't have names it will be "".
-    virtual void get_name(char out_name[ZX_MAX_NAME_LEN]) const { out_name[0] = 0; }
+    virtual void get_name(char out_name[ZX_MAX_NAME_LEN]) const __NONNULL((2)) {
+        memset(out_name, 0, ZX_MAX_NAME_LEN);
+    }
 
     // set_name() will truncate to ZX_MAX_NAME_LEN - 1 and ensure there is a
     // terminating null
     virtual zx_status_t set_name(const char* name, size_t len) { return ZX_ERR_NOT_SUPPORTED; }
-
-    // Dispatchers that support get/set cookie must provide
-    // a CookieJar for those cookies to be stored in.
-    virtual CookieJar* get_cookie_jar() { return nullptr; }
 
     struct DeleterListTraits {
         static fbl::SinglyLinkedListNodeState<Dispatcher*>& node_state(
@@ -186,31 +185,30 @@ protected:
     void UpdateStateLocked(zx_signals_t clear_mask, zx_signals_t set_mask) TA_REQ(get_lock());
 
     zx_signals_t GetSignalsStateLocked() const TA_REQ(get_lock()) {
-        ZX_DEBUG_ASSERT(has_state_tracker());
         return signals_;
     }
 
     // Dispatcher subtypes should use this lock to protect their internal state.
-    virtual fbl::Mutex* get_lock() const = 0;
+    virtual Lock<fbl::Mutex>* get_lock() const = 0;
 
 private:
     friend class fbl::Recyclable<Dispatcher>;
     void fbl_recycle();
 
     // The common implementation of UpdateState and UpdateStateLocked.
-    template <typename Mutex>
+    template <typename LockType>
     void UpdateStateHelper(zx_signals_t clear_mask,
                            zx_signals_t set_mask,
-                           Mutex* mutex);
+                           Lock<LockType>* lock);
 
     // The common implementation of AddObserver and AddObserverLocked.
-    template <typename Mutex>
+    template <typename LockType>
     void AddObserverHelper(StateObserver* observer,
-                           const StateObserver::CountInfo* cinfo, Mutex* mutex);
+                           const StateObserver::CountInfo* cinfo,
+                           Lock<LockType>* lock);
 
-    // Returns flag kHandled if one of the observers have been signaled.
-    StateObserver::Flags UpdateInternalLocked(ObserverList* obs_to_remove,
-                                              zx_signals_t signals) TA_REQ(get_lock());
+    void UpdateInternalLocked(ObserverList* obs_to_remove,
+                              zx_signals_t signals) TA_REQ(get_lock());
 
     const zx_koid_t koid_;
     uint32_t handle_count_;
@@ -224,9 +222,50 @@ private:
     fbl::SinglyLinkedListNodeState<Dispatcher*> deleter_ll_;
 };
 
+// SoloDispatchers stand alone. Since they have no peer to coordinate with, they
+// directly contain their state lock. This is a CRTP template type to permit
+// the lock validator to distinguish between locks in different subclasses of
+// SoloDispatcher.
+template <typename T, zx_rights_t def_rights, zx_signals_t extra_signals = 0u>
+class SoloDispatcher : public Dispatcher {
+public:
+    static constexpr zx_rights_t default_rights() { return def_rights; }
+
+    // At construction, the object's state tracker is asserting
+    // |signals|.
+    explicit SoloDispatcher(zx_signals_t signals = 0u)
+        : Dispatcher(signals) {}
+
+    // Related koid is overidden by subclasses, like thread and process.
+    zx_koid_t get_related_koid() const override TA_REQ(get_lock()) { return 0ULL; }
+    bool is_waitable() const final { return default_rights() & ZX_RIGHT_WAIT; }
+
+    zx_status_t user_signal_self(uint32_t clear_mask, uint32_t set_mask) final {
+        if (!is_waitable())
+            return ZX_ERR_NOT_SUPPORTED;
+        // Generic objects can set all USER_SIGNALs. Particular object
+        // types (events and eventpairs) may be able to set more.
+        auto allowed_signals = ZX_USER_SIGNAL_ALL | extra_signals;
+        if ((set_mask & ~allowed_signals) || (clear_mask & ~allowed_signals))
+            return ZX_ERR_INVALID_ARGS;
+
+        UpdateState(clear_mask, set_mask);
+        return ZX_OK;
+    }
+
+    zx_status_t user_signal_peer(uint32_t clear_mask, uint32_t set_mask) final {
+        return ZX_ERR_NOT_SUPPORTED;
+    }
+
+protected:
+    Lock<fbl::Mutex>* get_lock() const final { return &lock_; }
+
+    mutable DECLARE_MUTEX(SoloDispatcher) lock_;
+};
+
 // PeeredDispatchers have opposing endpoints to coordinate state
 // with. For example, writing into one endpoint of a Channel needs to
-// modify zx_signal_t state (for the readability bit) on the opposite
+// modify zx_signals_t state (for the readability bit) on the opposite
 // side. To coordinate their state, they share a mutex, which is held
 // by the PeerHolder. Both endpoints have a RefPtr back to the
 // PeerHolder; no one else ever does.
@@ -243,6 +282,10 @@ private:
 //     foo0->Init(&foo1);
 //     foo1->Init(&foo0);
 
+// A PeeredDispatcher object, in its |on_zero_handles| call must clear
+// out its peer's |peer_| field. This is needed to avoid leaks, and to
+// ensure that |user_signal| can correctly report ZX_ERR_PEER_CLOSED.
+
 // TODO(kulakowski) We should investigate turning this into one
 // allocation. This would mean PeerHolder would have two EndPoint
 // members, and that PeeredDispatcher would have custom refcounting.
@@ -252,14 +295,16 @@ public:
     PeerHolder() = default;
     ~PeerHolder() = default;
 
-    fbl::Mutex* get_lock() const { return &lock_; }
+    Lock<fbl::Mutex>* get_lock() const { return &lock_; }
 
-    mutable fbl::Mutex lock_;
+    mutable DECLARE_MUTEX(PeerHolder) lock_;
 };
 
-template <typename Self>
+template <typename Self, zx_rights_t def_rights, zx_signals_t extra_signals = 0u>
 class PeeredDispatcher : public Dispatcher {
 public:
+    static constexpr zx_rights_t default_rights() { return def_rights; }
+
     // At construction, the object's state tracker is asserting
     // |signals|.
     explicit PeeredDispatcher(fbl::RefPtr<PeerHolder<Self>> holder,
@@ -269,20 +314,27 @@ public:
     virtual ~PeeredDispatcher() = default;
 
     zx_koid_t get_related_koid() const final TA_REQ(get_lock()) { return peer_koid_; }
+    bool is_waitable() const final { return default_rights() & ZX_RIGHT_WAIT; }
 
-    zx_status_t user_signal(uint32_t clear_mask, uint32_t set_mask, bool peer) final
+    zx_status_t user_signal_self(uint32_t clear_mask, uint32_t set_mask) final
         TA_NO_THREAD_SAFETY_ANALYSIS {
-        auto allowed_signals = allowed_user_signals();
+        auto allowed_signals = ZX_USER_SIGNAL_ALL | extra_signals;
         if ((set_mask & ~allowed_signals) || (clear_mask & ~allowed_signals))
             return ZX_ERR_INVALID_ARGS;
 
-        fbl::AutoLock locker(get_lock());
+        Guard<fbl::Mutex> guard{get_lock()};
 
-        if (!peer) {
-            UpdateStateLocked(clear_mask, set_mask);
-            return ZX_OK;
-        }
+        UpdateStateLocked(clear_mask, set_mask);
+        return ZX_OK;
+    }
 
+    zx_status_t user_signal_peer(uint32_t clear_mask, uint32_t set_mask) final
+        TA_NO_THREAD_SAFETY_ANALYSIS {
+        auto allowed_signals = ZX_USER_SIGNAL_ALL | extra_signals;
+        if ((set_mask & ~allowed_signals) || (clear_mask & ~allowed_signals))
+            return ZX_ERR_INVALID_ARGS;
+
+        Guard<fbl::Mutex> guard{get_lock()};
         // object_signal() may race with handle_close() on another thread.
         if (!peer_)
             return ZX_ERR_PEER_CLOSED;
@@ -290,7 +342,25 @@ public:
         return ZX_OK;
     }
 
-    fbl::Mutex* get_lock() const override { return holder_->get_lock(); }
+    // All subclasses of PeeredDispatcher must implement a public
+    // |void on_zero_handles_locked()|. The peer lifetime management
+    // (i.e. the peer zeroing) is centralized here.
+    void on_zero_handles() final TA_NO_THREAD_SAFETY_ANALYSIS {
+        Guard<fbl::Mutex> guard{get_lock()};
+        auto peer = fbl::move(peer_);
+        static_cast<Self*>(this)->on_zero_handles_locked();
+
+        // This is needed to avoid leaks, and to ensure that
+        // |user_signal| can correctly report ZX_ERR_PEER_CLOSED.
+        if (peer != nullptr) {
+            // This defeats the lock analysis in the usual way: it
+            // can't reason that the peers' get_lock() calls alias.
+            peer->peer_.reset();
+            static_cast<Self*>(peer.get())->OnPeerZeroHandlesLocked();
+        }
+    }
+
+    Lock<fbl::Mutex>* get_lock() const final { return holder_->get_lock(); }
 
 protected:
     zx_koid_t peer_koid_ = 0u;
@@ -298,21 +368,6 @@ protected:
 
 private:
     const fbl::RefPtr<PeerHolder<Self>> holder_;
-};
-
-// SoloDispatchers stand alone. Since they have no peer to coordinate
-// with, they directly contain their state lock.
-class SoloDispatcher : public Dispatcher {
-public:
-    // At construction, the object's state tracker is asserting
-    // |signals|.
-    explicit SoloDispatcher(zx_signals_t signals = 0u) : Dispatcher(signals) {}
-
-    zx_status_t user_signal(uint32_t clear_mask, uint32_t set_mask, bool peer) final;
-
-protected:
-    fbl::Mutex* get_lock() const override { return &lock_; }
-    mutable fbl::Mutex lock_;
 };
 
 // DownCastDispatcher checks if a RefPtr<Dispatcher> points to a

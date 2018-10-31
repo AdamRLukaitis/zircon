@@ -6,32 +6,67 @@
 
 #include "display-device.h"
 #include "dpcd.h"
+#include <ddk/protocol/i2c-impl.h>
 
 namespace i915 {
 
 class DpAuxMessage;
 
-class DpDisplay : public DisplayDevice, private edid::EdidDdcSource {
+class DpAux {
 public:
-    DpDisplay(Controller* controller, registers::Ddi ddi, registers::Pipe pipe);
+    DpAux(registers::Ddi ddi);
 
-private:
-    bool QueryDevice(edid::Edid* edid, zx_display_info_t* info) final;
-    bool DefaultModeset() final;
-    bool DdcRead(uint8_t segment, uint8_t offset, uint8_t* buf, uint8_t len) final;
-
-    bool DpAuxRead(uint32_t dp_cmd, uint32_t addr, uint8_t* buf, size_t size);
-    bool DpAuxReadChunk(uint32_t dp_cmd, uint32_t addr, uint8_t* buf, uint32_t size_in,
-                        size_t* size_out);
-    bool DpAuxWrite(uint32_t dp_cmd, uint32_t addr, const uint8_t* buf, size_t size);
-    bool SendDpAuxMsg(const DpAuxMessage& request, DpAuxMessage* reply, bool* timeout_result);
-    bool SendDpAuxMsgWithRetry(const DpAuxMessage& request, DpAuxMessage* reply);
+    zx_status_t I2cTransact(const i2c_impl_op_t* ops, size_t count);
 
     bool DpcdRead(uint32_t addr, uint8_t* buf, size_t size);
     bool DpcdWrite(uint32_t addr, const uint8_t* buf, size_t size);
 
+    void set_mmio_space(ddk::MmioBuffer* mmio_space) {
+        fbl::AutoLock lock(&lock_);
+        mmio_space_ = mmio_space;
+    };
+private:
+    const registers::Ddi ddi_;
+    // The lock protects the registers this class writes to, not the whole register io space.
+    ddk::MmioBuffer* mmio_space_ __TA_GUARDED(lock_);
+    mtx_t lock_;
+
+    zx_status_t DpAuxRead(uint32_t dp_cmd, uint32_t addr,
+                          uint8_t* buf, size_t size) __TA_REQUIRES(lock_);
+    zx_status_t DpAuxReadChunk(uint32_t dp_cmd, uint32_t addr, uint8_t* buf, uint32_t size_in,
+                               size_t* size_out) __TA_REQUIRES(lock_);
+    zx_status_t DpAuxWrite(uint32_t dp_cmd, uint32_t addr,
+                           const uint8_t* buf, size_t size) __TA_REQUIRES(lock_);
+    zx_status_t SendDpAuxMsg(const DpAuxMessage& request, DpAuxMessage* reply) __TA_REQUIRES(lock_);
+    zx_status_t SendDpAuxMsgWithRetry(const DpAuxMessage& request,
+                                      DpAuxMessage* reply) __TA_REQUIRES(lock_);
+};
+
+class DpDisplay : public DisplayDevice {
+public:
+    DpDisplay(Controller* controller, uint64_t id, registers::Ddi ddi);
+
+private:
+    bool Query() final;
+    bool InitDdi() final;
+    bool DdiModeset(const display_mode_t& mode,
+                    registers::Pipe pipe, registers::Trans trans) final;
+    bool PipeConfigPreamble(const display_mode_t& mode,
+                            registers::Pipe pipe, registers::Trans trans) final;
+    bool PipeConfigEpilogue(const display_mode_t& mode,
+                            registers::Pipe pipe, registers::Trans trans) final;
+    bool ComputeDpllState(uint32_t pixel_clock_10khz, struct dpll_state* config) final;
+    uint32_t LoadClockRateForTranscoder(registers::Trans transcoder) final;
+
+    bool CheckPixelRate(uint64_t pixel_rate) final;
+
+    uint32_t i2c_bus_id() const final { return ddi() + registers::kDdiCount; }
+
+    bool DpcdWrite(uint32_t addr, const uint8_t* buf, size_t size);
+    bool DpcdRead(uint32_t addr, uint8_t* buf, size_t size);
     bool DpcdRequestLinkTraining(const dpcd::TrainingPatternSet& tp_set,
                                  const dpcd::TrainingLaneSet lanes[]);
+    bool DpcdUpdateLinkTraining(const dpcd::TrainingLaneSet lanes[]);
     template<uint32_t addr, typename T> bool DpcdReadPairedRegs(
             hwreg::RegisterBase<T, typename T::ValueType>* status);
     bool DpcdHandleAdjustRequest(dpcd::TrainingLaneSet* training, dpcd::AdjustRequestLane* adjust);
@@ -43,12 +78,29 @@ private:
     bool LinkTrainingStage2(dpcd::TrainingPatternSet* tp_set, dpcd::TrainingLaneSet* lanes);
 
     bool SetBacklightOn(bool on);
+    bool InitBacklightHw() override;
+
+    bool IsBacklightOn();
     // Sets the backlight brightness with |val| as a coefficient on the maximum
     // brightness. |val| must be in [0, 1]. If the panel has a minimum fractional
     // brightness, then |val| will be clamped to [min, 1].
     bool SetBacklightBrightness(double val);
 
+    // Gets the backlight brightness as a coefficient on the maximum brightness,
+    // between the minimum brightness and 1.
+    double GetBacklightBrightness();
+
     bool HandleHotplug(bool long_pulse) override;
+    bool HasBacklight() override;
+    void SetBacklightState(bool power, uint8_t brightness) override;
+    void GetBacklightState(bool* power, uint8_t* brightness) override;
+
+    uint8_t dpcd_capability(uint16_t addr) {
+        return dpcd_capabilities_[addr - dpcd::DPCD_CAP_START];
+    }
+    uint8_t dpcd_edp_capability(uint16_t addr) {
+        return dpcd_edp_capabilities_[addr - dpcd::DPCD_EDP_CAP_START];
+    }
 
     uint8_t dp_lane_count_;
     uint32_t dp_link_rate_mhz_;

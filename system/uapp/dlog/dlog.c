@@ -59,7 +59,7 @@ int main(int argc, char** argv) {
         argv++;
     }
 
-    if (zx_log_create(ZX_LOG_FLAG_READABLE, &h) < 0) {
+    if (zx_debuglog_create(ZX_HANDLE_INVALID, ZX_LOG_FLAG_READABLE, &h) < 0) {
         fprintf(stderr, "dlog: cannot open debug log\n");
         return -1;
     }
@@ -68,7 +68,7 @@ int main(int argc, char** argv) {
     zx_log_record_t* rec = (zx_log_record_t*)buf;
     for (;;) {
         zx_status_t status;
-        if ((status = zx_log_read(h, ZX_LOG_RECORD_MAX, rec, 0)) < 0) {
+        if ((status = zx_debuglog_read(h, 0, rec, ZX_LOG_RECORD_MAX)) < 0) {
             if ((status == ZX_ERR_SHOULD_WAIT) && tail) {
                 zx_object_wait_one(h, ZX_LOG_READABLE, ZX_TIME_INFINITE, NULL);
                 continue;

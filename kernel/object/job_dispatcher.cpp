@@ -22,8 +22,6 @@
 
 #include <platform.h>
 
-using fbl::AutoLock;
-
 // The starting max_height value of the root job.
 static constexpr uint32_t kRootJobMaxHeight = 32;
 
@@ -51,7 +49,7 @@ uint32_t JobDispatcher::ChildCountLocked<ProcessDispatcher>() const {
 //
 //  LiveRefsArray refs;
 //  {
-//      AutoLock lock(get_lock());
+//      Guard<fbl::Mutex> guard{get_lock()};
 //      refs = ForEachChildInLocked(...);
 //  }
 //
@@ -87,7 +85,7 @@ JobDispatcher::LiveRefsArray JobDispatcher::ForEachChildInLocked(
     size_t ix = 0;
 
     for (auto& craw : children) {
-        auto cref = ::fbl::internal::MakeRefPtrUpgradeFromRaw(&craw, lock_);
+        auto cref = ::fbl::internal::MakeRefPtrUpgradeFromRaw(&craw, lock_.lock());
         if (!cref)
             continue;
 
@@ -131,11 +129,11 @@ zx_status_t JobDispatcher::Create(uint32_t flags,
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    if (!parent->AddChildJob(job.get())) {
+    if (!parent->AddChildJob(job)) {
         return ZX_ERR_BAD_STATE;
     }
 
-    *rights = ZX_DEFAULT_JOB_RIGHTS;
+    *rights = default_rights();
     *dispatcher = fbl::move(job);
     return ZX_OK;
 }
@@ -149,19 +147,18 @@ JobDispatcher::JobDispatcher(uint32_t /*flags*/,
       state_(State::READY),
       process_count_(0u),
       job_count_(0u),
-      importance_(parent != nullptr
-                      ? ZX_JOB_IMPORTANCE_INHERITED
-                      : ZX_JOB_IMPORTANCE_MAX),
+      kill_on_oom_(false),
       policy_(policy) {
 
-    // Set the initial relative importance.
-    // Tries to make older jobs closer to the root more important.
+    // Set the initial job order, and try to make older jobs closer to
+    // the root (both hierarchically and temporally) show up earlier
+    // in enumeration.
     if (parent_ == nullptr) {
         // Root job is the most important.
-        AutoLock lock(&importance_lock_);
-        importance_list_.push_back(this);
+        Guard<fbl::Mutex> guard{AllJobsLock::Get()};
+        all_jobs_list_.push_back(this);
     } else {
-        AutoLock plock(parent_->get_lock());
+        Guard<fbl::Mutex> parent_guard{parent_->get_lock()};
         JobDispatcher* neighbor;
         if (!parent_->jobs_.is_empty()) {
             // Our youngest sibling.
@@ -182,10 +179,9 @@ JobDispatcher::JobDispatcher(uint32_t /*flags*/,
             neighbor = parent_.get();
         }
 
-        // Make ourselves slightly less important than our neighbor.
-        AutoLock lock(&importance_lock_);
-        importance_list_.insert( // insert before
-            importance_list_.make_iterator(*neighbor), this);
+        // Make ourselves appear after our next-youngest neighbor.
+        Guard<fbl::Mutex> guard{AllJobsLock::Get()};
+        all_jobs_list_.insert(all_jobs_list_.make_iterator(*neighbor), this);
     }
 }
 
@@ -194,9 +190,9 @@ JobDispatcher::~JobDispatcher() {
         parent_->RemoveChildJob(this);
 
     {
-        AutoLock lock(&importance_lock_);
-        DEBUG_ASSERT(dll_importance_.InContainer());
-        importance_list_.erase(*this);
+        Guard<fbl::Mutex> guard{AllJobsLock::Get()};
+        DEBUG_ASSERT(dll_all_jobs_.InContainer());
+        all_jobs_list_.erase(*this);
     }
 }
 
@@ -204,26 +200,26 @@ zx_koid_t JobDispatcher::get_related_koid() const {
     return parent_ ? parent_->get_koid() : 0u;
 }
 
-bool JobDispatcher::AddChildProcess(ProcessDispatcher* process) {
+bool JobDispatcher::AddChildProcess(const fbl::RefPtr<ProcessDispatcher>& process) {
     canary_.Assert();
 
-    AutoLock lock(get_lock());
+    Guard<fbl::Mutex> guard{get_lock()};
     if (state_ != State::READY)
         return false;
-    procs_.push_back(process);
+    procs_.push_back(process.get());
     ++process_count_;
     UpdateSignalsIncrementLocked();
     return true;
 }
 
-bool JobDispatcher::AddChildJob(JobDispatcher* job) {
+bool JobDispatcher::AddChildJob(const fbl::RefPtr<JobDispatcher>& job) {
     canary_.Assert();
 
-    AutoLock lock(get_lock());
+    Guard<fbl::Mutex> guard{get_lock()};
     if (state_ != State::READY)
         return false;
 
-    jobs_.push_back(job);
+    jobs_.push_back(job.get());
     ++job_count_;
     UpdateSignalsIncrementLocked();
     return true;
@@ -232,7 +228,7 @@ bool JobDispatcher::AddChildJob(JobDispatcher* job) {
 void JobDispatcher::RemoveChildProcess(ProcessDispatcher* process) {
     canary_.Assert();
 
-    AutoLock lock(get_lock());
+    Guard<fbl::Mutex> guard{get_lock()};
     // The process dispatcher can call us in its destructor, Kill(),
     // or RemoveThread().
     if (!ProcessDispatcher::JobListTraitsRaw::node_state(*process).InContainer())
@@ -245,7 +241,7 @@ void JobDispatcher::RemoveChildProcess(ProcessDispatcher* process) {
 void JobDispatcher::RemoveChildJob(JobDispatcher* job) {
     canary_.Assert();
 
-    AutoLock lock(get_lock());
+    Guard<fbl::Mutex> guard{get_lock()};
     if (!JobDispatcher::ListTraitsRaw::node_state(*job).InContainer())
         return;
     jobs_.erase(*job);
@@ -256,7 +252,8 @@ void JobDispatcher::RemoveChildJob(JobDispatcher* job) {
 void JobDispatcher::UpdateSignalsDecrementLocked() {
     canary_.Assert();
 
-    DEBUG_ASSERT(get_lock()->IsHeld());
+    DEBUG_ASSERT(get_lock()->lock().IsHeld());
+
     // removing jobs or processes.
     zx_signals_t set = 0u;
     if (process_count_ == 0u) {
@@ -287,7 +284,8 @@ void JobDispatcher::UpdateSignalsDecrementLocked() {
 void JobDispatcher::UpdateSignalsIncrementLocked() {
     canary_.Assert();
 
-    DEBUG_ASSERT(get_lock()->IsHeld());
+    DEBUG_ASSERT(get_lock()->lock().IsHeld());
+
     // Adding jobs or processes.
     zx_signals_t clear = 0u;
     if (process_count_ == 1u) {
@@ -302,11 +300,11 @@ void JobDispatcher::UpdateSignalsIncrementLocked() {
 }
 
 pol_cookie_t JobDispatcher::GetPolicy() {
-    AutoLock lock(get_lock());
+    Guard<fbl::Mutex> guard{get_lock()};
     return policy_;
 }
 
-void JobDispatcher::Kill() {
+bool JobDispatcher::Kill() {
     canary_.Assert();
 
     JobList jobs_to_kill;
@@ -316,14 +314,9 @@ void JobDispatcher::Kill() {
     LiveRefsArray proc_refs;
 
     {
-        AutoLock lock(get_lock());
+        Guard<fbl::Mutex> guard{get_lock()};
         if (state_ != State::READY)
-            return;
-
-        // Short circuit if there is nothing to do. Notice |state_|
-        // does not change.
-        if ((job_count_ == 0u) && (process_count_ == 0u))
-            return;
+            return false;
 
         state_ = State::KILLING;
         zx_status_t result;
@@ -348,12 +341,14 @@ void JobDispatcher::Kill() {
     while (!procs_to_kill.is_empty()) {
         procs_to_kill.pop_front()->Kill();
     }
+
+    return true;
 }
 
 zx_status_t JobDispatcher::SetPolicy(
     uint32_t mode, const zx_policy_basic* in_policy, size_t policy_count) {
     // Can't set policy when there are active processes or jobs.
-    AutoLock lock(get_lock());
+    Guard<fbl::Mutex> guard{get_lock()};
 
     if (!procs_.is_empty() || !jobs_.is_empty())
         return ZX_ERR_BAD_STATE;
@@ -362,7 +357,7 @@ zx_status_t JobDispatcher::SetPolicy(
     auto status = GetSystemPolicyManager()->AddPolicy(
         mode, policy_, in_policy, policy_count, &new_policy);
 
-    if (status < 0)
+    if (status != ZX_OK)
         return status;
 
     policy_ = new_policy;
@@ -378,7 +373,7 @@ bool JobDispatcher::EnumerateChildren(JobEnumerator* je, bool recurse) {
     zx_status_t result = ZX_OK;
 
     {
-        AutoLock lock(get_lock());
+        Guard<fbl::Mutex> guard{get_lock()};
 
         proc_refs = ForEachChildInLocked(
             procs_, &result, [&](fbl::RefPtr<ProcessDispatcher> proc) {
@@ -413,7 +408,7 @@ JobDispatcher::LookupProcessById(zx_koid_t koid) {
 
     fbl::RefPtr<ProcessDispatcher> found_proc;
     {
-        AutoLock lock(get_lock());
+        Guard<fbl::Mutex> guard{get_lock()};
         zx_status_t result;
 
         proc_refs = ForEachChildInLocked(procs_, &result, [&](fbl::RefPtr<ProcessDispatcher> proc) {
@@ -435,7 +430,7 @@ JobDispatcher::LookupJobById(zx_koid_t koid) {
 
     fbl::RefPtr<JobDispatcher> found_job;
     {
-        AutoLock lock(get_lock());
+        Guard<fbl::Mutex> guard{get_lock()};
         zx_status_t result;
 
         jobs_refs = ForEachChildInLocked(jobs_, &result, [&](fbl::RefPtr<JobDispatcher> job) {
@@ -461,99 +456,34 @@ zx_status_t JobDispatcher::set_name(const char* name, size_t len) {
     return name_.set(name, len);
 }
 
-zx_status_t JobDispatcher::get_importance(zx_job_importance_t* out) const {
-    canary_.Assert();
-    DEBUG_ASSERT(out != nullptr);
-
-    // Find the importance value that we inherit.
-    const JobDispatcher* job = this;
-    do {
-        zx_job_importance_t imp = job->GetRawImportance();
-        if (imp != ZX_JOB_IMPORTANCE_INHERITED) {
-            *out = imp;
-            return ZX_OK;
-        }
-        // Don't need to use RefPtrs or grab locks: our caller has a reference
-        // to |this|, and there's a const RefPtr chain from |this| to all
-        // ancestors.
-        job = job->parent_.get();
-    } while (job != nullptr);
-
-    // The root job should always have a non-INHERITED importance.
-    PANIC("Could not find inherited importance of job %" PRIu64 "\n",
-          get_koid());
-}
-
-// Does not resolve ZX_JOB_IMPORTANCE_INHERITED.
-zx_job_importance_t JobDispatcher::GetRawImportance() const {
-    canary_.Assert();
-    AutoLock lock(get_lock());
-    return importance_;
-}
-
-zx_status_t JobDispatcher::set_importance(zx_job_importance_t importance) {
-    canary_.Assert();
-
-    if ((importance < ZX_JOB_IMPORTANCE_MIN ||
-         importance > ZX_JOB_IMPORTANCE_MAX) &&
-        importance != ZX_JOB_IMPORTANCE_INHERITED) {
-        return ZX_ERR_OUT_OF_RANGE;
-    }
-    AutoLock lock(get_lock());
-    // No-one is allowed to change the importance of the root job.  Note that
-    // the actual root job ("<superroot>") typically isn't seen by userspace, so
-    // no userspace program should see this error.  The job that userspace calls
-    // "root" is actually a child of the real (super) root job.
-    if (parent_ == nullptr) {
-        return ZX_ERR_ACCESS_DENIED;
-    }
-    importance_ = importance;
-    return ZX_OK;
-}
-
-// Global importance ranking. Note that this is independent of
-// zx_task_importance_t-style importance as far as JobDispatcher is concerned;
-// some other entity will choose how to order importance_list_.
-fbl::Mutex JobDispatcher::importance_lock_;
-JobDispatcher::JobImportanceList JobDispatcher::importance_list_;
-
-zx_status_t JobDispatcher::MakeMoreImportantThan(
-    fbl::RefPtr<JobDispatcher> other) {
-
-    canary_.Assert();
-    if (other != nullptr)
-        other->canary_.Assert();
-
-    // Update this job's position in the global job importance list.
-    AutoLock lock(&importance_lock_);
-    DEBUG_ASSERT(dll_importance_.InContainer());
-    DEBUG_ASSERT(other == nullptr || other->dll_importance_.InContainer());
-
-    importance_list_.erase(*this);
-    DEBUG_ASSERT(!dll_importance_.InContainer());
-    if (other == nullptr) {
-        // Make this the least important.
-        importance_list_.push_front(this);
-    } else {
-        // Insert just after the less-important other job.
-        importance_list_.insert_after(
-            importance_list_.make_iterator(*other), this);
-    }
-    DEBUG_ASSERT(dll_importance_.InContainer());
-
-    return ZX_OK;
-}
+// Global list of all jobs.
+JobDispatcher::AllJobsList JobDispatcher::all_jobs_list_;
 
 zx_status_t JobDispatcher::SetExceptionPort(fbl::RefPtr<ExceptionPort> eport) {
     canary_.Assert();
+    bool debugger = false;
+    switch (eport->type()) {
+    case ExceptionPort::Type::JOB_DEBUGGER:
+        debugger = true;
+        break;
+    case ExceptionPort::Type::JOB:
+        break;
+    default:
+        DEBUG_ASSERT_MSG(false, "unexpected port type: %d",
+                         static_cast<int>(eport->type()));
+        break;
+    }
 
-    DEBUG_ASSERT(eport->type() == ExceptionPort::Type::JOB);
-
-    AutoLock lock(get_lock());
-    if (exception_port_)
-        return ZX_ERR_BAD_STATE;
-    exception_port_ = fbl::move(eport);
-
+    Guard<fbl::Mutex> guard{get_lock()};
+    if (debugger) {
+        if (debugger_exception_port_)
+            return ZX_ERR_ALREADY_BOUND;
+        debugger_exception_port_ = fbl::move(eport);
+    } else {
+        if (exception_port_)
+            return ZX_ERR_ALREADY_BOUND;
+        exception_port_ = fbl::move(eport);
+    }
     return ZX_OK;
 }
 
@@ -573,13 +503,17 @@ private:
     fbl::RefPtr<ExceptionPort> eport_;
 };
 
-bool JobDispatcher::ResetExceptionPort(bool quietly) {
+bool JobDispatcher::ResetExceptionPort(bool debugger, bool quietly) {
     canary_.Assert();
 
     fbl::RefPtr<ExceptionPort> eport;
     {
-        AutoLock lock(get_lock());
-        exception_port_.swap(eport);
+        Guard<fbl::Mutex> lock{get_lock()};
+        if (debugger) {
+            debugger_exception_port_.swap(eport);
+        } else {
+            exception_port_.swap(eport);
+        }
         if (eport == nullptr) {
             // Attempted to unbind when no exception port is bound.
             return false;
@@ -615,6 +549,21 @@ bool JobDispatcher::ResetExceptionPort(bool quietly) {
 }
 
 fbl::RefPtr<ExceptionPort> JobDispatcher::exception_port() {
-    AutoLock lock(get_lock());
+    Guard<fbl::Mutex> lock{get_lock()};
     return exception_port_;
+}
+
+fbl::RefPtr<ExceptionPort> JobDispatcher::debugger_exception_port() {
+    Guard<fbl::Mutex> guard{get_lock()};
+    return debugger_exception_port_;
+}
+
+void JobDispatcher::set_kill_on_oom(bool value) {
+    Guard<fbl::Mutex> guard{get_lock()};
+    kill_on_oom_ = value;
+};
+
+bool JobDispatcher::get_kill_on_oom() const {
+    Guard<fbl::Mutex> guard{get_lock()};
+    return kill_on_oom_;
 }

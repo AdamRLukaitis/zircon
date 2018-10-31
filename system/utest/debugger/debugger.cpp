@@ -12,9 +12,9 @@
 #include <fbl/atomic.h>
 #include <launchpad/launchpad.h>
 #include <launchpad/vmo.h>
+#include <lib/zircon-internal/crashlogger.h>
 #include <test-utils/test-utils.h>
 #include <unittest/unittest.h>
-#include <zircon/crashlogger.h>
 #include <zircon/process.h>
 #include <zircon/processargs.h>
 #include <zircon/syscalls.h>
@@ -28,7 +28,7 @@
 
 namespace {
 
-typedef bool(wait_inferior_exception_handler_t)(zx_handle_t inferior,
+typedef bool(wait_inferior_exception_handler_t)(zx_handle_t inferior, zx_handle_t port,
                                                 const zx_port_packet_t* packet, void* handler_arg);
 
 constexpr size_t kTestMemorySize = 8;
@@ -42,12 +42,12 @@ constexpr int kNumExtraThreads = 4;
 // Produce a backtrace of sufficient size to be interesting but not excessive.
 constexpr int kTestSegfaultDepth = 4;
 
-const char test_inferior_child_name[] = "inferior";
+constexpr char kTestInferiorChildName[] = "inferior";
 // The segfault child is not used by the test.
 // It exists for debugging purposes.
-const char test_segfault_child_name[] = "segfault";
+constexpr char kTestSegfaultChildName[] = "segfault";
 // Used for testing the s/w breakpoint insn.
-const char test_swbreak_child_name[] = "swbreak";
+constexpr char kTestSwbreakChildName[] = "swbreak";
 
 fbl::atomic<int> extra_thread_count;
 
@@ -100,7 +100,7 @@ void test_memory_ops(zx_handle_t inferior, zx_handle_t thread) {
 void fix_inferior_segv(zx_handle_t thread) {
     unittest_printf("Fixing inferior segv\n");
 
-    // The segv was because r8 == 0, change it to a usable value. See test_prep_and_segv.
+    // The segv was because r8 == 0, change it to a usable value. See TestPrepAndSegv.
     zx_thread_state_general_regs_t regs;
     read_inferior_gregs(thread, &regs);
 #if defined(__x86_64__)
@@ -111,7 +111,7 @@ void fix_inferior_segv(zx_handle_t thread) {
     write_inferior_gregs(thread, &regs);
 }
 
-bool test_segv_pc(zx_handle_t thread) {
+bool TestSegvPc(zx_handle_t thread) {
     zx_thread_state_general_regs_t regs;
     read_inferior_gregs(thread, &regs);
 
@@ -146,7 +146,7 @@ bool wait_inferior_thread_worker(inferior_data_t* inferior_data,
             return true;
         }
 
-        if (!handler(inferior, &packet, handler_arg))
+        if (!handler(inferior, eport, &packet, handler_arg))
             return false;
     }
 }
@@ -244,7 +244,9 @@ bool handle_thread_exiting(zx_handle_t inferior, const zx_port_packet_t* packet)
 // This returns a bool as it's a unittest "helper" routine.
 // N.B. This runs on the wait-inferior thread.
 
-bool handle_expected_page_fault(zx_handle_t inferior, const zx_port_packet_t* packet,
+bool handle_expected_page_fault(zx_handle_t inferior,
+                                zx_handle_t port,
+                                const zx_port_packet_t* packet,
                                 fbl::atomic<int>* segv_count) {
     BEGIN_HELPER;
 
@@ -256,7 +258,7 @@ bool handle_expected_page_fault(zx_handle_t inferior, const zx_port_packet_t* pa
     dump_inferior_regs(thread);
 
     // Verify that the fault is at the PC we expected.
-    if (!test_segv_pc(thread))
+    if (!TestSegvPc(thread))
         return false;
 
     // Do some tests that require a suspended inferior.
@@ -271,7 +273,7 @@ bool handle_expected_page_fault(zx_handle_t inferior, const zx_port_packet_t* pa
     // before we can increment it.
     atomic_fetch_add(segv_count, 1);
 
-    zx_status_t status = zx_task_resume(thread, ZX_RESUME_EXCEPTION);
+    zx_status_t status = zx_task_resume_from_exception(thread, port, 0);
     tu_handle_close(thread);
     ASSERT_EQ(status, ZX_OK);
 
@@ -280,7 +282,8 @@ bool handle_expected_page_fault(zx_handle_t inferior, const zx_port_packet_t* pa
 
 // N.B. This runs on the wait-inferior thread.
 
-bool debugger_test_exception_handler(zx_handle_t inferior, const zx_port_packet_t* packet,
+bool debugger_test_exception_handler(zx_handle_t inferior, zx_handle_t port,
+                                     const zx_port_packet_t* packet,
                                      void* handler_arg) {
     BEGIN_HELPER;
 
@@ -314,7 +317,7 @@ bool debugger_test_exception_handler(zx_handle_t inferior, const zx_port_packet_
 
         case ZX_EXCP_FATAL_PAGE_FAULT:
             ASSERT_NONNULL(segv_count);
-            ASSERT_TRUE(handle_expected_page_fault(inferior, packet, segv_count));
+            ASSERT_TRUE(handle_expected_page_fault(inferior, port, packet, segv_count));
             break;
 
         default: {
@@ -329,12 +332,12 @@ bool debugger_test_exception_handler(zx_handle_t inferior, const zx_port_packet_
     END_HELPER;
 }
 
-bool debugger_test() {
+bool DebuggerTest() {
     BEGIN_TEST;
 
     launchpad_t* lp;
     zx_handle_t inferior, channel;
-    if (!setup_inferior(test_inferior_child_name, &lp, &inferior, &channel))
+    if (!setup_inferior(kTestInferiorChildName, &lp, &inferior, &channel))
         return false;
 
     fbl::atomic<int> segv_count;
@@ -379,12 +382,12 @@ bool debugger_test() {
     END_TEST;
 }
 
-bool debugger_thread_list_test() {
+bool DebuggerThreadListTest() {
     BEGIN_TEST;
 
     launchpad_t* lp;
     zx_handle_t inferior, channel;
-    if (!setup_inferior(test_inferior_child_name, &lp, &inferior, &channel))
+    if (!setup_inferior(kTestInferiorChildName, &lp, &inferior, &channel))
         return false;
 
     zx_handle_t eport = tu_io_port_create();
@@ -443,7 +446,7 @@ bool debugger_thread_list_test() {
     END_TEST;
 }
 
-bool property_process_debug_addr_test() {
+bool PropertyProcessDebugAddrTest() {
     BEGIN_TEST;
 
     zx_handle_t self = zx_process_self();
@@ -504,7 +507,7 @@ int write_text_segment_helper() {
     return 42;
 }
 
-bool write_text_segment() {
+bool WriteTextSegment() {
     BEGIN_TEST;
 
     zx_handle_t self = zx_process_self();
@@ -573,9 +576,7 @@ int reg_access_thread_func(void* arg_) {
 
 #ifdef __x86_64__
     __asm__("\
-        call 1f\n\
-      1:\n\
-        pop %[pc]\n\
+        lea .(%%rip), %[pc]\n\
         mov %%rsp, %[sp]\n\
         mov %[initial_value], %%" REG_ACCESS_TEST_REG_NAME "\n\
       2:\n\
@@ -583,7 +584,7 @@ int reg_access_thread_func(void* arg_) {
         cmp %[initial_value], %%" REG_ACCESS_TEST_REG_NAME "\n\
         je 2b\n\
         mov %%" REG_ACCESS_TEST_REG_NAME ", %[result]"
-            : [result] "=r"(result), [pc] "=r"(pc), [sp] "=r"(sp)
+            : [result] "=r"(result), [pc] "=&r"(pc), [sp] "=&r"(sp)
             : [initial_value] "r"(initial_value)
             : REG_ACCESS_TEST_REG_NAME);
 #endif
@@ -598,7 +599,7 @@ int reg_access_thread_func(void* arg_) {
         cmp %[initial_value], " REG_ACCESS_TEST_REG_NAME "\n\
         b.eq 1b\n\
         mov %[result], " REG_ACCESS_TEST_REG_NAME
-            : [result] "=r"(result), [pc] "=r"(pc), [sp] "=r"(sp)
+            : [result] "=r"(result), [pc] "=&r"(pc), [sp] "=&r"(sp)
             : [initial_value] "r"(initial_value)
             : REG_ACCESS_TEST_REG_NAME);
 #endif
@@ -612,7 +613,7 @@ int reg_access_thread_func(void* arg_) {
     return 0;
 }
 
-bool suspended_reg_access_test() {
+bool SuspendedRegAccessTest() {
     BEGIN_TEST;
 
     zx_handle_t self_proc = zx_process_self();
@@ -643,15 +644,22 @@ bool suspended_reg_access_test() {
     // Keep looping until we know the thread is stopped in the assembler.
     // This is the only place we can guarantee particular registers have
     // particular values.
+    zx_handle_t suspend_token = ZX_HANDLE_INVALID;
     zx_thread_state_general_regs_t regs;
     uint64_t test_reg = 0;
-    while (test_reg != reg_access_initial_value) {
+    while (true) {
         zx_nanosleep(zx_deadline_after(ZX_USEC(1)));
-        ASSERT_EQ(zx_task_suspend(thread), ZX_OK);
+        ASSERT_EQ(zx_task_suspend_token(thread, &suspend_token), ZX_OK);
         ASSERT_TRUE(wait_thread_suspended(self_proc, thread, eport));
 
         read_inferior_gregs(thread, &regs);
         test_reg = regs.REG_ACCESS_TEST_REG;
+
+        if (test_reg == reg_access_initial_value)
+            break;  // Keep thread suspended.
+
+        // Resume and try again.
+        zx_handle_close(suspend_token);
     }
 
     uint64_t pc_value = extract_pc_reg(&regs);
@@ -659,7 +667,7 @@ bool suspended_reg_access_test() {
     regs.REG_ACCESS_TEST_REG = reg_access_write_test_value;
     write_inferior_gregs(thread, &regs);
 
-    ASSERT_EQ(zx_task_resume(thread, 0), ZX_OK);
+    ASSERT_EQ(zx_handle_close(suspend_token), ZX_OK);
     thrd_join(thread_c11, NULL);
     tu_handle_close(thread);
 
@@ -721,10 +729,10 @@ int suspended_in_syscall_reg_access_thread_func(void* arg_) {
             .rd_num_handles = 0,
         };
         zx_status_t call_status = zx_channel_call(arg->syscall_handle, 0, ZX_TIME_INFINITE,
-                                                  &call_args, &actual_bytes, &actual_handles, NULL);
+                                                  &call_args, &actual_bytes, &actual_handles);
         ASSERT_EQ(call_status, ZX_OK);
         EXPECT_EQ(actual_bytes, sizeof(recv_buf));
-        EXPECT_EQ(memcmp(recv_buf, "TXIDy", sizeof(recv_buf)), 0);
+        EXPECT_EQ(memcmp(recv_buf + sizeof(zx_txid_t), "y", sizeof(recv_buf) - sizeof(zx_txid_t)), 0);
     } else {
         zx_signals_t pending;
         zx_status_t status =
@@ -775,12 +783,14 @@ bool suspended_in_syscall_reg_access_worker(bool do_channel_call) {
 
     // Busy-wait until thread is blocked inside the syscall.
     zx_info_thread_t thread_info;
+    uint32_t expected_blocked_reason =
+        do_channel_call ? ZX_THREAD_STATE_BLOCKED_CHANNEL : ZX_THREAD_STATE_BLOCKED_WAIT_ONE;
     do {
         // Don't check too frequently here as it can blow up tracing output
         // when debugging with kernel tracing turned on.
         zx_nanosleep(zx_deadline_after(ZX_USEC(100)));
         thread_info = tu_thread_get_info(thread);
-    } while (thread_info.state != ZX_THREAD_STATE_BLOCKED);
+    } while (thread_info.state != expected_blocked_reason);
     ASSERT_EQ(thread_info.wait_exception_port_type, ZX_EXCEPTION_PORT_TYPE_NONE);
 
     // Extra sanity check for channels.
@@ -794,7 +804,8 @@ bool suspended_in_syscall_reg_access_worker(bool do_channel_call) {
     zx_signals_t signals = ZX_THREAD_TERMINATED | ZX_THREAD_RUNNING | ZX_THREAD_SUSPENDED;
     tu_object_wait_async(thread, eport, signals);
 
-    ASSERT_EQ(zx_task_suspend(thread), ZX_OK);
+    zx_handle_t token;
+    ASSERT_EQ(zx_task_suspend_token(thread, &token), ZX_OK);
 
     ASSERT_TRUE(wait_thread_suspended(self_proc, thread, eport));
 
@@ -821,7 +832,7 @@ bool suspended_in_syscall_reg_access_worker(bool do_channel_call) {
             zx_channel_read(syscall_handle, 0, buf, NULL, sizeof(buf), 0, &actual_bytes, NULL),
             ZX_OK);
         EXPECT_EQ(actual_bytes, sizeof(buf));
-        EXPECT_EQ(memcmp(buf, "TXIDx", sizeof(buf)), 0);
+        EXPECT_EQ(memcmp(buf + sizeof(zx_txid_t), "x", sizeof(buf) - sizeof(zx_txid_t)), 0);
 
         // write a reply
         buf[sizeof(zx_txid_t)] = 'y';
@@ -840,7 +851,7 @@ bool suspended_in_syscall_reg_access_worker(bool do_channel_call) {
         ASSERT_EQ(zx_object_signal(syscall_handle, 0u, ZX_EVENT_SIGNALED), ZX_OK);
     }
 
-    ASSERT_EQ(zx_task_resume(thread, 0), ZX_OK);
+    ASSERT_EQ(zx_handle_close(token), ZX_OK);
     thrd_join(thread_c11, NULL);
     tu_handle_close(thread);
 
@@ -853,7 +864,7 @@ bool suspended_in_syscall_reg_access_worker(bool do_channel_call) {
     return true;
 }
 
-bool suspended_in_syscall_reg_access_test() {
+bool SuspendedInSyscallRegAccessTest() {
     BEGIN_TEST;
 
     EXPECT_TRUE(suspended_in_syscall_reg_access_worker(false));
@@ -861,7 +872,7 @@ bool suspended_in_syscall_reg_access_test() {
     END_TEST;
 }
 
-bool suspended_in_channel_call_reg_access_test() {
+bool SuspendedInChannelCallRegAccessTest() {
     BEGIN_TEST;
 
     EXPECT_TRUE(suspended_in_syscall_reg_access_worker(true));
@@ -874,14 +885,15 @@ struct suspend_in_exception_data {
     fbl::atomic<int> suspend_count;
     fbl::atomic<int> resume_count;
     zx_handle_t thread_handle;
+    zx_handle_t suspend_token;
     zx_koid_t process_id;
     zx_koid_t thread_id;
 };
 
 // N.B. This runs on the wait-inferior thread.
 
-bool suspended_in_exception_handler(zx_handle_t inferior, const zx_port_packet_t* packet,
-                                    void* handler_arg) {
+bool suspended_in_exception_handler(zx_handle_t inferior, zx_handle_t port,
+                                    const zx_port_packet_t* packet, void* handler_arg) {
     BEGIN_HELPER;
 
     suspend_in_exception_data* data = static_cast<suspend_in_exception_data*>(handler_arg);
@@ -904,7 +916,7 @@ bool suspended_in_exception_handler(zx_handle_t inferior, const zx_port_packet_t
         if (packet->signal.observed & ZX_THREAD_SUSPENDED) {
             ASSERT_EQ(pkt_tid, data->thread_id);
             atomic_fetch_add(&data->suspend_count, 1);
-            ASSERT_EQ(zx_task_resume(data->thread_handle, 0), ZX_OK);
+            ASSERT_EQ(zx_handle_close(data->suspend_token), ZX_OK);
             // At this point we should get ZX_THREAD_RUNNING, we'll
             // process it later.
         }
@@ -926,12 +938,12 @@ bool suspended_in_exception_handler(zx_handle_t inferior, const zx_port_packet_t
             ASSERT_EQ(pkt_tid, data->thread_id);
 
             // Verify that the fault is at the PC we expected.
-            if (!test_segv_pc(data->thread_handle))
+            if (!TestSegvPc(data->thread_handle))
                 return false;
 
             // Suspend the thread before fixing the segv to verify register
             // access works while the thread is in an exception and suspended.
-            ASSERT_EQ(zx_task_suspend(data->thread_handle), ZX_OK);
+            ASSERT_EQ(zx_task_suspend_token(data->thread_handle, &data->suspend_token), ZX_OK);
 
             // Waiting for the thread to suspend doesn't work here as the
             // thread stays in the exception until we pass ZX_RESUME_EXCEPTION.
@@ -968,12 +980,12 @@ bool suspended_in_exception_handler(zx_handle_t inferior, const zx_port_packet_t
     END_HELPER;
 }
 
-bool suspended_in_exception_reg_access_test() {
+bool SuspendedInExceptionRegAccessTest() {
     BEGIN_TEST;
 
     launchpad_t* lp;
     zx_handle_t inferior, channel;
-    if (!setup_inferior(test_inferior_child_name, &lp, &inferior, &channel))
+    if (!setup_inferior(kTestInferiorChildName, &lp, &inferior, &channel))
         return false;
 
     if (!start_inferior(lp))
@@ -1034,7 +1046,7 @@ bool suspended_in_exception_reg_access_test() {
 
 // This function is marked as no-inline to avoid duplicate label in case the
 // function call is being inlined.
-__NO_INLINE static bool test_prep_and_segv() {
+__NO_INLINE static bool TestPrepAndSegv() {
     uint8_t test_data[kTestMemorySize];
     for (unsigned i = 0; i < sizeof(test_data); ++i)
         test_data[i] = static_cast<uint8_t>(i);
@@ -1087,7 +1099,7 @@ __NO_INLINE static bool test_prep_and_segv() {
     // Note: This is the inferior process, it's not running under the test harness.
     for (unsigned i = 0; i < sizeof(test_data); ++i) {
         if (test_data[i] != i + kTestDataAdjust) {
-            unittest_printf("test_prep_and_segv: bad data on resumption, test_data[%u] = 0x%x\n", i,
+            unittest_printf("TestPrepAndSegv: bad data on resumption, test_data[%u] = 0x%x\n", i,
                             test_data[i]);
             return false;
         }
@@ -1125,7 +1137,7 @@ bool msg_loop(zx_handle_t channel) {
             break;
         case MSG_CRASH_AND_RECOVER_TEST:
             for (int i = 0; i < kNumSegvTries; ++i) {
-                if (!test_prep_and_segv())
+                if (!TestPrepAndSegv())
                     exit(21);
             }
             send_msg(channel, MSG_RECOVERED_FROM_CRASH);
@@ -1163,7 +1175,7 @@ bool msg_loop(zx_handle_t channel) {
 }
 
 void test_inferior() {
-    zx_handle_t channel = zx_get_startup_handle(PA_USER0);
+    zx_handle_t channel = zx_take_startup_handle(PA_USER0);
     unittest_printf("test_inferior: got handle %d\n", channel);
 
     if (!msg_loop(channel))
@@ -1217,7 +1229,7 @@ int __NO_INLINE test_segfault() {
 // to request a backtrace but not terminate the process.
 int __NO_INLINE test_swbreak() {
     unittest_printf("Invoking s/w breakpoint instruction\n");
-    crashlogger_request_backtrace();
+    zx_crashlogger_request_backtrace();
     unittest_printf("Resumed after s/w breakpoint instruction\n");
     return 0;
 }
@@ -1227,9 +1239,6 @@ void scan_argv(int argc, char** argv) {
         if (strncmp(argv[i], "v=", 2) == 0) {
             int verbosity = atoi(argv[i] + 2);
             unittest_set_verbosity_level(verbosity);
-        } else if (strncmp(argv[i], "ts=", 3) == 0) {
-            int scale = atoi(argv[i] + 3);
-            tu_set_timeout_scale(scale);
         }
     }
 }
@@ -1237,36 +1246,31 @@ void scan_argv(int argc, char** argv) {
 } // namespace
 
 BEGIN_TEST_CASE(debugger_tests)
-RUN_TEST(debugger_test)
-RUN_TEST(debugger_thread_list_test)
-RUN_TEST(property_process_debug_addr_test)
-RUN_TEST(write_text_segment)
-RUN_TEST(suspended_reg_access_test)
-RUN_TEST(suspended_in_syscall_reg_access_test)
-RUN_TEST(suspended_in_channel_call_reg_access_test)
-RUN_TEST(suspended_in_exception_reg_access_test)
+RUN_TEST(DebuggerTest)
+RUN_TEST(DebuggerThreadListTest)
+RUN_TEST(PropertyProcessDebugAddrTest)
+RUN_TEST(WriteTextSegment)
+RUN_TEST(SuspendedRegAccessTest)
+RUN_TEST(SuspendedInSyscallRegAccessTest)
+RUN_TEST(SuspendedInChannelCallRegAccessTest)
+RUN_TEST(SuspendedInExceptionRegAccessTest)
 END_TEST_CASE(debugger_tests)
 
 int main(int argc, char** argv) {
     program_path = argv[0];
     scan_argv(argc, argv);
 
-    if (argc >= 2 && strcmp(argv[1], test_inferior_child_name) == 0) {
+    if (argc >= 2 && strcmp(argv[1], kTestInferiorChildName) == 0) {
         test_inferior();
         return 0;
     }
-    if (argc >= 2 && strcmp(argv[1], test_segfault_child_name) == 0) {
+    if (argc >= 2 && strcmp(argv[1], kTestSegfaultChildName) == 0) {
         return test_segfault();
     }
-    if (argc >= 2 && strcmp(argv[1], test_swbreak_child_name) == 0) {
+    if (argc >= 2 && strcmp(argv[1], kTestSwbreakChildName) == 0) {
         return test_swbreak();
     }
 
-    tu_watchdog_start();
-
     bool success = unittest_run_all_tests(argc, argv);
-
-    tu_watchdog_cancel();
-
     return success ? 0 : -1;
 }

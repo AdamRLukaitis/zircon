@@ -18,6 +18,7 @@
 #include <arch/x86/mmu_mem_types.h>
 #include <kernel/mp.h>
 #include <vm/arch_vm_aspace.h>
+#include <vm/physmap.h>
 #include <vm/pmm.h>
 #include <vm/vm.h>
 #include <zircon/types.h>
@@ -47,10 +48,20 @@ volatile pt_entry_t linear_map_pdp[(64ULL * GB) / (2 * MB)] __ALIGNED(PAGE_SIZE)
 /* which of the above variables is the top level page table */
 #define KERNEL_PT pml4
 
-/* kernel base top level page table in physical space */
-static const paddr_t kernel_pt_phys = (vaddr_t)KERNEL_PT - KERNEL_BASE + KERNEL_LOAD_OFFSET;
+// Static relocated base to prepare for KASLR. Used at early boot and by gdb
+// script to know the target relocated address.
+// TODO(thgarnie): Move to a dynamicly generated base address
+#if DISABLE_KASLR
+uint64_t kernel_relocated_base = KERNEL_BASE - KERNEL_LOAD_OFFSET;
+#else
+uint64_t kernel_relocated_base = 0xffffffff00000000;
+#endif
 
-/* valid EPT MMU flags */
+/* kernel base top level page table in physical space */
+static const paddr_t kernel_pt_phys =
+    (vaddr_t)KERNEL_PT - (vaddr_t)__code_start + KERNEL_LOAD_OFFSET;
+
+// Valid EPT MMU flags.
 static const uint kValidEptFlags =
     ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE | ARCH_MMU_FLAG_PERM_EXECUTE;
 
@@ -93,7 +104,7 @@ static bool x86_mmu_check_vaddr(vaddr_t vaddr) {
 /**
  * @brief  check if the physical address is valid and aligned
  */
-static bool x86_mmu_check_paddr(paddr_t paddr) {
+bool x86_mmu_check_paddr(paddr_t paddr) {
     uint64_t max_paddr;
 
     /* Check to see if the address is PAGE aligned */
@@ -228,18 +239,18 @@ X86PageTableBase::PtFlags X86PageTableMmu::terminal_flags(PageTableLevel level,
                                                           uint flags) {
     X86PageTableBase::PtFlags terminal_flags = 0;
 
-    if (flags & ARCH_MMU_FLAG_PERM_WRITE)
+    if (flags & ARCH_MMU_FLAG_PERM_WRITE) {
         terminal_flags |= X86_MMU_PG_RW;
-
-    if (flags & ARCH_MMU_FLAG_PERM_USER)
+    }
+    if (flags & ARCH_MMU_FLAG_PERM_USER) {
         terminal_flags |= X86_MMU_PG_U;
-
+    }
     if (use_global_mappings_) {
         terminal_flags |= X86_MMU_PG_G;
     }
-
-    if (!(flags & ARCH_MMU_FLAG_PERM_EXECUTE))
+    if (!(flags & ARCH_MMU_FLAG_PERM_EXECUTE)) {
         terminal_flags |= X86_MMU_PG_NX;
+    }
 
     if (level > 0) {
         switch (flags & ARCH_MMU_FLAG_CACHE_MASK) {
@@ -302,14 +313,15 @@ void X86PageTableMmu::TlbInvalidate(PendingTlbInvalidation* pending) {
 uint X86PageTableMmu::pt_flags_to_mmu_flags(PtFlags flags, PageTableLevel level) {
     uint mmu_flags = ARCH_MMU_FLAG_PERM_READ;
 
-    if (flags & X86_MMU_PG_RW)
+    if (flags & X86_MMU_PG_RW) {
         mmu_flags |= ARCH_MMU_FLAG_PERM_WRITE;
-
-    if (flags & X86_MMU_PG_U)
+    }
+    if (flags & X86_MMU_PG_U) {
         mmu_flags |= ARCH_MMU_FLAG_PERM_USER;
-
-    if (!(flags & X86_MMU_PG_NX))
+    }
+    if (!(flags & X86_MMU_PG_NX)) {
         mmu_flags |= ARCH_MMU_FLAG_PERM_EXECUTE;
+    }
 
     if (level > 0) {
         switch (flags & X86_MMU_LARGE_PAT_MASK) {
@@ -381,18 +393,32 @@ X86PageTableBase::PtFlags X86PageTableEpt::intermediate_flags() {
 
 X86PageTableBase::PtFlags X86PageTableEpt::terminal_flags(PageTableLevel level,
                                                           uint flags) {
-    DEBUG_ASSERT((flags & ARCH_MMU_FLAG_CACHE_MASK) == ARCH_MMU_FLAG_CACHED);
-    // Only the write-back memory type is supported.
-    X86PageTableBase::PtFlags terminal_flags = X86_EPT_WB;
+    X86PageTableBase::PtFlags terminal_flags = 0;
 
-    if (flags & ARCH_MMU_FLAG_PERM_READ)
+    if (flags & ARCH_MMU_FLAG_PERM_READ) {
         terminal_flags |= X86_EPT_R;
-
-    if (flags & ARCH_MMU_FLAG_PERM_WRITE)
+    }
+    if (flags & ARCH_MMU_FLAG_PERM_WRITE) {
         terminal_flags |= X86_EPT_W;
-
-    if (flags & ARCH_MMU_FLAG_PERM_EXECUTE)
+    }
+    if (flags & ARCH_MMU_FLAG_PERM_EXECUTE) {
         terminal_flags |= X86_EPT_X;
+    }
+
+    switch (flags & ARCH_MMU_FLAG_CACHE_MASK) {
+    case ARCH_MMU_FLAG_CACHED:
+        terminal_flags |= X86_EPT_WB;
+        break;
+    case ARCH_MMU_FLAG_UNCACHED_DEVICE:
+    case ARCH_MMU_FLAG_UNCACHED:
+        terminal_flags |= X86_EPT_UC;
+        break;
+    case ARCH_MMU_FLAG_WRITE_COMBINING:
+        terminal_flags |= X86_EPT_WC;
+        break;
+    default:
+        PANIC_UNIMPLEMENTED;
+    }
 
     return terminal_flags;
 }
@@ -411,17 +437,31 @@ void X86PageTableEpt::TlbInvalidate(PendingTlbInvalidation* pending) {
 }
 
 uint X86PageTableEpt::pt_flags_to_mmu_flags(PtFlags flags, PageTableLevel level) {
-    // Only the write-back memory type is supported.
-    uint mmu_flags = ARCH_MMU_FLAG_CACHED;
+    uint mmu_flags = 0;
 
-    if (flags & X86_EPT_R)
+    if (flags & X86_EPT_R) {
         mmu_flags |= ARCH_MMU_FLAG_PERM_READ;
-
-    if (flags & X86_EPT_W)
+    }
+    if (flags & X86_EPT_W) {
         mmu_flags |= ARCH_MMU_FLAG_PERM_WRITE;
-
-    if (flags & X86_EPT_X)
+    }
+    if (flags & X86_EPT_X) {
         mmu_flags |= ARCH_MMU_FLAG_PERM_EXECUTE;
+    }
+
+    switch (flags & X86_EPT_MEMORY_TYPE_MASK) {
+    case X86_EPT_WB:
+        mmu_flags |= ARCH_MMU_FLAG_CACHED;
+        break;
+    case X86_EPT_UC:
+        mmu_flags |= ARCH_MMU_FLAG_UNCACHED;
+        break;
+    case X86_EPT_WC:
+        mmu_flags |= ARCH_MMU_FLAG_WRITE_COMBINING;
+        break;
+    default:
+        PANIC_UNIMPLEMENTED;
+    }
 
     return mmu_flags;
 }
@@ -467,13 +507,14 @@ X86PageTableBase::~X86PageTableBase() {
 // to write to |pages_| since this is part of object construction.
 zx_status_t X86PageTableBase::Init(void* ctx) TA_NO_THREAD_SAFETY_ANALYSIS {
     /* allocate a top level page table for the new address space */
+    vm_page* p;
     paddr_t pa;
-    vm_page_t* p;
-    virt_ = (pt_entry_t*)pmm_alloc_kpage(&pa, &p);
-    if (!virt_) {
+    zx_status_t status = pmm_alloc_page(0, &p, &pa);
+    if (status != ZX_OK) {
         TRACEF("error allocating top level page directory\n");
         return ZX_ERR_NO_MEMORY;
     }
+    virt_ = reinterpret_cast<pt_entry_t*>(paddr_to_physmap(pa));
     phys_ = pa;
     p->state = VM_PAGE_STATE_MMU;
 

@@ -4,7 +4,7 @@
 
 #include <gpt/gpt.h>
 #include <zircon/types.h>
-#include <fdio/io.h>
+#include <lib/fdio/io.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -14,11 +14,16 @@
 #include <unistd.h>
 #include <limits.h>
 
+#include <lib/fdio/unsafe.h>
 #include <zircon/device/block.h>
+#include <zircon/skipblock/c/fidl.h>
 #include <zircon/device/device.h>
+#include <zircon/process.h>
+#include <zircon/syscalls.h>
 #include <pretty/hexdump.h>
 
 #define DEV_BLOCK "/dev/class/block"
+#define DEV_SKIP_BLOCK "/dev/class/skip-block"
 
 static char* size_to_cstring(char* str, size_t maxlen, uint64_t size) {
     const char* unit;
@@ -43,36 +48,6 @@ static char* size_to_cstring(char* str, size_t maxlen, uint64_t size) {
     return str;
 }
 
-static const char* guid_to_type(char* guid) {
-    if (!strcmp("FE3A2A5D-4F32-41A7-B725-ACCC3285A309", guid)) {
-        return "cros kernel";
-    } else if (!strcmp("3CB8E202-3B7E-47DD-8A3C-7FF2A13CFCEC", guid)) {
-        return "cros rootfs";
-    } else if (!strcmp("2E0A753D-9E48-43B0-8337-B15192CB1B5E", guid)) {
-        return "cros reserved";
-    } else if (!strcmp("CAB6E88E-ABF3-4102-A07A-D4BB9BE3C1D3", guid)) {
-        return "cros firmware";
-    } else if (!strcmp("C12A7328-F81F-11D2-BA4B-00A0C93EC93B", guid)) {
-        return "efi system";
-    } else if (!strcmp("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7", guid)) {
-        return "data";
-    } else if (!strcmp("21686148-6449-6E6F-744E-656564454649", guid)) {
-        return "bios";
-    } else if (!strcmp(GUID_SYSTEM_STRING, guid)) {
-        return "fuchsia-system";
-    } else if (!strcmp(GUID_DATA_STRING, guid)) {
-        return "fuchsia-data";
-    } else if (!strcmp(GUID_INSTALL_STRING, guid)) {
-        return "fuchsia-install";
-    } else if (!strcmp(GUID_BLOB_STRING, guid)) {
-        return "fuchsia-blob";
-    } else if (!strcmp(GUID_FVM_STRING, guid)) {
-        return "fuchsia-fvm";
-    } else {
-        return "unknown";
-    }
-}
-
 typedef struct blkinfo {
     char path[128];
     char topo[1024];
@@ -85,13 +60,13 @@ static int cmd_list_blk(void) {
     struct dirent* de;
     DIR* dir = opendir(DEV_BLOCK);
     if (!dir) {
-        printf("Error opening %s\n", DEV_BLOCK);
+        fprintf(stderr, "Error opening %s\n", DEV_BLOCK);
         return -1;
     }
     blkinfo_t info;
     const char* type;
     int fd;
-    printf("%-3s %-4s %-14s %-20s %-6s %s\n",
+    printf("%-3s %-4s %-16s %-20s %-6s %s\n",
            "ID", "SIZE", "TYPE", "LABEL", "FLAGS", "DEVICE");
     while ((de = readdir(dir)) != NULL) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) {
@@ -102,7 +77,7 @@ static int cmd_list_blk(void) {
         snprintf(info.path, sizeof(info.path), "%s/%s", DEV_BLOCK, de->d_name);
         fd = open(info.path, O_RDONLY);
         if (fd < 0) {
-            printf("Error opening %s\n", info.path);
+            fprintf(stderr, "Error opening %s\n", info.path);
             goto devdone;
         }
         if (ioctl_device_get_topo_path(fd, info.topo, sizeof(info.topo)) < 0) {
@@ -117,7 +92,7 @@ static int cmd_list_blk(void) {
         uint8_t guid[GPT_GUID_LEN];
         if (ioctl_block_get_type_guid(fd, guid, sizeof(guid)) >= 0) {
             uint8_to_guid_string(info.guid, guid);
-            type = guid_to_type(info.guid);
+            type = gpt_guid_to_type(info.guid);
         }
         ioctl_block_get_name(fd, info.label, sizeof(info.label));
 
@@ -129,9 +104,12 @@ static int cmd_list_blk(void) {
         if (block_info.flags & BLOCK_FLAG_REMOVABLE) {
             strlcat(flags, "RE ", sizeof(flags));
         }
-devdone:
+        if (block_info.flags & BLOCK_FLAG_BOOTPART) {
+            strlcat(flags, "BP ", sizeof(flags));
+        }
         close(fd);
-        printf("%-3s %4s %-14s %-20s %-6s %s\n",
+devdone:
+        printf("%-3s %4s %-16s %-20s %-6s %s\n",
                de->d_name, info.sizestr, type ? type : "",
                info.label, flags, info.topo);
     }
@@ -139,10 +117,124 @@ devdone:
     return 0;
 }
 
+static int cmd_list_skip_blk(void) {
+    struct dirent* de;
+    DIR* dir = opendir(DEV_SKIP_BLOCK);
+    if (!dir) {
+        fprintf(stderr, "Error opening %s\n", DEV_SKIP_BLOCK);
+        return -1;
+    }
+    blkinfo_t info;
+    const char* type;
+    int fd;
+    while ((de = readdir(dir)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) {
+            continue;
+        }
+        memset(&info, 0, sizeof(blkinfo_t));
+        type = NULL;
+        snprintf(info.path, sizeof(info.path), "%s/%s", DEV_SKIP_BLOCK, de->d_name);
+        fd = open(info.path, O_RDONLY);
+        if (fd < 0) {
+            fprintf(stderr, "Error opening %s\n", info.path);
+            goto devdone;
+        }
+        if (ioctl_device_get_topo_path(fd, info.topo, sizeof(info.topo)) < 0) {
+            strcpy(info.topo, "UNKNOWN");
+        }
+
+        fdio_t* io = fdio_unsafe_fd_to_io(fd);
+        zx_handle_t channel = fdio_unsafe_borrow_channel(io);
+
+        zx_status_t status;
+        zircon_skipblock_PartitionInfo partition_info;
+        zircon_skipblock_SkipBlockGetPartitionInfo(channel, &status, &partition_info);
+        if (status == ZX_OK) {
+            size_to_cstring(info.sizestr, sizeof(info.sizestr),
+                            partition_info.block_size_bytes * partition_info.partition_block_count);
+            uint8_to_guid_string(info.guid, partition_info.partition_guid);
+            type = gpt_guid_to_type(info.guid);
+        }
+
+        close(fd);
+devdone:
+        printf("%-3s %4s %-16s %-20s %-6s %s\n",
+               de->d_name, info.sizestr, type ? type : "", "", "", info.topo);
+    }
+    closedir(dir);
+    return 0;
+}
+
+static int try_read_skip_blk(int fd, off_t offset, size_t count) {
+    fdio_t* io = fdio_unsafe_fd_to_io(fd);
+    zx_handle_t channel = fdio_unsafe_borrow_channel(io);
+
+    // check that count and offset are aligned to block size
+    uint64_t blksize;
+    zx_status_t status;
+    zircon_skipblock_PartitionInfo info;
+    zircon_skipblock_SkipBlockGetPartitionInfo(channel, &status, &info);
+    if (status != ZX_OK) {
+        return status;
+    }
+    blksize = info.block_size_bytes;
+    if (count % blksize) {
+        fprintf(stderr, "Bytes read must be a multiple of blksize=%" PRIu64 "\n", blksize);
+        return -1;
+    }
+    if (offset % blksize) {
+        fprintf(stderr, "Offset must be a multiple of blksize=%" PRIu64 "\n", blksize);
+        return -1;
+    }
+
+    // allocate and map a buffer to read into
+    zx_handle_t vmo, dup;
+    void* buf;
+    if (zx_vmo_create(count, 0, &vmo) != ZX_OK) {
+        fprintf(stderr, "No memory\n");
+        return -1;
+    }
+    int rc = 0;
+    if (zx_vmar_map(zx_vmar_root_self(), ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
+                    0, vmo, 0, count, (uintptr_t*) &buf) != ZX_OK) {
+        fprintf(stderr, "Failed to map vmo\n");
+        rc = -1;
+        goto out;
+    }
+    if (zx_handle_duplicate(vmo, ZX_RIGHT_SAME_RIGHTS, &dup) != ZX_OK) {
+        fprintf(stderr, "Cannot duplicate handle\n");
+        rc = -1;
+        goto out2;
+    }
+
+    // read the data
+    zircon_skipblock_ReadWriteOperation op = {
+        .vmo = dup,
+        .vmo_offset = 0,
+        .block = offset / blksize,
+        .block_count = count / blksize,
+    };
+
+    zircon_skipblock_SkipBlockRead(channel, &op, &status);
+    if (status != ZX_OK) {
+        fprintf(stderr, "Error %d in SkipBlockRead()\n", status);
+        rc = status;
+        goto out2;
+    }
+
+    hexdump8_ex(buf, count, offset);
+
+out2:
+    zx_vmar_unmap(zx_vmar_root_self(), (uintptr_t)buf, count);
+out:
+    zx_handle_close(vmo);
+    return rc;
+}
+
 static int cmd_read_blk(const char* dev, off_t offset, size_t count) {
     int fd = open(dev, O_RDONLY);
     if (fd < 0) {
-        printf("Error opening %s\n", dev);
+        fprintf(stderr, "Error opening %s\n", dev);
         return fd;
     }
 
@@ -151,18 +243,19 @@ static int cmd_read_blk(const char* dev, off_t offset, size_t count) {
     block_info_t info;
     ssize_t rc = ioctl_block_get_info(fd, &info);
     if (rc < 0) {
-        printf("Error getting block size for %s\n", dev);
-        close(fd);
+        if (try_read_skip_blk(fd, offset, count) < 0) {
+            fprintf(stderr, "Error getting block size for %s\n", dev);
+        }
         goto out;
     }
     blksize = info.block_size;
     if (count % blksize) {
-        printf("Bytes read must be a multiple of blksize=%" PRIu64 "\n", blksize);
+        fprintf(stderr, "Bytes read must be a multiple of blksize=%" PRIu64 "\n", blksize);
         rc = -1;
         goto out;
     }
     if (offset % blksize) {
-        printf("Offset must be a multiple of blksize=%" PRIu64 "\n", blksize);
+        fprintf(stderr, "Offset must be a multiple of blksize=%" PRIu64 "\n", blksize);
         rc = -1;
         goto out;
     }
@@ -172,13 +265,13 @@ static int cmd_read_blk(const char* dev, off_t offset, size_t count) {
     if (offset) {
         rc = lseek(fd, offset, SEEK_SET);
         if (rc < 0) {
-            printf("Error %zd seeking to offset %jd\n", rc, (intmax_t)offset);
+            fprintf(stderr, "Error %zd seeking to offset %jd\n", rc, (intmax_t)offset);
             goto out2;
         }
     }
     ssize_t c = read(fd, buf, count);
     if (c < 0) {
-        printf("Error %zd in read()\n", c);
+        fprintf(stderr,"Error %zd in read()\n", c);
         rc = c;
         goto out2;
     }
@@ -195,22 +288,24 @@ out:
 static int cmd_stats(const char* dev, bool clear) {
     int fd = open(dev, O_RDONLY);
     if (fd < 0) {
-        printf("Error opening %s\n", dev);
+        fprintf(stderr, "Error opening %s\n", dev);
         return fd;
     }
 
     block_stats_t stats;
     ssize_t rc = ioctl_block_get_stats(fd, &clear, &stats);
     if (rc < 0) {
-        printf("Error getting stats for %s\n", dev);
+        fprintf(stderr, "Error getting stats for %s\n", dev);
         close(fd);
         goto out;
     }
 
-    printf("max concurrent ops:        %zu\n", stats.max_concur);
-    printf("max pending block ops:     %zu\n", stats.max_pending);
-    printf("total submitted block ops: %zu\n", stats.total_ops);
-    printf("total submitted blocks:    %zu\n", stats.total_blocks);
+    printf("total submitted block ops:      %zu\n", stats.total_ops);
+    printf("total submitted blocks:         %zu\n", stats.total_blocks);
+    printf("total submitted read ops:       %zu\n", stats.total_reads);
+    printf("total submitted blocks read:    %zu\n", stats.total_blocks_read);
+    printf("total submitted write ops:      %zu\n", stats.total_writes);
+    printf("total submitted blocks written: %zu\n", stats.total_blocks_written);
 out:
     close(fd);
     return rc;
@@ -230,17 +325,17 @@ int main(int argc, const char** argv) {
             if (strcmp("true", argv[3]) && strcmp("false", argv[3])) goto usage;
             rc = cmd_stats(argv[2], !strcmp("true", argv[3]) ? true : false);
         } else {
-            printf("Unrecognized command %s!\n", cmd);
+            fprintf(stderr, "Unrecognized command %s!\n", cmd);
             goto usage;
         }
     } else {
-        rc = cmd_list_blk();
+        rc = cmd_list_blk() || cmd_list_skip_blk();
     }
     return rc;
 usage:
-    printf("Usage:\n");
-    printf("%s\n", argv[0]);
-    printf("%s read <blkdev> <offset> <count>\n", argv[0]);
-    printf("%s stats <blkdev> <clear=true|false>\n", argv[0]);
+    fprintf(stderr, "Usage:\n");
+    fprintf(stderr, "%s\n", argv[0]);
+    fprintf(stderr, "%s read <blkdev> <offset> <count>\n", argv[0]);
+    fprintf(stderr, "%s stats <blkdev> <clear=true|false>\n", argv[0]);
     return 0;
 }

@@ -3,7 +3,8 @@
 // found in the LICENSE file.
 
 #include <lib/async-loop/cpp/loop.h>
-#include <fdio/util.h>
+#include <lib/fdio/util.h>
+#include <fs/synchronous-vfs.h>
 #include <fs/pseudo-dir.h>
 #include <fs/service.h>
 
@@ -44,7 +45,7 @@ bool test_service() {
     zx_handle_t hc1 = c1.get();
 
     // serve, the connector will return success the first time
-    fs::Vfs vfs;
+    fs::SynchronousVfs vfs;
     EXPECT_EQ(ZX_OK, svc->Serve(&vfs, fbl::move(c1), ZX_FS_RIGHT_READABLE));
     EXPECT_EQ(hc1, bound_channel.get());
 
@@ -56,7 +57,7 @@ bool test_service() {
     END_TEST;
 }
 
-bool test_serve_directory() {
+bool TestServeDirectory() {
     BEGIN_TEST;
 
     zx::channel client, server;
@@ -74,8 +75,8 @@ bool test_serve_directory() {
     client.reset();
 
     // serve
-    async::Loop loop;
-    fs::Vfs vfs(loop.async());
+     async::Loop loop(&kAsyncLoopConfigNoAttachToThread);
+    fs::SynchronousVfs vfs(loop.dispatcher());
 
     auto directory = fbl::AdoptRef<fs::PseudoDir>(new fs::PseudoDir());
     auto vnode = fbl::AdoptRef<fs::Service>(new fs::Service(
@@ -95,5 +96,5 @@ bool test_serve_directory() {
 
 BEGIN_TEST_CASE(service_tests)
 RUN_TEST(test_service)
-RUN_TEST(test_serve_directory)
+RUN_TEST(TestServeDirectory)
 END_TEST_CASE(service_tests)

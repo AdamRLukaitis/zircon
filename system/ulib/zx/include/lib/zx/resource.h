@@ -26,10 +26,15 @@ public:
         return *this;
     }
 
-    static zx_status_t create(const resource& parent, uint32_t kind, uint64_t low,
-                              uint64_t high, resource* result);
+    static zx_status_t create(const resource& parent,
+                              uint32_t options,
+                              uint64_t base,
+                              size_t len,
+                              const char* name,
+                              size_t namelen,
+                              resource* result);
 };
 
-using unowned_resource = const unowned<resource>;
+using unowned_resource = unowned<resource>;
 
 } // namespace zx

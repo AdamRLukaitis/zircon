@@ -11,9 +11,12 @@
 
 #include <fbl/alloc_checker.h>
 #include <fbl/unique_ptr.h>
-#include <openssl/sha.h>
 #include <zircon/assert.h>
 #include <zircon/errors.h>
+
+// See note in //zircon/third_party/ulib/uboringssl/rules.mk
+#define BORINGSSL_NO_CXX
+#include <openssl/sha.h>
 
 namespace digest {
 
@@ -24,14 +27,28 @@ struct Digest::Context {
     SHA256_CTX impl;
 };
 
-Digest::Digest() : ctx_{nullptr}, bytes_{0}, ref_count_(0) {}
+Digest::Digest() : bytes_{0} {}
 
-Digest::Digest(const uint8_t* other) : ctx_{nullptr}, bytes_{0}, ref_count_(0) {
+Digest::Digest(const uint8_t* other) : bytes_{0} {
     *this = other;
 }
 
 Digest::~Digest() {
     ZX_DEBUG_ASSERT(ref_count_ == 0);
+}
+
+Digest::Digest(Digest&& o) {
+    ZX_DEBUG_ASSERT(o.ref_count_ == 0);
+    ctx_ = fbl::move(o.ctx_);
+    memcpy(bytes_, o.bytes_, kLength);
+    memset(o.bytes_, 0, kLength);
+}
+
+Digest& Digest::operator=(Digest&& o) {
+    ZX_DEBUG_ASSERT(o.ref_count_ == 0);
+    ZX_DEBUG_ASSERT(ref_count_ == 0);
+    memcpy(bytes_, o.bytes_, kLength);
+    return *this;
 }
 
 Digest& Digest::operator=(const uint8_t* rhs) {
@@ -54,11 +71,13 @@ zx_status_t Digest::Init() {
 void Digest::Update(const void* buf, size_t len) {
     ZX_DEBUG_ASSERT(ref_count_ == 0);
     ZX_DEBUG_ASSERT(len <= INT_MAX);
+    ZX_DEBUG_ASSERT(ctx_ != nullptr);
     SHA256_Update(&ctx_->impl, buf, len);
 }
 
 const uint8_t* Digest::Final() {
     ZX_DEBUG_ASSERT(ref_count_ == 0);
+    ZX_DEBUG_ASSERT(ctx_ != nullptr);
     SHA256_Final(bytes_, &ctx_->impl);
     return bytes_;
 }

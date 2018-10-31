@@ -15,6 +15,7 @@
 
 #include <zircon/compiler.h>
 #include <zircon/listnode.h>
+#include <lib/zircon-internal/xorshiftrand.h>
 #include <zircon/types.h>
 
 #include "filesystems.h"
@@ -311,7 +312,13 @@ static bool test_work_concurrently(void) {
     END_TEST;
 }
 
-RUN_FOR_ALL_FILESYSTEMS(rw_workers_test,
+const test_disk_t disk = {
+    .block_count = 3 * (1LLU << 16),
+    .block_size = 1LLU << 9,
+    .slice_size = 1LLU << 23,
+};
+
+RUN_FOR_ALL_FILESYSTEMS_SIZE(rw_workers_test, disk,
     RUN_TEST_MEDIUM(test_work_single_thread)
     RUN_TEST_LARGE(test_work_concurrently)
 )

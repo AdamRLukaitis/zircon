@@ -11,7 +11,7 @@ vcpu_read_state - read the state of a VCPU
 #include <zircon/syscalls/hypervisor.h>
 
 zx_status_t zx_vcpu_read_state(zx_handle_t vcpu, uint32_t kind, void* buffer,
-                               uint32_t len);
+                               size_t len);
 ```
 
 ## DESCRIPTION
@@ -21,6 +21,10 @@ zx_status_t zx_vcpu_read_state(zx_handle_t vcpu, uint32_t kind, void* buffer,
 paused.
 
 *kind* must be *ZX_VCPU_STATE*.
+
+## RIGHTS
+
+TODO(ZX-2399)
 
 ## RETURN VALUE
 

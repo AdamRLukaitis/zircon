@@ -3,15 +3,17 @@
 // found in the LICENSE file.
 
 #include <ddk/binding.h>
+#include <ddk/debug.h>
 #include <ddk/device.h>
 #include <ddk/driver.h>
 #include <ddk/io-buffer.h>
+#include <ddk/mmio-buffer.h>
 #include <ddk/protocol/ethernet.h>
 #include <ddk/protocol/pci.h>
+#include <ddk/protocol/pci-lib.h>
 #include <hw/pci.h>
 
 #include <zircon/assert.h>
-#include <zircon/device/ethernet.h>
 #include <zircon/syscalls.h>
 #include <zircon/types.h>
 #include <stdio.h>
@@ -34,7 +36,7 @@ typedef struct ethernet_device {
     eth_state state;
     zx_device_t* zxdev;
     pci_protocol_t pci;
-    zx_handle_t ioh;
+    mmio_buffer_t mmio;
     zx_handle_t irqh;
     thrd_t thread;
     zx_handle_t btih;
@@ -50,12 +52,11 @@ static int irq_thread(void* arg) {
     ethernet_device_t* edev = arg;
     for (;;) {
         zx_status_t r;
-        uint64_t slots;
-        if ((r = zx_interrupt_wait(edev->irqh, &slots)) < 0) {
+        r = zx_interrupt_wait(edev->irqh, NULL);
+        if (r != ZX_OK) {
             printf("eth: irq wait failed? %d\n", r);
             break;
         }
-
         mtx_lock(&edev->lock);
         unsigned irq = eth_handle_irq(&edev->eth);
         if (irq & ETH_IRQ_RX) {
@@ -72,10 +73,11 @@ static int irq_thread(void* arg) {
         if (irq & ETH_IRQ_LSC) {
             bool was_online = edev->online;
             bool online = eth_status_online(&edev->eth);
+            zxlogf(TRACE, "intel-eth: ETH_IRQ_LSC fired: %d->%d\n", was_online, online);
             if (online != was_online) {
                 edev->online = online;
                 if (edev->ifc) {
-                    edev->ifc->status(edev->cookie, online ? ETH_STATUS_ONLINE : 0);
+                    edev->ifc->status(edev->cookie, online ? ETHMAC_STATUS_ONLINE : 0);
                 }
             }
         }
@@ -116,7 +118,7 @@ static zx_status_t eth_start(void* ctx, ethmac_ifc_t* ifc, void* cookie) {
     } else {
         edev->ifc = ifc;
         edev->cookie = cookie;
-        edev->ifc->status(edev->cookie, edev->online ? ETH_STATUS_ONLINE : 0);
+        edev->ifc->status(edev->cookie, edev->online ? ETHMAC_STATUS_ONLINE : 0);
     }
     mtx_unlock(&edev->lock);
 
@@ -209,10 +211,10 @@ static void eth_release(void* ctx) {
     pci_enable_bus_master(&edev->pci, false);
 
     io_buffer_release(&edev->buffer);
+    mmio_buffer_release(&edev->mmio);
 
     zx_handle_close(edev->btih);
     zx_handle_close(edev->irqh);
-    zx_handle_close(edev->ioh);
     free(edev);
 }
 
@@ -261,16 +263,19 @@ static zx_status_t eth_bind(void* ctx, zx_device_t* dev) {
     }
 
     // map iomem
-    uint64_t sz;
-    zx_handle_t h;
-    void* io;
-    r = pci_map_bar(&edev->pci, 0u, ZX_CACHE_POLICY_UNCACHED_DEVICE, &io, &sz, &h);
+    r = pci_map_bar_buffer(&edev->pci, 0u, ZX_CACHE_POLICY_UNCACHED_DEVICE, &edev->mmio);
     if (r != ZX_OK) {
-        printf("eth: cannot map io %d\n", h);
+        printf("eth: cannot map io %d\n", edev->mmio.vmo);
         goto fail;
     }
-    edev->eth.iobase = (uintptr_t)io;
-    edev->ioh = h;
+    edev->eth.iobase = (uintptr_t)edev->mmio.vaddr;
+
+    zx_pcie_device_info_t pci_info;
+    status = pci_get_device_info(&edev->pci, &pci_info);
+    if (status != ZX_OK) {
+        goto fail;
+    }
+    edev->eth.pci_did = pci_info.device_id;
 
     if ((r = pci_enable_bus_master(&edev->pci, true)) < 0) {
         printf("eth: cannot enable bus master %d\n", r);
@@ -293,6 +298,7 @@ static zx_status_t eth_bind(void* ctx, zx_device_t* dev) {
 
     eth_setup_buffers(&edev->eth, io_buffer_virt(&edev->buffer), io_buffer_phys(&edev->buffer));
     eth_init_hw(&edev->eth);
+    edev->online = eth_status_online(&edev->eth);
 
     device_add_args_t args = {
         .version = DEVICE_ADD_ARGS_VERSION,
@@ -319,10 +325,10 @@ fail:
     if (edev->btih) {
         zx_handle_close(edev->btih);
     }
-    if (edev->ioh) {
+    if (edev->mmio.vmo) {
         pci_enable_bus_master(&edev->pci, false);
         zx_handle_close(edev->irqh);
-        zx_handle_close(edev->ioh);
+        mmio_buffer_release(&edev->mmio);
     }
     free(edev);
     return ZX_ERR_NOT_SUPPORTED;
@@ -334,16 +340,7 @@ static zx_driver_ops_t intel_ethernet_driver_ops = {
 };
 
 // clang-format off
-ZIRCON_DRIVER_BEGIN(intel_ethernet, intel_ethernet_driver_ops, "zircon", "0.1", 11)
+ZIRCON_DRIVER_BEGIN(intel_ethernet, intel_ethernet_driver_ops, "zircon", "0.1", 2)
     BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_PCI),
     BI_ABORT_IF(NE, BIND_PCI_VID, 0x8086),
-    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x100E), // Qemu
-    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x15A3), // Broadwell
-    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x1570), // Skylake
-    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x1533), // I210 standalone
-    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x1539), // I211-AT
-    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x156f), // I219-LM (Dawson Canyon NUC)
-    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x15b7), // Skull Canyon NUC
-    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x15b8), // I219-V
-    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x15d8), // Kaby Lake NUC
 ZIRCON_DRIVER_END(intel_ethernet)

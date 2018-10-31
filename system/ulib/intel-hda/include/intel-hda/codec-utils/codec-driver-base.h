@@ -25,6 +25,7 @@ class IntelHDAStreamBase;
 class IntelHDACodecDriverBase : public fbl::RefCounted<IntelHDACodecDriverBase> {
 public:
     virtual void Shutdown();
+    virtual zx_status_t Suspend(uint32_t flags);
 
     // Properties
     zx_device_t* codec_device() const { return codec_device_; }
@@ -110,7 +111,7 @@ private:
 
     static zx_protocol_device_t CODEC_DEVICE_THUNKS;
     zx_device_t* codec_device_ = nullptr;
-    zx_time_t    create_time_  = zx_clock_get(ZX_CLOCK_MONOTONIC);
+    zx_time_t    create_time_  = zx_clock_get_monotonic();
 
     fbl::Mutex device_channel_lock_;
     fbl::RefPtr<dispatcher::Channel> device_channel_ __TA_GUARDED(device_channel_lock_);

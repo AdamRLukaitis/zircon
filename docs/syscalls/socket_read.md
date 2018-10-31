@@ -10,19 +10,24 @@ socket_read - read data from a socket
 #include <zircon/syscalls.h>
 
 zx_status_t zx_socket_read(zx_handle_t handle, uint32_t options,
-                           void* buffer, size_t size,
+                           void* buffer, size_t buffer_size,
                            size_t* actual) {
 ```
 
 ## DESCRIPTION
 
-**socket_read**() attempts to read *size* bytes into *buffer*. If
+**socket_read**() attempts to read *buffer_size* bytes into *buffer*. If
 successful, the number of bytes actually read are return via
 *actual*.
 
-If a NULL *buffer* and 0 *size* are passed in, then this syscall
-instead requests that the number of outstanding bytes to be returned
-via *actual*.
+If a NULL *buffer* and 0 *buffer_size* are passed in, then this syscall
+instead returns the number of outstanding bytes via *actual*.
+If the socket was created with **ZX_SOCKET_DATAGRAM**, this is the
+number of bytes in the first datagram.
+If the socket was created with **ZX_SOCKET_STREAM**, this is the
+total number of bytes in the stream.
+If no bytes are available, this syscall will still return **ZX_OK**,
+rather than **ZX_ERR_SHOULD_WAIT**.
 
 If a NULL *actual* is passed in, it will be ignored.
 
@@ -34,6 +39,10 @@ truncated, and any remaining bytes in the datagram will be discarded.
 If *options* is set to **ZX_SOCKET_CONTROL**, then **socket_read**()
 attempts to read from the socket control plane.
 
+## RIGHTS
+
+TODO(ZX-2399)
+
 ## RETURN VALUE
 
 **socket_read**() returns **ZX_OK** on success, and writes into
@@ -43,8 +52,9 @@ attempts to read from the socket control plane.
 
 **ZX_ERR_BAD_HANDLE**  *handle* is not a valid handle.
 
-**ZX_ERR_BAD_STATE** *options* includes **ZX_SOCKET_CONTROL** and the
-socket was not created with **ZX_SOCKET_HAS_CONTROL**.
+**ZX_ERR_BAD_STATE** Either (a) *options* includes **ZX_SOCKET_CONTROL** and the
+socket was not created with **ZX_SOCKET_HAS_CONTROL**, or (b) reading has been
+disabled for this socket endpoint.
 
 **ZX_ERR_WRONG_TYPE**  *handle* is not a socket handle.
 
@@ -54,12 +64,12 @@ or if *options* is not either zero or **ZX_SOCKET_CONTROL*.
 
 **ZX_ERR_ACCESS_DENIED**  *handle* does not have **ZX_RIGHT_READ**.
 
-**ZX_ERR_SHOULD_WAIT**  The socket contained no data to read.
+**ZX_ERR_SHOULD_WAIT**  The socket contained no data to read. (However, if a
+NULL *buffer* and 0 *buffer_size* are passed in, ZX_OK will be returned in
+this case.)
 
 **ZX_ERR_PEER_CLOSED**  The other side of the socket is closed and no data is
 readable.
-
-**ZX_ERR_BAD_STATE**  Reading has been disabled for this socket endpoint.
 
 ## SEE ALSO
 

@@ -7,6 +7,7 @@
 #ifdef __Fuchsia__
 #include <fbl/auto_lock.h>
 #include <fbl/mutex.h>
+#include <lib/fzl/mapped-vmo.h>
 #include <lib/zx/vmo.h>
 #endif
 
@@ -17,69 +18,17 @@
 #include <fbl/ref_ptr.h>
 #include <fbl/unique_ptr.h>
 
-#include <fs/block-txn.h>
-#include <fs/mapped-vmo.h>
 #include <fs/queue.h>
 #include <fs/vfs.h>
 
+#include <minfs/allocator.h>
 #include <minfs/bcache.h>
+#include <minfs/block-txn.h>
 #include <minfs/format.h>
 
 namespace minfs {
 
 class VnodeMinfs;
-
-using ReadTxn = fs::ReadTxn<kMinfsBlockSize, Bcache>;
-
-#ifdef __Fuchsia__
-
-typedef struct {
-    zx_handle_t vmo;
-    size_t vmo_offset;
-    size_t dev_offset;
-    size_t length;
-} write_request_t;
-
-class WritebackBuffer;
-
-// A transaction consisting of enqueued VMOs to be written
-// out to disk at specified locations.
-//
-// TODO(smklein): Rename to LogWriteTxn, or something similar, to imply
-// that this write transaction acts fundamentally different from the
-// ulib/fs WriteTxn under the hood.
-class WriteTxn {
-public:
-    DISALLOW_COPY_ASSIGN_AND_MOVE(WriteTxn);
-    explicit WriteTxn(Bcache* bc) : bc_(bc) {}
-    ~WriteTxn() {
-        ZX_DEBUG_ASSERT_MSG(requests_.size() == 0, "WriteTxn still has pending requests");
-    }
-
-    // Identify that a block should be written to disk
-    // as a later point in time.
-    void Enqueue(zx_handle_t vmo, uint64_t vmo_offset, uint64_t dev_offset, uint64_t nblocks);
-    fbl::Vector<write_request_t>& Requests() { return requests_; }
-
-    // Activate the transaction, writing it out to disk.
-    //
-    // Each transaction uses the |vmo| / |vmoid| pair supplied, since the
-    // transactions should be all reading from a single in-memory buffer.
-    zx_status_t Flush(zx_handle_t vmo, vmoid_t vmoid);
-
-    size_t BlkCount() const;
-
-private:
-    friend class WritebackBuffer;
-    Bcache* bc_;
-    fbl::Vector<write_request_t> requests_;
-};
-
-#else
-
-using WriteTxn = fs::WriteTxn<kMinfsBlockSize, Bcache>;
-
-#endif
 
 // A wrapper around a WriteTxn, holding references to the underlying Vnodes
 // corresponding to the txn, so their Vnodes (and VMOs) are not released
@@ -87,7 +36,8 @@ using WriteTxn = fs::WriteTxn<kMinfsBlockSize, Bcache>;
 //
 // Additionally, this class allows completions to be signalled when the transaction
 // has successfully completed.
-class WritebackWork : public fbl::SinglyLinkedListable<fbl::unique_ptr<WritebackWork>> {
+class WritebackWork : public WriteTxn,
+                      public fbl::SinglyLinkedListable<fbl::unique_ptr<WritebackWork>> {
 public:
     WritebackWork(Bcache* bc);
 
@@ -111,6 +61,7 @@ public:
     using SyncCallback = fs::Vnode::SyncCallback;
     void SetClosure(SyncCallback closure);
 #else
+    // Flushes any pending transactions.
     void Complete();
 #endif
 
@@ -118,17 +69,56 @@ public:
     // this writeback operation.
     void PinVnode(fbl::RefPtr<VnodeMinfs> vn);
 
-    WriteTxn* txn() { return &txn_; }
 private:
 #ifdef __Fuchsia__
     SyncCallback closure_; // Optional.
 #endif
-    WriteTxn txn_;
     size_t node_count_;
     // May be empty. Currently '4' is the maximum number of vnodes within a
     // single unit of writeback work, which occurs during a cross-directory
     // rename operation.
     fbl::RefPtr<VnodeMinfs> vn_[4];
+};
+
+// Tracks the current transaction, including any enqueued writes, and reserved blocks
+// and inodes. Also handles allocation of previously reserved blocks/inodes.
+class Transaction {
+public:
+    Transaction(fbl::unique_ptr<WritebackWork> work,
+                fbl::unique_ptr<AllocatorPromise> inode_promise,
+                fbl::unique_ptr<AllocatorPromise> block_promise)
+        : work_(fbl::move(work)),
+          inode_promise_(fbl::move(inode_promise)),
+          block_promise_(fbl::move(block_promise)) {}
+
+    size_t AllocateInode() {
+        ZX_DEBUG_ASSERT(inode_promise_ != nullptr);
+        return inode_promise_->Allocate(work_.get());
+    }
+
+    size_t AllocateBlock() {
+        ZX_DEBUG_ASSERT(block_promise_ != nullptr);
+        return block_promise_->Allocate(work_.get());
+    }
+
+    void SetWork(fbl::unique_ptr<WritebackWork> work) {
+        work_ = fbl::move(work);
+    }
+
+    WritebackWork* GetWork() {
+        ZX_DEBUG_ASSERT(work_ != nullptr);
+        return work_.get();
+    }
+
+    fbl::unique_ptr<WritebackWork> RemoveWork() {
+        ZX_DEBUG_ASSERT(work_ != nullptr);
+        return fbl::move(work_);
+    }
+
+private:
+    fbl::unique_ptr<WritebackWork> work_;
+    fbl::unique_ptr<AllocatorPromise> inode_promise_;
+    fbl::unique_ptr<AllocatorPromise> block_promise_;
 };
 
 #ifdef __Fuchsia__
@@ -138,7 +128,7 @@ private:
 class WritebackBuffer {
 public:
     // Calls constructor, return an error if anything goes wrong.
-    static zx_status_t Create(Bcache* bc, fbl::unique_ptr<MappedVmo> buffer,
+    static zx_status_t Create(Bcache* bc, fbl::unique_ptr<fzl::MappedVmo> buffer,
                               fbl::unique_ptr<WritebackBuffer>* out);
     ~WritebackBuffer();
 
@@ -153,7 +143,7 @@ public:
     void Enqueue(fbl::unique_ptr<WritebackWork> work) __TA_EXCLUDES(writeback_lock_);
 
 private:
-    WritebackBuffer(Bcache* bc, fbl::unique_ptr<MappedVmo> buffer);
+    WritebackBuffer(Bcache* bc, fbl::unique_ptr<fzl::MappedVmo> buffer);
 
     // Blocks until |blocks| blocks of data are free for the caller.
     // Returns |ZX_OK| with the lock still held in this case.
@@ -201,7 +191,7 @@ private:
     // writeback buffer and are ready to be sent to disk.
     WorkQueue work_queue_ __TA_GUARDED(writeback_lock_){};
     bool unmounting_ __TA_GUARDED(writeback_lock_){false};
-    fbl::unique_ptr<MappedVmo> buffer_{};
+    fbl::unique_ptr<fzl::MappedVmo> buffer_{};
     vmoid_t buffer_vmoid_ = VMOID_INVALID;
     // The units of all the following are "MinFS blocks".
     size_t start_ __TA_GUARDED(writeback_lock_){};

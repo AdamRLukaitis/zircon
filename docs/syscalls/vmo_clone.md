@@ -21,7 +21,8 @@ of an existing vmo.
 One handle is returned on success, representing an object with the requested
 size.
 
-*options* must contain one or more flags to control clone creation.
+*options* must contain *ZX_VMO_CLONE_COPY_ON_WRITE* and zero or more flags to control
+clone creation.
 
 Valid flags:
 
@@ -32,6 +33,8 @@ the cloned vmo is now a copy and may diverge from the parent. Any reads from
 ranges outside of the parent vmo's size will contain zeros, and writes will
 allocate new zero filled pages.  See the NOTES section below for details on
 VMO syscall interactions with clones.
+
+- *ZX_VMO_CLONE_NON_RESIZEABLE* - Create a non-resizeable clone VMO.
 
 *offset* must be page aligned.
 
@@ -48,12 +51,6 @@ discussion of the details of each right.
 If *options* is *ZX_VMO_CLONE_COPY_ON_WRITE* the following rights are added:
 
 - **ZX_RIGHT_WRITE**
-
-*TEMPORARY* The following rights are added:
-
-- **ZX_RIGHT_EXECUTE**
-
-- **ZX_RIGHT_MAP**
 
 ## NOTES
 
@@ -77,6 +74,10 @@ ways:
 - If the **vmo_op_range**() LOOKUP mode is used, the parent's pages will be visible
   where the clone has not modified them.
 
+## RIGHTS
+
+TODO(ZX-2399)
+
 ## RETURN VALUE
 
 **vmo_clone**() returns **ZX_OK** on success. In the event
@@ -94,6 +95,8 @@ or the offset is not page aligned.
 **ZX_ERR_OUT_OF_RANGE**  *offset* + *size* is too large.
 
 **ZX_ERR_NO_MEMORY**  Failure due to lack of memory.
+There is no good way for userspace to handle this (unlikely) error.
+In a future build this error will no longer occur.
 
 ## SEE ALSO
 

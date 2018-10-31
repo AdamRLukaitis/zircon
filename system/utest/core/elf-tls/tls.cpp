@@ -69,13 +69,9 @@ static thread_local struct Ctor {
 } ctor;
 static thread_local uint8_t big_array[1 << 20];
 
-// Test that large alignments work correctly with thread-local variables.
-// TODO(ZX-1646): Make this work on ARM64.
-#if !defined(__aarch64__)
 __attribute__((aligned(0x1000))) thread_local int aligned_var = 123;
-#endif
 
-bool check_initializers() {
+bool CheckInitializers() {
     BEGIN_TEST;
 
     ASSERT_EQ(u1, true, "unexpected initialized value");
@@ -120,15 +116,13 @@ bool check_initializers() {
     ASSERT_EQ(sum, 0u, "unexpected initialized value");
 
     // TODO(ZX-1646): Make this work on ARM64.
-#if !defined(__aarch64__)
     EXPECT_EQ((uintptr_t)&aligned_var % 0x1000, 0);
     EXPECT_EQ(aligned_var, 123);
-#endif
 
     END_TEST;
 }
 
-bool test_array_spam(uintptr_t idx) {
+bool TestArraySpam(uintptr_t idx) {
     BEGIN_TEST;
 
     for (uintptr_t iteration = 0; iteration < 100; ++iteration) {
@@ -149,22 +143,22 @@ bool test_array_spam(uintptr_t idx) {
     END_TEST;
 }
 
-int test_thread(void* arg) {
+int TestThread(void* arg) {
     auto idx = reinterpret_cast<uintptr_t>(arg);
 
-    check_initializers();
-    test_array_spam(idx);
+    CheckInitializers();
+    TestArraySpam(idx);
     return 0;
 }
 
-bool executable_tls_test() {
+bool ExecutableTlsTest() {
     BEGIN_TEST;
 
     constexpr uintptr_t thread_count = 64u;
     thrd_t threads[thread_count];
     for (uintptr_t idx = 0u; idx < thread_count; ++idx) {
         auto arg = reinterpret_cast<void*>(idx);
-        int ret = thrd_create_with_name(&threads[idx], &test_thread, arg, "elf tls test");
+        int ret = thrd_create_with_name(&threads[idx], &TestThread, arg, "elf tls test");
         ASSERT_EQ(ret, thrd_success, "unable to create test thread");
     }
     for (uintptr_t idx = 0u; idx < thread_count; ++idx) {
@@ -172,13 +166,13 @@ bool executable_tls_test() {
         ASSERT_EQ(ret, thrd_success, "unable to join test thread");
     }
 
-    test_thread(nullptr);
+    TestThread(nullptr);
 
     END_TEST;
 }
 
 BEGIN_TEST_CASE(elf_tls_tests)
-RUN_TEST(executable_tls_test)
+RUN_TEST(ExecutableTlsTest)
 END_TEST_CASE(elf_tls_tests)
 
 #ifndef BUILD_COMBINED_TESTS

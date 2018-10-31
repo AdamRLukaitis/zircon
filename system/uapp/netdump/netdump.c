@@ -3,10 +3,11 @@
 // found in the LICENSE file.
 
 #include <inet6/inet6.h>
+#include <lib/fdio/util.h>
 #include <pretty/hexdump.h>
 #include <zircon/assert.h>
 #include <zircon/boot/netboot.h>
-#include <zircon/device/ethernet.h>
+#include <zircon/ethernet/c/fidl.h>
 #include <zircon/process.h>
 #include <zircon/syscalls.h>
 
@@ -273,7 +274,7 @@ int write_packet(int fd, void* data, size_t len) {
 }
 
 void handle_rx(zx_handle_t rx_fifo, char* iobuf, unsigned count, netdump_options_t* options) {
-    eth_fifo_entry_t entries[count];
+    zircon_ethernet_FifoEntry entries[count];
 
     if (write_shb(options->dumpfile)) {
         return;
@@ -283,9 +284,9 @@ void handle_rx(zx_handle_t rx_fifo, char* iobuf, unsigned count, netdump_options
     }
 
     for (;;) {
-        uint32_t n;
+        size_t n;
         zx_status_t status;
-        if ((status = zx_fifo_read_old(rx_fifo, entries, sizeof(entries), &n)) < 0) {
+        if ((status = zx_fifo_read(rx_fifo, sizeof(entries[0]), entries, countof(entries), &n)) < 0) {
             if (status == ZX_ERR_SHOULD_WAIT) {
                 zx_object_wait_one(rx_fifo, ZX_FIFO_READABLE | ZX_FIFO_PEER_CLOSED, ZX_TIME_INFINITE, NULL);
                 continue;
@@ -294,9 +295,9 @@ void handle_rx(zx_handle_t rx_fifo, char* iobuf, unsigned count, netdump_options
             return;
         }
 
-        eth_fifo_entry_t* e = entries;
-        for (uint32_t i = 0; i < n; i++, e++) {
-            if (e->flags & ETH_FIFO_RX_OK) {
+        zircon_ethernet_FifoEntry* e = entries;
+        for (size_t i = 0; i < n; i++, e++) {
+            if (e->flags & zircon_ethernet_FIFO_RX_OK) {
                 if (options->raw) {
                     printf("---\n");
                     hexdump8_ex(iobuf + e->offset, e->length, 0);
@@ -316,8 +317,7 @@ void handle_rx(zx_handle_t rx_fifo, char* iobuf, unsigned count, netdump_options
 
             e->length = BUFSIZE;
             e->flags = 0;
-            uint32_t actual;
-            if ((status = zx_fifo_write_old(rx_fifo, e, sizeof(*e), &actual)) < 0) {
+            if ((status = zx_fifo_write(rx_fifo, sizeof(*e), e, 1, NULL)) < 0) {
                 fprintf(stderr, "netdump: failed to queue rx packet: %d\n", status);
                 break;
             }
@@ -416,73 +416,83 @@ int main(int argc, const char** argv) {
         return -1;
     }
 
-    eth_fifos_t fifos;
-    zx_status_t status;
+    zx_handle_t svc;
+    zx_status_t status = fdio_get_service_handle(fd, &svc);
+    if (status != ZX_OK) {
+        fprintf(stderr, "netdump: failed to get service handle\n");
+        return -1;
+    }
 
-    ssize_t r;
-    if ((r = ioctl_ethernet_get_fifos(fd, &fifos)) < 0) {
-        fprintf(stderr, "netdump: failed to get fifos: %zd\n", r);
-        return r;
+
+    zircon_ethernet_Fifos fifos;
+    zx_status_t call_status = ZX_OK;
+    status = zircon_ethernet_DeviceGetFifos(svc, &call_status, &fifos);
+    if (status != ZX_OK || call_status != ZX_OK) {
+        fprintf(stderr, "netdump: failed to get fifos: %d, %d\n", status, call_status);
+        return -1;
     }
 
     unsigned count = fifos.rx_depth / 2;
     zx_handle_t iovmo;
     // allocate shareable ethernet buffer data heap
-    if ((status = zx_vmo_create(count * BUFSIZE, 0, &iovmo)) < 0) {
+    if ((status = zx_vmo_create(count * BUFSIZE, ZX_VMO_NON_RESIZABLE, &iovmo)) < 0) {
         return -1;
     }
 
     char* iobuf;
-    if ((status = zx_vmar_map(zx_vmar_root_self(), 0, iovmo, 0, count * BUFSIZE,
-                              ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE,
-                              (uintptr_t*)&iobuf)) < 0) {
+    if ((status = zx_vmar_map(zx_vmar_root_self(),
+                              ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
+                              0, iovmo, 0, count * BUFSIZE, (uintptr_t*)&iobuf)) < 0) {
         return -1;
     }
 
-    if ((r = ioctl_ethernet_set_iobuf(fd, &iovmo)) < 0) {
-        fprintf(stderr, "netdump: failed to set iobuf: %zd\n", r);
+    status = zircon_ethernet_DeviceSetIOBuffer(svc, iovmo, &call_status);
+    if (status != ZX_OK || call_status != ZX_OK) {
+        fprintf(stderr, "netdump: failed to set iobuf: %d, %d\n", status, call_status);
         return -1;
     }
 
-    if ((r = ioctl_ethernet_set_client_name(fd, "netdump", 7)) < 0) {
-        fprintf(stderr, "netdump: failed to set client name %zd\n", r);
+    status = zircon_ethernet_DeviceSetClientName(svc, "netdump", 7, &call_status);
+    if (status != ZX_OK || call_status != ZX_OK) {
+        fprintf(stderr, "netdump: failed to set client name %d, %d\n", status, call_status);
     }
 
     if (options.promisc) {
-        bool yes = true;
-        if ((r = ioctl_ethernet_set_promisc(fd, &yes)) < 0) {
-            fprintf(stderr, "netdump: failed to set promisc mode: %zd\n", r);
+        status = zircon_ethernet_DeviceSetPromiscuousMode(svc, true, &call_status);
+        if (status != ZX_OK || call_status != ZX_OK) {
+            fprintf(stderr, "netdump: failed to set promisc mode: %d, %d\n", status, call_status);
         }
     }
 
     // assign data chunks to ethbufs
     for (unsigned n = 0; n < count; n++) {
-        eth_fifo_entry_t entry = {
+        zircon_ethernet_FifoEntry entry = {
             .offset = n * BUFSIZE,
             .length = BUFSIZE,
             .flags = 0,
-            .cookie = NULL,
+            .cookie = 0,
         };
-        uint32_t actual;
-        if ((status = zx_fifo_write_old(fifos.rx_fifo, &entry, sizeof(entry), &actual)) < 0) {
+        if ((status = zx_fifo_write(fifos.rx, sizeof(entry), &entry, 1, NULL)) < 0) {
             fprintf(stderr, "netdump: failed to queue rx packet: %d\n", status);
             return -1;
         }
     }
 
-    if (ioctl_ethernet_start(fd) < 0) {
+    status = zircon_ethernet_DeviceStart(svc, &call_status);
+    if (status != ZX_OK || call_status != ZX_OK) {
         fprintf(stderr, "netdump: failed to start network interface\n");
         return -1;
     }
 
-    if (ioctl_ethernet_tx_listen_start(fd) < 0) {
+    status = zircon_ethernet_DeviceListenStart(svc, &call_status);
+    if (status != ZX_OK || call_status != ZX_OK) {
         fprintf(stderr, "netdump: failed to start listening\n");
         return -1;
     }
 
-    handle_rx(fifos.rx_fifo, iobuf, count, &options);
+    handle_rx(fifos.rx, iobuf, count, &options);
 
-    zx_handle_close(fifos.rx_fifo);
+    zx_handle_close(fifos.rx);
     if (options.dumpfile != -1) {
         close(options.dumpfile);
     }

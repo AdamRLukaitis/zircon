@@ -4,7 +4,9 @@
 
 #include "fidl/lexer.h"
 
+#include <assert.h>
 #include <ctype.h>
+#include <map>
 
 namespace fidl {
 
@@ -12,6 +14,12 @@ namespace {
 
 bool IsIdentifierBody(char c) {
     return isalnum(c) || c == '_';
+}
+
+// IsIdentifierValid disallows identifiers (escaped, and unescaped) from
+// starting or ending with underscore.
+bool IsIdentifierValid(StringView source_data) {
+    return source_data[0] != '_' && source_data[source_data.size() - 1] != '_';
 }
 
 bool IsNumericLiteralBody(char c) {
@@ -67,40 +75,53 @@ char Lexer::Consume() {
     return current;
 }
 
-StringView Lexer::Reset() {
+StringView Lexer::Reset(Token::Kind kind) {
     auto data = StringView(token_start_, token_size_);
+    if (kind != Token::Kind::kComment) {
+        previous_end_ = token_start_ + token_size_;
+    }
     token_start_ = current_;
     token_size_ = 0u;
     return data;
 }
 
 Token Lexer::Finish(Token::Kind kind) {
-    return Token(SourceLocation(Reset(), source_file_), kind);
+    assert(kind != Token::Kind::kIdentifier);
+    StringView previous(previous_end_, token_start_ - previous_end_);
+    SourceLocation previous_location(previous, source_file_);
+    return Token(previous_location,
+                 SourceLocation(Reset(kind), source_file_), kind, Token::Subkind::kNone);
 }
 
 Token Lexer::LexEndOfStream() {
-    return Finish(Token::Kind::EndOfFile);
+    return Finish(Token::Kind::kEndOfFile);
 }
 
 Token Lexer::LexNumericLiteral() {
     while (IsNumericLiteralBody(Peek()))
         Consume();
-    return Finish(Token::Kind::NumericLiteral);
+    return Finish(Token::Kind::kNumericLiteral);
 }
 
 Token Lexer::LexIdentifier() {
     while (IsIdentifierBody(Peek()))
         Consume();
-    return identifier_table_->MakeIdentifier(Reset(), source_file_, /* escaped */ false);
-}
-
-Token Lexer::LexEscapedIdentifier() {
-    // Reset() to drop the initial @ from the identifier.
-    Reset();
-
-    while (IsIdentifierBody(Peek()))
-        Consume();
-    return identifier_table_->MakeIdentifier(Reset(), source_file_, /* escaped */ true);
+    StringView previous(previous_end_, token_start_ - previous_end_);
+    SourceLocation previous_end(previous, source_file_);
+    StringView identifier_data = Reset(Token::Kind::kIdentifier);
+    if (!IsIdentifierValid(identifier_data)) {
+        SourceLocation location(StringView(token_start_, token_size_), source_file_);
+        std::string msg("invalid identifier '");
+        msg.append(identifier_data);
+        msg.append("'");
+        error_reporter_->ReportError(location, msg);
+    }
+    auto subkind = Token::Subkind::kNone;
+    auto lookup = keyword_table_.find(identifier_data);
+    if (lookup != keyword_table_.end())
+        subkind = lookup->second;
+    return Token(previous_end, SourceLocation(identifier_data, source_file_),
+                 Token::Kind::kIdentifier, subkind);
 }
 
 Token Lexer::LexStringLiteral() {
@@ -111,11 +132,11 @@ Token Lexer::LexStringLiteral() {
         auto next = Consume();
         switch (next) {
         case 0:
-            return Finish(Token::Kind::NotAToken);
+            return LexEndOfStream();
         case '"':
             // This escaping logic is incorrect for the input: "\\"
             if (last != '\\')
-                return Finish(Token::Kind::StringLiteral);
+                return Finish(Token::Kind::kStringLiteral);
         // Fall through.
         default:
             last = next;
@@ -123,10 +144,22 @@ Token Lexer::LexStringLiteral() {
     }
 }
 
-Token Lexer::LexComment() {
+Token Lexer::LexCommentOrDocComment() {
     // Consume the second /.
     assert(Peek() == '/');
     Consume();
+
+    // Check if it's a Doc Comment
+    auto comment_type = Token::Kind::kComment;
+    if (Peek() == '/') {
+        comment_type = Token::Kind::kDocComment;
+        Consume();
+        // Anything with more than 3 slashes is a likely a section
+        // break comment
+        if (Peek() == '/') {
+            comment_type = Token::Kind::kComment;
+        }
+    }
 
     // Lexing a C++-style // comment. Go to the end of the line or
     // file.
@@ -134,7 +167,7 @@ Token Lexer::LexComment() {
         switch (Peek()) {
         case 0:
         case '\n':
-            return Finish(Token::Kind::Comment);
+            return Finish(comment_type);
         default:
             Consume();
             continue;
@@ -160,149 +193,159 @@ void Lexer::SkipWhitespace() {
 Token Lexer::LexNoComments() {
     for (;;) {
         auto token = Lex();
-        if (token.kind() == Token::Kind::Comment)
+        if (token.kind() == Token::Kind::kComment)
             continue;
         return token;
     }
 }
 
 Token Lexer::Lex() {
-    SkipWhitespace();
+    do {
+        SkipWhitespace();
 
-    switch (Consume()) {
-    case 0:
-        return LexEndOfStream();
+        switch (Consume()) {
+        case 0:
+            return LexEndOfStream();
 
-    case ' ':
-    case '\n':
-    case '\r':
-    case '\t':
-        assert(false && "Should have been handled by SkipWhitespace!");
+        case ' ':
+        case '\n':
+        case '\r':
+        case '\t':
+            assert(false && "Should have been handled by SkipWhitespace!");
 
-    case '-':
-        // Maybe the start of an arrow.
-        if (Peek() == '>') {
-            Consume();
-            return Finish(Token::Kind::Arrow);
-        }
-    // Fallthrough
-    case '0':
-    case '1':
-    case '2':
-    case '3':
-    case '4':
-    case '5':
-    case '6':
-    case '7':
-    case '8':
-    case '9':
-        return LexNumericLiteral();
+        case '-':
+            // Maybe the start of an arrow.
+            if (Peek() == '>') {
+                Consume();
+                return Finish(Token::Kind::kArrow);
+            }
+        // Fallthrough
+        case '0':
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+        case '5':
+        case '6':
+        case '7':
+        case '8':
+        case '9':
+            return LexNumericLiteral();
 
-    case 'a':
-    case 'A':
-    case 'b':
-    case 'B':
-    case 'c':
-    case 'C':
-    case 'd':
-    case 'D':
-    case 'e':
-    case 'E':
-    case 'f':
-    case 'F':
-    case 'g':
-    case 'G':
-    case 'h':
-    case 'H':
-    case 'i':
-    case 'I':
-    case 'j':
-    case 'J':
-    case 'k':
-    case 'K':
-    case 'l':
-    case 'L':
-    case 'm':
-    case 'M':
-    case 'n':
-    case 'N':
-    case 'o':
-    case 'O':
-    case 'p':
-    case 'P':
-    case 'q':
-    case 'Q':
-    case 'r':
-    case 'R':
-    case 's':
-    case 'S':
-    case 't':
-    case 'T':
-    case 'u':
-    case 'U':
-    case 'v':
-    case 'V':
-    case 'w':
-    case 'W':
-    case 'x':
-    case 'X':
-    case 'y':
-    case 'Y':
-    case 'z':
-    case 'Z':
-    case '_':
-        return LexIdentifier();
+        case 'a':
+        case 'A':
+        case 'b':
+        case 'B':
+        case 'c':
+        case 'C':
+        case 'd':
+        case 'D':
+        case 'e':
+        case 'E':
+        case 'f':
+        case 'F':
+        case 'g':
+        case 'G':
+        case 'h':
+        case 'H':
+        case 'i':
+        case 'I':
+        case 'j':
+        case 'J':
+        case 'k':
+        case 'K':
+        case 'l':
+        case 'L':
+        case 'm':
+        case 'M':
+        case 'n':
+        case 'N':
+        case 'o':
+        case 'O':
+        case 'p':
+        case 'P':
+        case 'q':
+        case 'Q':
+        case 'r':
+        case 'R':
+        case 's':
+        case 'S':
+        case 't':
+        case 'T':
+        case 'u':
+        case 'U':
+        case 'v':
+        case 'V':
+        case 'w':
+        case 'W':
+        case 'x':
+        case 'X':
+        case 'y':
+        case 'Y':
+        case 'z':
+        case 'Z':
+            return LexIdentifier();
 
-    case '@':
-        return LexEscapedIdentifier();
+        case '"':
+            return LexStringLiteral();
 
-    case '"':
-        return LexStringLiteral();
-
-    case '/':
-        // Maybe the start of a comment.
-        switch (Peek()) {
         case '/':
-            return LexComment();
-        default:
-            return Finish(Token::Kind::NotAToken);
+            // Maybe the start of a comment.
+            switch (Peek()) {
+            case '/':
+                return LexCommentOrDocComment();
+            default: {
+                SourceLocation location(StringView(token_start_, token_size_), source_file_);
+                std::string msg("invalid character '");
+                msg.append(location.data());
+                msg.append("'");
+                error_reporter_->ReportError(location, msg);
+                continue;
+            }
+            } // switch
+
+        case '(':
+            return Finish(Token::Kind::kLeftParen);
+        case ')':
+            return Finish(Token::Kind::kRightParen);
+        case '[':
+            return Finish(Token::Kind::kLeftSquare);
+        case ']':
+            return Finish(Token::Kind::kRightSquare);
+        case '{':
+            return Finish(Token::Kind::kLeftCurly);
+        case '}':
+            return Finish(Token::Kind::kRightCurly);
+        case '<':
+            return Finish(Token::Kind::kLeftAngle);
+        case '>':
+            return Finish(Token::Kind::kRightAngle);
+
+        case '.':
+            return Finish(Token::Kind::kDot);
+        case ',':
+            return Finish(Token::Kind::kComma);
+        case ';':
+            return Finish(Token::Kind::kSemicolon);
+        case ':':
+            return Finish(Token::Kind::kColon);
+        case '?':
+            return Finish(Token::Kind::kQuestion);
+        case '=':
+            return Finish(Token::Kind::kEqual);
+        case '&':
+            return Finish(Token::Kind::kAmpersand);
+
+        default: {
+            SourceLocation location(StringView(token_start_, token_size_), source_file_);
+            std::string msg("invalid character '");
+            msg.append(location.data());
+            msg.append("'");
+            error_reporter_->ReportError(location, msg);
+            continue;
         }
-
-    case '(':
-        return Finish(Token::Kind::LeftParen);
-    case ')':
-        return Finish(Token::Kind::RightParen);
-    case '[':
-        return Finish(Token::Kind::LeftSquare);
-    case ']':
-        return Finish(Token::Kind::RightSquare);
-    case '{':
-        return Finish(Token::Kind::LeftCurly);
-    case '}':
-        return Finish(Token::Kind::RightCurly);
-    case '<':
-        return Finish(Token::Kind::LeftAngle);
-    case '>':
-        return Finish(Token::Kind::RightAngle);
-
-    case '.':
-        return Finish(Token::Kind::Dot);
-    case ',':
-        return Finish(Token::Kind::Comma);
-    case ';':
-        return Finish(Token::Kind::Semicolon);
-    case ':':
-        return Finish(Token::Kind::Colon);
-    case '?':
-        return Finish(Token::Kind::Question);
-    case '=':
-        return Finish(Token::Kind::Equal);
-    case '&':
-        return Finish(Token::Kind::Ampersand);
-
-    default:
-        return Finish(Token::Kind::NotAToken);
-    }
+        } // switch
+    } while (true);
 }
 
 } // namespace fidl

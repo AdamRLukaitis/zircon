@@ -18,13 +18,13 @@ void bootfs_mount(zx_handle_t vmar, zx_handle_t log, zx_handle_t vmo, struct boo
     zx_status_t status = zx_vmo_get_size(vmo, &size);
     check(log, status, "zx_vmo_get_size failed on bootfs vmo\n");
     uintptr_t addr = 0;
-    status = zx_vmar_map(vmar, 0, vmo, 0, size, ZX_VM_FLAG_PERM_READ, &addr);
+    status = zx_vmar_map(vmar, ZX_VM_PERM_READ, 0, vmo, 0, size, &addr);
     check(log, status, "zx_vmar_map failed on bootfs vmo\n");
     fs->contents = (const void*)addr;
     fs->len = size;
     status = zx_handle_duplicate(
         vmo,
-        ZX_RIGHT_READ | ZX_RIGHT_EXECUTE | ZX_RIGHT_MAP |
+        ZX_RIGHT_READ | ZX_RIGHT_MAP |
         ZX_RIGHTS_BASIC | ZX_RIGHT_GET_PROPERTY,
         &fs->vmo);
     check(log, status, "zx_handle_duplicate failed on bootfs VMO handle\n");
@@ -102,11 +102,16 @@ zx_handle_t bootfs_open(zx_handle_t log, const char* purpose,
     // TODO(mcgrathr): Should be superfluous with read-only zx_vmo_clone.
     status = zx_handle_replace(
         vmo,
-        ZX_RIGHT_READ | ZX_RIGHT_EXECUTE | ZX_RIGHT_MAP |
+        ZX_RIGHT_READ | ZX_RIGHT_MAP |
         ZX_RIGHTS_BASIC | ZX_RIGHT_GET_PROPERTY,
         &vmo);
     if (status != ZX_OK)
         fail(log, "zx_handle_replace failed: %d", status);
+
+    // TODO(mdempsky): Restrict to bin/ and lib/.
+    status = zx_vmo_replace_as_executable(vmo, ZX_HANDLE_INVALID, &vmo);
+    if (status != ZX_OK)
+        fail(log, "zx_vmo_replace_as_executable failed: %d", status);
 
     return vmo;
 }

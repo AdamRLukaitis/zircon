@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef LIB_FIDL_CPP_MESSAGE_BUFFER_H_
+#define LIB_FIDL_CPP_MESSAGE_BUFFER_H_
 
 #include <stdint.h>
 
@@ -43,6 +44,9 @@ public:
     // The returned |Message| contains no bytes or handles.
     Message CreateEmptyMessage();
 
+    // Creates a |Builder| that is backed by the memory in this buffer.
+    Builder CreateBuilder();
+
 private:
     uint8_t* const buffer_;
     const uint32_t bytes_capacity_;
@@ -50,3 +54,5 @@ private:
 };
 
 } // namespace fidl
+
+#endif // LIB_FIDL_CPP_MESSAGE_BUFFER_H_

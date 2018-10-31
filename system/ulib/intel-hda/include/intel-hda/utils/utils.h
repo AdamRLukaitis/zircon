@@ -6,9 +6,13 @@
 
 #include <zircon/device/audio.h>
 #include <zircon/types.h>
+#include <lib/zx/bti.h>
 #include <lib/zx/channel.h>
 #include <lib/zx/handle.h>
 #include <lib/zx/vmo.h>
+#include <fbl/function.h>
+#include <fbl/ref_counted.h>
+#include <fbl/ref_ptr.h>
 #include <fbl/type_support.h>
 #include <fbl/vector.h>
 
@@ -17,7 +21,29 @@
 namespace audio {
 namespace intel_hda {
 
+static constexpr size_t MAX_HANDLER_CAPTURE_SIZE = sizeof(void*) * 2;
+using WaitConditionFn = fbl::InlineFunction<bool(), MAX_HANDLER_CAPTURE_SIZE>;
+zx_status_t WaitCondition(zx_duration_t timeout,
+                          zx_duration_t poll_interval,
+                          WaitConditionFn cond);
+
+template <typename E> constexpr typename fbl::underlying_type<E>::type to_underlying(E e) {
+    return static_cast<typename fbl::underlying_type<E>::type>(e);
+}
+
 zx_obj_type_t GetHandleType(const zx::handle& handle);
+
+// Utility class which manages a Bus Transaction Initiator using RefPtrs
+// (allowing the BTI to be shared by multiple objects)
+class RefCountedBti : public fbl::RefCounted<RefCountedBti> {
+  public:
+    static fbl::RefPtr<RefCountedBti> Create(zx::bti initiator);
+    const zx::bti& initiator() const { return initiator_; }
+
+  private:
+    explicit RefCountedBti(zx::bti initiator) : initiator_(fbl::move(initiator)) { }
+    zx::bti initiator_;
+};
 
 template <typename T>
 zx_status_t ConvertHandle(zx::handle* abstract_handle, T* concrete_handle) {

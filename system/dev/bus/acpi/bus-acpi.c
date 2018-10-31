@@ -6,6 +6,7 @@
 #include <ddk/device.h>
 #include <ddk/driver.h>
 #include <ddk/debug.h>
+#include <ddk/metadata.h>
 #include <ddk/protocol/acpi.h>
 #include <ddk/protocol/pciroot.h>
 
@@ -18,76 +19,26 @@
 #include <sys/stat.h>
 #include <threads.h>
 
+#include <acpica/acpi.h>
 #include <zircon/compiler.h>
 #include <zircon/process.h>
 #include <zircon/syscalls/iommu.h>
 
+#include "acpi-private.h"
 #include "cpu-trace.h"
 #include "dev.h"
 #include "errors.h"
 #include "init.h"
+#include "iommu.h"
+#include "methods.h"
+#include "nhlt.h"
 #include "pci.h"
-#include "powerbtn.h"
+#include "pciroot.h"
 #include "power.h"
-#include "processor.h"
 #include "resources.h"
 
-#define MAX_NAMESPACE_DEPTH 100
-
-typedef struct acpi_device_resource {
-    bool writeable;
-    uint32_t base_address;
-    uint32_t alignment;
-    uint32_t address_length;
-} acpi_device_resource_t;
-
-typedef struct acpi_device_irq {
-    uint8_t trigger;
-#define ACPI_IRQ_TRIGGER_LEVEL  0
-#define ACPI_IRQ_TRIGGER_EDGE   1
-    uint8_t polarity;
-#define ACPI_IRQ_ACTIVE_HIGH    0
-#define ACPI_IRQ_ACTIVE_LOW     1
-#define ACPI_IRQ_ACTIVE_BOTH    2
-    uint8_t sharable;
-#define ACPI_IRQ_EXCLUSIVE      0
-#define ACPI_IRQ_SHARED         1
-    uint8_t wake_capable;
-    uint8_t pin;
-} acpi_device_irq_t;
-
-typedef struct acpi_device {
-    zx_device_t* zxdev;
-
-    mtx_t lock;
-
-    bool got_resources;
-
-    // memory resources from _CRS
-    acpi_device_resource_t* resources;
-    size_t resource_count;
-
-    // interrupt resources from _CRS
-    acpi_device_irq_t* irqs;
-    size_t irq_count;
-
-    // handle to the corresponding ACPI node
-    ACPI_HANDLE ns_node;
-} acpi_device_t;
-
-typedef struct {
-    zx_device_t* parent;
-    bool found_pci;
-} publish_acpi_device_ctx_t;
-
-typedef struct {
-    uint8_t max;
-    uint8_t i;
-    auxdata_i2c_device_t* data;
-} pci_child_auxdata_ctx_t;
 
 zx_handle_t root_resource_handle;
-static zx_handle_t dummy_iommu_handle;
 
 static zx_device_t* publish_device(zx_device_t* parent, ACPI_HANDLE handle,
                                    ACPI_DEVICE_INFO* info, const char* name,
@@ -101,170 +52,6 @@ static void acpi_device_release(void* ctx) {
 static zx_protocol_device_t acpi_device_proto = {
     .version = DEVICE_OPS_VERSION,
     .release = acpi_device_release,
-};
-
-static ACPI_STATUS find_pci_child_callback(ACPI_HANDLE object, uint32_t nesting_level,
-                                           void* context, void** out_value) {
-    ACPI_DEVICE_INFO* info;
-    ACPI_STATUS acpi_status = AcpiGetObjectInfo(object, &info);
-    if (acpi_status != AE_OK) {
-        zxlogf(TRACE, "bus-acpi: AcpiGetObjectInfo failed %d\n", acpi_status);
-        return acpi_status;
-    }
-    ACPI_FREE(info);
-    ACPI_OBJECT obj = {
-        .Type = ACPI_TYPE_INTEGER,
-    };
-    ACPI_BUFFER buffer = {
-        .Length = sizeof(obj),
-        .Pointer = &obj,
-    };
-    acpi_status = AcpiEvaluateObject(object, (char*)"_ADR", NULL, &buffer);
-    if (acpi_status != AE_OK) {
-        return AE_OK;
-    }
-    uint32_t addr = *(uint32_t*)context;
-    ACPI_HANDLE* out_handle = (ACPI_HANDLE*)out_value;
-    if (addr == obj.Integer.Value) {
-        *out_handle = object;
-        return AE_CTRL_TERMINATE;
-    } else {
-        return AE_OK;
-    }
-}
-
-static ACPI_STATUS pci_child_data_resources_callback(ACPI_RESOURCE* res, void* context) {
-    pci_child_auxdata_ctx_t* ctx = (pci_child_auxdata_ctx_t*)context;
-    auxdata_i2c_device_t* child = ctx->data + ctx->i;
-
-    if (res->Type != ACPI_RESOURCE_TYPE_SERIAL_BUS) {
-        return AE_NOT_FOUND;
-    }
-    if (res->Data.I2cSerialBus.Type != ACPI_RESOURCE_SERIAL_TYPE_I2C) {
-        return AE_NOT_FOUND;
-    }
-
-    ACPI_RESOURCE_I2C_SERIALBUS* i2c = &res->Data.I2cSerialBus;
-    child->bus_master = i2c->SlaveMode;
-    child->ten_bit = i2c->AccessMode;
-    child->address = i2c->SlaveAddress;
-    child->bus_speed = i2c->ConnectionSpeed;
-
-    return AE_CTRL_TERMINATE;
-}
-
-static ACPI_STATUS pci_child_data_callback(ACPI_HANDLE object,
-                                           uint32_t nesting_level,
-                                           void* context, void** out_value) {
-    pci_child_auxdata_ctx_t* ctx = (pci_child_auxdata_ctx_t*)context;
-    if ((ctx->i + 1) > ctx->max) {
-        return AE_CTRL_TERMINATE;
-    }
-
-    // get device type (only looking for i2c-hid and tpm right now)
-    ACPI_DEVICE_INFO* info = NULL;
-    ACPI_STATUS acpi_status = AcpiGetObjectInfo(object, &info);
-    if (acpi_status == AE_OK) {
-        // These length fields count the trailing NUL.
-        if ((info->Valid & ACPI_VALID_HID) && info->HardwareId.Length <= HID_LENGTH + 1) {
-            if (!strncmp(info->HardwareId.String, GOOGLE_TPM_HID_STRING, HID_LENGTH)) {
-                ctx->data->protocol_id = ZX_PROTOCOL_TPM;
-            }
-        }
-        if ((info->Valid & ACPI_VALID_CID) && info->CompatibleIdList.Count > 0) {
-            ACPI_PNP_DEVICE_ID* id = &info->CompatibleIdList.Ids[0];
-            if (id->Length <= CID_LENGTH + 1) {
-                if (!strncmp(id->String, I2C_HID_CID_STRING, CID_LENGTH)) {
-                    ctx->data->protocol_id = ZX_PROTOCOL_I2C_HID;
-                }
-            }
-        }
-        ACPI_FREE(info);
-    }
-
-    // call _CRS to get i2c info
-    acpi_status = AcpiWalkResources(object, (char*)"_CRS",
-                                    pci_child_data_resources_callback, ctx);
-    if ((acpi_status == AE_OK) || (acpi_status == AE_CTRL_TERMINATE)) {
-        ctx->i += 1;
-    }
-    return AE_OK;
-}
-
-static zx_status_t pciroot_op_get_auxdata(void* context, const char* args,
-                                          void* data, uint32_t bytes,
-                                          uint32_t* actual) {
-    acpi_device_t* dev = (acpi_device_t*)context;
-
-    char type[16];
-    uint32_t bus_id, dev_id, func_id;
-    int n;
-    if ((n = sscanf(args, "%[^,],%02x:%02x:%02x", type, &bus_id, &dev_id, &func_id)) != 4) {
-        return ZX_ERR_INVALID_ARGS;
-    }
-
-    zxlogf(SPEW, "bus-acpi: get_auxdata type '%s' device %02x:%02x:%02x\n", type,
-           bus_id, dev_id, func_id);
-
-    if (strcmp(type, "i2c-child")) {
-        return ZX_ERR_NOT_SUPPORTED;
-    }
-
-    if (bytes < (2 * sizeof(uint32_t))) {
-        return ZX_ERR_BUFFER_TOO_SMALL;
-    }
-
-    ACPI_HANDLE pci_node = NULL;
-    uint32_t addr = (dev_id << 16) | func_id;
-
-    // Look for the child node with this device and function id
-    ACPI_STATUS acpi_status = AcpiWalkNamespace(ACPI_TYPE_DEVICE, dev->ns_node, 1,
-                                                find_pci_child_callback, NULL,
-                                                &addr, &pci_node);
-    if ((acpi_status != AE_OK) && (acpi_status != AE_CTRL_TERMINATE)) {
-        return acpi_to_zx_status(acpi_status);
-    }
-    if (pci_node == NULL) {
-        return ZX_ERR_NOT_FOUND;
-    }
-
-    // Look for as many children as can fit in the provided buffer
-    pci_child_auxdata_ctx_t ctx = {
-        .max = bytes / sizeof(auxdata_i2c_device_t),
-        .i = 0,
-        .data = data,
-    };
-
-    acpi_status = AcpiWalkNamespace(ACPI_TYPE_DEVICE, pci_node, 1,
-                                    pci_child_data_callback, NULL, &ctx, NULL);
-    if ((acpi_status != AE_OK) && (acpi_status != AE_CTRL_TERMINATE)) {
-        *actual = 0;
-        return acpi_to_zx_status(acpi_status);
-    }
-
-    *actual = ctx.i * sizeof(auxdata_i2c_device_t);
-
-    zxlogf(SPEW, "bus-acpi: get_auxdata '%s' %u devs actual %u\n",
-           args, ctx.i, *actual);
-
-    return ZX_OK;
-}
-
-static zx_status_t pciroot_op_get_bti(void* context, uint32_t bdf, uint32_t index,
-                                      zx_handle_t* bti) {
-    // The x86 IOMMU world uses PCI BDFs as the hardware identifiers, so there
-    // will only be one BTI per device.
-    if (index != 0) {
-        return ZX_ERR_OUT_OF_RANGE;
-    }
-    // For dummy IOMMUs, the bti_id just needs to be unique.  For Intel IOMMUs,
-    // the bti_ids correspond to PCI BDFs.
-    return zx_bti_create(dummy_iommu_handle, 0, bdf, bti);
-}
-
-static pciroot_protocol_ops_t pciroot_proto = {
-    .get_auxdata = pciroot_op_get_auxdata,
-    .get_bti = pciroot_op_get_bti,
 };
 
 typedef struct {
@@ -472,9 +259,9 @@ static zx_status_t acpi_op_map_resource(void* ctx, uint32_t res_id, uint32_t cac
         goto unlock;
     }
 
-    st = zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size,
-                     ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE | ZX_VM_FLAG_MAP_RANGE,
-                     &vaddr);
+    st = zx_vmar_map(zx_vmar_root_self(),
+                     ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_MAP_RANGE,
+                     0, vmo, 0, size, &vaddr);
     if (st != ZX_OK) {
         zx_handle_close(vmo);
     } else {
@@ -487,7 +274,7 @@ unlock:
     return st;
 }
 
-static zx_status_t acpi_op_map_interrupt(void* ctx, int which_irq, zx_handle_t* out_handle) {
+static zx_status_t acpi_op_map_interrupt(void* ctx, int64_t which_irq, zx_handle_t* out_handle) {
     acpi_device_t* dev = (acpi_device_t*)ctx;
     mtx_lock(&dev->lock);
 
@@ -503,16 +290,10 @@ static zx_status_t acpi_op_map_interrupt(void* ctx, int which_irq, zx_handle_t* 
 
     acpi_device_irq_t* irq = dev->irqs + which_irq;
     zx_handle_t handle;
-    st = zx_interrupt_create(get_root_resource(), 0, &handle);
+    st = zx_interrupt_create(get_root_resource(), irq->pin, ZX_INTERRUPT_REMAP_IRQ, &handle);
     if (st != ZX_OK) {
         goto unlock;
     }
-    st = zx_interrupt_bind(handle, 0, get_root_resource(), irq->pin, ZX_INTERRUPT_REMAP_IRQ);
-    if (st != ZX_OK) {
-        zx_handle_close(handle);
-        goto unlock;
-    }
-
     *out_handle = handle;
 
 unlock:
@@ -532,6 +313,10 @@ static zx_protocol_device_t acpi_root_device_proto = {
 
 static zx_status_t sys_device_suspend(void* ctx, uint32_t flags) {
     switch (flags & DEVICE_SUSPEND_REASON_MASK) {
+    case DEVICE_SUSPEND_FLAG_MEXEC: {
+        AcpiTerminate();
+        return ZX_OK;
+    }
     case DEVICE_SUSPEND_FLAG_REBOOT:
         reboot();
         // Kill this driver so that the IPC channel gets closed; devmgr will
@@ -599,7 +384,7 @@ static zx_device_t* publish_device(zx_device_t* parent,
 
     if (driver_get_log_flags() & DDK_LOG_SPEW) {
         // ACPI names are always 4 characters in a uint32
-        zxlogf(SPEW, "acpi-bus: got device %s\n", acpi_name);
+        zxlogf(SPEW, "acpi: got device %s\n", acpi_name);
         if (info->Valid & ACPI_VALID_HID) {
             zxlogf(SPEW, "     HID=%s\n", info->HardwareId.String);
         } else {
@@ -644,12 +429,12 @@ static zx_device_t* publish_device(zx_device_t* parent,
 
     zx_status_t status;
     if ((status = device_add(parent, &args, &dev->zxdev)) != ZX_OK) {
-        zxlogf(ERROR, "acpi-bus: error %d in device_add, parent=%s(%p)\n",
+        zxlogf(ERROR, "acpi: error %d in device_add, parent=%s(%p)\n",
                 status, device_get_name(parent), parent);
         free(dev);
         return NULL;
     } else {
-        zxlogf(ERROR, "acpi-bus: published device %s(%p), parent=%s(%p), handle=%p\n",
+        zxlogf(ERROR, "acpi: published device %s(%p), parent=%s(%p), handle=%p\n",
                 name, dev, device_get_name(parent), parent, (void*)dev->ns_node);
         return dev->zxdev;
     }
@@ -663,18 +448,38 @@ static ACPI_STATUS acpi_ns_walk_callback(ACPI_HANDLE object, uint32_t nesting_le
         return acpi_status;
     }
 
+    publish_acpi_device_ctx_t* ctx = (publish_acpi_device_ctx_t*)context;
+    zx_device_t* parent = ctx->parent;
+
     // TODO: This is a temporary workaround until we have full ACPI device
     // enumeration. If this is the I2C1 bus, we run _PS0 so the controller
     // is active.
     if (!memcmp(&info->Name, "I2C1", 4)) {
-        ACPI_STATUS acpi_status = AcpiEvaluateObject(object, (char*)"_PS0", NULL, NULL);
+        acpi_status = AcpiEvaluateObject(object, (char*)"_PS0", NULL, NULL);
         if (acpi_status != AE_OK) {
-            zxlogf(ERROR, "acpi-bus: acpi error 0x%x in I2C1._PS0\n", acpi_status);
+            zxlogf(ERROR, "acpi: acpi error 0x%x in I2C1._PS0\n", acpi_status);
+        }
+
+    // Attach the NHLT table as metadata on the HDA device.
+    // The ACPI node representing the HDA controller is named "HDAS" on Pixelbook.
+    // TODO: This is a temporary workaround for ACPI device enumeration.
+    } else if (!memcmp(&info->Name, "HDAS", 4)) {
+        // We must have already seen at least one PCI root due to traversal order.
+        if (ctx->last_pci == 0xFF) {
+            zxlogf(ERROR, "acpi: Found HDAS node, but no prior PCI root was discovered!\n");
+        } else if (!(info->Valid & ACPI_VALID_ADR)) {
+            zxlogf(ERROR, "acpi: no valid ADR found for HDA device\n");
+        } else {
+            zx_status_t status = nhlt_publish_metadata(parent,
+                                                       ctx->last_pci,
+                                                       (uint64_t)info->Address,
+                                                       object);
+            if ((status != ZX_OK) && (status != ZX_ERR_NOT_FOUND)) {
+                zxlogf(ERROR, "acpi: failed to publish NHLT metadata\n");
+            }
         }
     }
 
-    publish_acpi_device_ctx_t* ctx = (publish_acpi_device_ctx_t*)context;
-    zx_device_t* parent = ctx->parent;
     const char* hid = hid_from_acpi_devinfo(info);
     if (hid == 0) {
         goto out;
@@ -688,15 +493,52 @@ static ACPI_STATUS acpi_ns_walk_callback(ACPI_HANDLE object, uint32_t nesting_le
         cid = (const char*)info->CompatibleIdList.Ids[0].String;
     }
 
-    if (!ctx->found_pci && (!memcmp(hid, PCI_EXPRESS_ROOT_HID_STRING, HID_LENGTH) ||
-                            !memcmp(hid, PCI_ROOT_HID_STRING, HID_LENGTH))) {
-        // Publish PCI root as top level
-        // Only publish one PCI root device for all PCI roots
-        // TODO: store context for PCI root protocol
-        parent = device_get_parent(parent);
-        zx_device_t* pcidev = publish_device(parent, object, info, "pci",
-                ZX_PROTOCOL_PCIROOT, &pciroot_proto);
-        ctx->found_pci = (pcidev != NULL);
+    if ((!memcmp(hid, PCI_EXPRESS_ROOT_HID_STRING, HID_LENGTH) ||
+         !memcmp(hid, PCI_ROOT_HID_STRING, HID_LENGTH))) {
+// TODO(cja): Stubbed out for userspace PCI development
+#ifdef ENABLE_USER_PCI
+        register_pci_root(object);
+#else
+        if (!ctx->found_pci) {
+            // Report current resources to kernel PCI driver
+            zx_status_t status = pci_report_current_resources(get_root_resource());
+            if (status != ZX_OK) {
+                zxlogf(ERROR, "acpi: WARNING: ACPI failed to report all current resources!\n");
+            }
+
+            // Initialize kernel PCI driver
+            zx_pci_init_arg_t* arg;
+            uint32_t arg_size;
+            status = get_pci_init_arg(&arg, &arg_size);
+            if (status != ZX_OK) {
+                zxlogf(ERROR, "acpi: erorr %d in get_pci_init_arg\n", status);
+                return AE_ERROR;
+            }
+
+            status = zx_pci_init(get_root_resource(), arg, arg_size);
+            if (status != ZX_OK) {
+                zxlogf(ERROR, "acpi: error %d in zx_pci_init\n", status);
+                return AE_ERROR;
+            }
+
+            free(arg);
+
+            // Publish PCI root as top level
+            // Only publish one PCI root device for all PCI roots
+            // TODO: store context for PCI root protocol
+            parent = device_get_parent(parent);
+            zx_device_t* pcidev = publish_device(parent, object, info, "pci",
+                    ZX_PROTOCOL_PCIROOT, get_pciroot_ops());
+            ctx->found_pci = (pcidev != NULL);
+        }
+        // Get the PCI base bus number
+        zx_status_t status = acpi_bbn_call(object, &ctx->last_pci);
+        if (status != ZX_OK) {
+            zxlogf(ERROR, "acpi: failed to get PCI base bus number for device '%s' "
+                          "(status %u)\n", (const char*)&info->Name, status);
+        }
+        zxlogf(TRACE, "acpi: found pci root #%u\n", ctx->last_pci);
+#endif
     } else if (!memcmp(hid, BATTERY_HID_STRING, HID_LENGTH)) {
         battery_init(parent, object);
     } else if (!memcmp(hid, PWRSRC_HID_STRING, HID_LENGTH)) {
@@ -724,11 +566,17 @@ out:
 }
 
 static zx_status_t publish_acpi_devices(zx_device_t* parent) {
+    zx_status_t status = pwrbtn_init(parent);
+    if (status != ZX_OK) {
+        zxlogf(ERROR, "acpi: failed to initialize pwrbtn device: %d\n", status);
+    }
+
     // Walk the ACPI namespace for devices and publish them
     // Only publish a single PCI device
     publish_acpi_device_ctx_t ctx = {
         .parent = parent,
         .found_pci = false,
+        .last_pci = 0xFF,
     };
     ACPI_STATUS acpi_status = AcpiWalkNamespace(ACPI_TYPE_DEVICE,
                                                 ACPI_ROOT_OBJECT,
@@ -743,57 +591,21 @@ static zx_status_t publish_acpi_devices(zx_device_t* parent) {
 }
 
 static zx_status_t acpi_drv_create(void* ctx, zx_device_t* parent, const char* name,
-                                   const char* _args, zx_handle_t bootdata_vmo) {
+                                   const char* _args, zx_handle_t zbi_vmo) {
     // ACPI is the root driver for its devhost so run init in the bind thread.
-    zxlogf(TRACE, "acpi-bus: bind to %s %p\n", device_get_name(parent), parent);
+    zxlogf(TRACE, "acpi: bind to %s %p\n", device_get_name(parent), parent);
     root_resource_handle = get_root_resource();
 
-    // We don't need bootdata VMO handle.
-    zx_handle_close(bootdata_vmo);
+    // We don't need ZBI VMO handle.
+    zx_handle_close(zbi_vmo);
 
-    if (init() != ZX_OK) {
-        zxlogf(ERROR, "acpi-bus: failed to initialize ACPI\n");
+    zx_status_t status = init();
+    if (status != ZX_OK) {
+        zxlogf(ERROR, "acpi: failed to initialize ACPI %d \n", status);
         return ZX_ERR_INTERNAL;
     }
 
-    zxlogf(TRACE, "acpi-bus: initialized\n");
-
-    zx_status_t status = install_powerbtn_handlers();
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "acpi-bus: error %d in install_powerbtn_handlers\n", status);
-        return status;
-    }
-
-    zx_iommu_desc_dummy_t desc;
-    status = zx_iommu_create(get_root_resource(), ZX_IOMMU_TYPE_DUMMY, &desc, sizeof(desc),
-                             &dummy_iommu_handle);
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "acpi-bus: error %d in zx_iommu_create\n", status);
-        return status;
-    }
-
-    // Report current resources to kernel PCI driver
-    status = pci_report_current_resources(get_root_resource());
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "acpi-bus: WARNING: ACPI failed to report all current resources!\n");
-    }
-
-    // Initialize kernel PCI driver
-    zx_pci_init_arg_t* arg;
-    uint32_t arg_size;
-    status = get_pci_init_arg(&arg, &arg_size);
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "acpi-bus: erorr %d in get_pci_init_arg\n", status);
-        return status;
-    }
-
-    status = zx_pci_init(get_root_resource(), arg, arg_size);
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "acpi-bus: error %d in zx_pci_init\n", status);
-        return status;
-    }
-
-    free(arg);
+    zxlogf(TRACE, "acpi: initialized\n");
 
     // publish sys root
     device_add_args_t args = {
@@ -806,14 +618,20 @@ static zx_status_t acpi_drv_create(void* ctx, zx_device_t* parent, const char* n
     zx_device_t* sys_root = NULL;
     status = device_add(parent, &args, &sys_root);
     if (status != ZX_OK) {
-        zxlogf(ERROR, "acpi-bus: error %d in device_add(sys)\n", status);
+        zxlogf(ERROR, "acpi: error %d in device_add(sys)\n", status);
         return status;
     }
 
+    zx_handle_t dummy_iommu_handle;
+    status = iommu_manager_get_dummy_iommu(&dummy_iommu_handle);
+    if (status != ZX_OK) {
+        zxlogf(ERROR, "acpi-bus: error %d in iommu_manager_get_dummy_iommu()\n", status);
+        return status;
+    }
     zx_handle_t cpu_trace_bti;
     status = zx_bti_create(dummy_iommu_handle, 0, CPU_TRACE_BTI_ID, &cpu_trace_bti);
     if (status != ZX_OK) {
-        zxlogf(ERROR, "acpi-bus: error %d in bti_create(cpu_trace_bti)\n", status);
+        zxlogf(ERROR, "acpi: error %d in bti_create(cpu_trace_bti)\n", status);
         return status;
     }
 
@@ -833,9 +651,19 @@ static zx_status_t acpi_drv_create(void* ctx, zx_device_t* parent, const char* n
     zx_device_t* acpi_root = NULL;
     status = device_add(sys_root, &args2, &acpi_root);
     if (status != ZX_OK) {
-        zxlogf(ERROR, "acpi-bus: error %d in device_add(sys/acpi)\n", status);
+        zxlogf(ERROR, "acpi: error %d in device_add(sys/acpi)\n", status);
         device_remove(sys_root);
         return status;
+    }
+
+    // TODO - retrieve more useful board name from ACPI data
+    const char board_name[] = { "pc" };
+
+    // Publish board name to sysinfo driver
+    status = device_publish_metadata(acpi_root, "/dev/misc/sysinfo", DEVICE_METADATA_BOARD_NAME,
+                                     board_name, sizeof(board_name));
+    if (status != ZX_OK) {
+        zxlogf(ERROR, "device_publish_metadata(board_name) failed: %d\n", status);
     }
 
     publish_acpi_devices(acpi_root);

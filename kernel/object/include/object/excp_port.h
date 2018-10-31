@@ -9,13 +9,13 @@
 #include <stdint.h>
 
 #include <arch/exception.h>
+#include <kernel/lockdep.h>
 #include <kernel/mutex.h>
 #include <object/dispatcher.h>
 
 #include <zircon/syscalls/exception.h>
 #include <zircon/syscalls/port.h>
 #include <zircon/types.h>
-#include <fbl/auto_lock.h>
 #include <fbl/canary.h>
 #include <fbl/intrusive_double_list.h>
 #include <fbl/mutex.h>
@@ -32,7 +32,7 @@ class PortDispatcher;
 class ExceptionPort : public fbl::DoublyLinkedListable<fbl::RefPtr<ExceptionPort>>
                     , public fbl::RefCounted<ExceptionPort> {
 public:
-    enum class Type { NONE, DEBUGGER, THREAD, PROCESS, JOB};
+    enum class Type { NONE, JOB_DEBUGGER, DEBUGGER, THREAD, PROCESS, JOB};
 
     static zx_status_t Create(Type type, fbl::RefPtr<PortDispatcher> port,
                               uint64_t port_key,
@@ -45,6 +45,7 @@ public:
 
     void OnThreadStartForDebugger(ThreadDispatcher* thread);
     void OnThreadExitForDebugger(ThreadDispatcher* thread);
+    void OnProcessStartForDebugger(ThreadDispatcher* thread);
 
     // Records the target that the ExceptionPort is bound to, so it can
     // unbind when the underlying PortDispatcher dies.
@@ -55,6 +56,9 @@ public:
     // Drops the ExceptionPort's references to its target and PortDispatcher.
     // Called by the target when the port is explicitly unbound.
     void OnTargetUnbind();
+
+    // Validates that this eport is associated with the given instance.
+    bool PortMatches(const PortDispatcher* port, bool allow_null);
 
     static void BuildArchReport(zx_exception_report_t* report, uint32_t type,
                                 const arch_exception_context_t* arch_context);
@@ -72,15 +76,6 @@ private:
     // Unbinds from the target if bound, and drops the ref to |port_|.
     // Called by |port_| when it reaches zero handles.
     void OnPortZeroHandles();
-
-#if DEBUG_ASSERT_IMPLEMENTED
-    // Lets PortDispatcher assert that this eport is associated
-    // with the right instance.
-    bool PortMatches(const PortDispatcher *port, bool allow_null) {
-        fbl::AutoLock lock(&lock_);
-        return (allow_null && port_ == nullptr) || port_.get() == port;
-    }
-#endif  // if DEBUG_ASSERT_IMPLEMENTED
 
     // Returns true if the ExceptionPort is currently bound to a target.
     bool IsBoundLocked() const TA_REQ(lock_) {
@@ -103,7 +98,7 @@ private:
     // The system exception port doesn't have a Dispatcher, hence the bool.
     fbl::RefPtr<Dispatcher> target_ TA_GUARDED(lock_);
 
-    fbl::Mutex lock_;
+    DECLARE_MUTEX(ExceptionPort) lock_;
 
     // NOTE: The DoublyLinkedListNodeState is guarded by |port_|'s lock,
     // and should only be touched using port_->LinkExceptionPort()

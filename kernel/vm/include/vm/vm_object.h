@@ -14,6 +14,7 @@
 #include <fbl/name.h>
 #include <fbl/ref_counted.h>
 #include <fbl/ref_ptr.h>
+#include <kernel/lockdep.h>
 #include <kernel/mutex.h>
 #include <lib/user_copy/user_ptr.h>
 #include <list.h>
@@ -34,7 +35,6 @@ public:
     virtual void OnOneChild() = 0;
 };
 
-
 // The base vm object that holds a range of bytes of data
 //
 // Can be created without mapping and used as a container of data, or mappable
@@ -47,9 +47,15 @@ public:
     virtual zx_status_t ResizeLocked(uint64_t size) TA_REQ(lock_) { return ZX_ERR_NOT_SUPPORTED; }
 
     virtual uint64_t size() const { return 0; }
+    virtual uint32_t create_options() const { return 0; }
 
     // Returns true if the object is backed by RAM.
     virtual bool is_paged() const { return false; }
+    // Returns true if the object is backed by a contiguous range of physical
+    // memory.
+    virtual bool is_contiguous() const { return false; }
+    // Returns true if the object size can be changed.
+    virtual bool is_resizable() const { return false; }
 
     // Returns the number of physical pages currently allocated to the
     // object where (offset <= page_offset < offset+len).
@@ -64,12 +70,6 @@ public:
 
     // find physical pages to back the range of the object
     virtual zx_status_t CommitRange(uint64_t offset, uint64_t len, uint64_t* committed) {
-        return ZX_ERR_NOT_SUPPORTED;
-    }
-
-    // find a contiguous run of physical pages to back the range of the object
-    virtual zx_status_t CommitRangeContiguous(uint64_t offset, uint64_t len, uint64_t* committed,
-                                              uint8_t alignment_log2) {
         return ZX_ERR_NOT_SUPPORTED;
     }
 
@@ -157,17 +157,15 @@ public:
         return ZX_ERR_NOT_SUPPORTED;
     }
 
-    virtual zx_status_t GetMappingCachePolicy(uint32_t* cache_policy) {
-        return ZX_ERR_NOT_SUPPORTED;
-    }
-
+    virtual uint32_t GetMappingCachePolicy() const = 0;
     virtual zx_status_t SetMappingCachePolicy(const uint32_t cache_policy) {
         return ZX_ERR_NOT_SUPPORTED;
     }
 
     // create a copy-on-write clone vmo at the page-aligned offset and length
     // note: it's okay to start or extend past the size of the parent
-    virtual zx_status_t CloneCOW(uint64_t offset, uint64_t size, bool copy_name,
+    virtual zx_status_t CloneCOW(bool resizable,
+                                 uint64_t offset, uint64_t size, bool copy_name,
                                  fbl::RefPtr<VmObject>* clone_vmo) {
         return ZX_ERR_NOT_SUPPORTED;
     }
@@ -184,8 +182,8 @@ public:
         return ZX_ERR_NOT_SUPPORTED;
     }
 
-    fbl::Mutex* lock() TA_RET_CAP(lock_) { return &lock_; }
-    fbl::Mutex& lock_ref() TA_RET_CAP(lock_) { return lock_; }
+    Lock<fbl::Mutex>* lock() TA_RET_CAP(lock_) { return &lock_; }
+    Lock<fbl::Mutex>& lock_ref() TA_RET_CAP(lock_) { return lock_; }
 
     void AddMappingLocked(VmMapping* r) TA_REQ(lock_);
     void RemoveMappingLocked(VmMapping* r) TA_REQ(lock_);
@@ -208,7 +206,7 @@ public:
     // error value.
     template <typename T>
     static zx_status_t ForEach(T func) {
-        fbl::AutoLock a(&all_vmos_lock_);
+        Guard<fbl::Mutex> guard{AllVmosLock::Get()};
         for (const auto& iter : all_vmos_) {
             zx_status_t s = func(iter);
             if (s != ZX_OK) {
@@ -221,7 +219,8 @@ public:
 protected:
     // private constructor (use Create())
     explicit VmObject(fbl::RefPtr<VmObject> parent);
-    VmObject() : VmObject(nullptr) {}
+    VmObject()
+        : VmObject(nullptr) {}
 
     // private destructor, only called from refptr
     virtual ~VmObject();
@@ -245,10 +244,10 @@ protected:
     // declare a local mutex and default to pointing at it
     // if constructed with a parent vmo, point lock_ at the parent's lock
 private:
-    fbl::Mutex local_lock_;
+    DECLARE_MUTEX(VmObject) local_lock_;
 
 protected:
-    fbl::Mutex& lock_;
+    Lock<fbl::Mutex>& lock_;
 
     // list of every mapping
     fbl::DoublyLinkedList<VmMapping*> mapping_list_ TA_GUARDED(lock_);
@@ -284,6 +283,6 @@ private:
         }
     };
     using GlobalList = fbl::DoublyLinkedList<VmObject*, GlobalListTraits>;
-    static fbl::Mutex all_vmos_lock_;
-    static GlobalList all_vmos_ TA_GUARDED(all_vmos_lock_);
+    DECLARE_SINGLETON_MUTEX(AllVmosLock);
+    static GlobalList all_vmos_ TA_GUARDED(AllVmosLock::Get());
 };

@@ -6,15 +6,19 @@
 #include <stdint.h>
 
 #include <crypto/digest.h>
-#include <crypto/error.h>
 #include <crypto/hmac.h>
 #include <explicit-memory/bytes.h>
 #include <fbl/alloc_checker.h>
-#include <fdio/debug.h>
-#include <openssl/digest.h>
-#include <openssl/hmac.h>
+#include <lib/fdio/debug.h>
 #include <zircon/errors.h>
 #include <zircon/types.h>
+
+// See note in //zircon/third_party/ulib/uboringssl/rules.mk
+#define BORINGSSL_NO_CXX
+#include <openssl/digest.h>
+#include <openssl/hmac.h>
+
+#include "error.h"
 
 #define ZXDEBUG 0
 
@@ -35,7 +39,7 @@ struct HMAC::Context {
 HMAC::HMAC() {}
 HMAC::~HMAC() {}
 
-zx_status_t HMAC::Create(digest::Algorithm digest, const Bytes& key, const void* in, size_t in_len,
+zx_status_t HMAC::Create(digest::Algorithm digest, const Secret& key, const void* in, size_t in_len,
                          Bytes* out, uint16_t flags) {
     zx_status_t rc;
 
@@ -48,7 +52,7 @@ zx_status_t HMAC::Create(digest::Algorithm digest, const Bytes& key, const void*
     return ZX_OK;
 }
 
-zx_status_t HMAC::Verify(digest::Algorithm digest, const Bytes& key, const void* in, size_t in_len,
+zx_status_t HMAC::Verify(digest::Algorithm digest, const Secret& key, const void* in, size_t in_len,
                          const Bytes& hmac, uint16_t flags) {
     zx_status_t rc;
 
@@ -79,7 +83,7 @@ zx_status_t HMAC::Verify(digest::Algorithm digest, const Bytes& key, const void*
     return ZX_OK;
 }
 
-zx_status_t HMAC::Init(digest::Algorithm digest, const Bytes& key, uint16_t flags) {
+zx_status_t HMAC::Init(digest::Algorithm digest, const Secret& key, uint16_t flags) {
     zx_status_t rc;
 
     if ((flags & (~kAllFlags)) != 0) {
@@ -164,9 +168,8 @@ zx_status_t HMAC::Final(Bytes* out) {
         xprintf_crypto_errors(&rc);
         return rc;
     }
-
-    out->Reset();
-    if ((rc = out->Copy(tmp.get(), out_len)) != ZX_OK) {
+    if ((rc = out->Resize(out_len)) != ZX_OK ||
+        (rc = out->Copy(tmp.get(), out_len)) != ZX_OK) {
         return rc;
     }
 

@@ -4,7 +4,7 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
-#if WITH_DEV_PCIE
+#if WITH_KERNEL_PCIE
 
 #include <object/pci_interrupt_dispatcher.h>
 
@@ -20,21 +20,10 @@ PciInterruptDispatcher::~PciInterruptDispatcher() {
 }
 
 pcie_irq_handler_retval_t PciInterruptDispatcher::IrqThunk(const PcieDevice& dev,
-                                                           uint irq_id,
-                                                           void* ctx) {
+                                                           uint irq_id, void* ctx) {
     DEBUG_ASSERT(ctx);
-
-    Interrupt* interrupt = reinterpret_cast<Interrupt*>(ctx);
-
-    // only record timestamp if this is the first IRQ since we started waiting
-    zx_time_t zero_timestamp = 0;
-    atomic_cmpxchg_u64(&interrupt->timestamp, &zero_timestamp, current_time());
-
-    PciInterruptDispatcher* thiz
-            = reinterpret_cast<PciInterruptDispatcher *>(interrupt->dispatcher);
-
-    // Mask the IRQ at the PCIe hardware level if we can.
-    thiz->Signal(SIGNAL_MASK(interrupt->slot), true);
+    auto thiz = reinterpret_cast<PciInterruptDispatcher*>(ctx);
+    thiz->InterruptHandler();
     return PCIE_IRQRET_MASK;
 }
 
@@ -54,24 +43,19 @@ zx_status_t PciInterruptDispatcher::Create(
 
     fbl::AllocChecker ac;
     // Attempt to allocate a new dispatcher wrapper.
-    auto interrupt_dispatcher = new (&ac) PciInterruptDispatcher(device, maskable);
+    auto interrupt_dispatcher = new (&ac) PciInterruptDispatcher(device, irq_id, maskable);
     fbl::RefPtr<Dispatcher> dispatcher = fbl::AdoptRef<Dispatcher>(interrupt_dispatcher);
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    fbl::AutoLock lock(interrupt_dispatcher->get_lock());
+    Guard<fbl::Mutex> guard{interrupt_dispatcher->get_lock()};
 
-    // bind our PCI interrupt
-    zx_status_t result = interrupt_dispatcher->AddSlotLocked(ZX_PCI_INTERRUPT_SLOT, irq_id,
-                                                             INTERRUPT_UNMASK_PREWAIT);
-    if (result != ZX_OK)
-        return result;
+    interrupt_dispatcher->set_flags(INTERRUPT_UNMASK_PREWAIT);
 
-    // prebind ZX_INTERRUPT_SLOT_USER
-    result = interrupt_dispatcher->AddSlotLocked(ZX_INTERRUPT_SLOT_USER, 0, INTERRUPT_VIRTUAL);
-    if (result != ZX_OK)
-        return result;
-
+    // Register the interrupt
+    zx_status_t status = interrupt_dispatcher->RegisterInterruptHandler();
+    if (status != ZX_OK)
+        return status;
 
     // Everything seems to have gone well.  Make sure the interrupt is unmasked
     // (if it is maskable) then transfer our dispatcher refererence to the
@@ -84,37 +68,22 @@ zx_status_t PciInterruptDispatcher::Create(
     return ZX_OK;
 }
 
-zx_status_t PciInterruptDispatcher::Bind(uint32_t slot, uint32_t vector, uint32_t options) {
-    canary_.Assert();
-
-    if (slot > ZX_INTERRUPT_MAX_SLOTS)
-        return ZX_ERR_INVALID_ARGS;
-
-    // For PCI interrupt handles we only support binding virtual interrupts
-    if (options != ZX_INTERRUPT_VIRTUAL)
-        return ZX_ERR_INVALID_ARGS;
-
-    fbl::AutoLock lock(get_lock());
-
-    return AddSlotLocked(slot, vector, INTERRUPT_VIRTUAL);
-}
-
-void PciInterruptDispatcher::MaskInterrupt(uint32_t vector) {
+void PciInterruptDispatcher::MaskInterrupt() {
     if (maskable_)
-        device_->MaskIrq(vector);
+        device_->MaskIrq(vector_);
 }
 
-void PciInterruptDispatcher::UnmaskInterrupt(uint32_t vector) {
+void PciInterruptDispatcher::UnmaskInterrupt() {
     if (maskable_)
-        device_->UnmaskIrq(vector);
+        device_->UnmaskIrq(vector_);
 }
 
-zx_status_t PciInterruptDispatcher::RegisterInterruptHandler(uint32_t vector, void* data) {
-    return device_->RegisterIrqHandler(vector, IrqThunk, data);
+zx_status_t PciInterruptDispatcher::RegisterInterruptHandler() {
+    return device_->RegisterIrqHandler(vector_, IrqThunk, this);
 }
 
-void PciInterruptDispatcher::UnregisterInterruptHandler(uint32_t vector) {
-    device_->RegisterIrqHandler(vector, nullptr, nullptr);
+void PciInterruptDispatcher::UnregisterInterruptHandler() {
+    device_->RegisterIrqHandler(vector_, nullptr, nullptr);
 }
 
-#endif  // if WITH_DEV_PCIE
+#endif  // if WITH_KERNEL_PCIE

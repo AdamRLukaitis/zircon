@@ -9,10 +9,9 @@ process_create - create a new process
 ```
 #include <zircon/syscalls.h>
 
-zx_status_t zx_process_create(zx_handle_t job,
-                              const char* name, uint32_t name_len,
-                              uint32_t options,
-                              zx_handle_t* proc_handle, zx_handle_t* vmar_handle);
+zx_status_t zx_process_create(zx_handle_t job, const char* name, size_t name_size,
+                              uint32_t options, zx_handle_t* proc_handle,
+                              zx_handle_t* vmar_handle);
 
 ```
 
@@ -34,6 +33,10 @@ Process handles may be waited on and will assert the signal
 *job* is the controlling [job object](../objects/job.md) for the new
 process, which will become a child of that job.
 
+## RIGHTS
+
+TODO(ZX-2399)
+
 ## RETURN VALUE
 
 On success, **process_create**() returns **ZX_OK**, a handle to the new process
@@ -52,7 +55,9 @@ On success, **process_create**() returns **ZX_OK**, a handle to the new process
 **ZX_ERR_INVALID_ARGS**  *name*, *proc_handle*, or *vmar_handle*  was an invalid pointer,
 or *options* was non-zero.
 
-**ZX_ERR_NO_MEMORY**  (Temporary) Failure due to lack of memory.
+**ZX_ERR_NO_MEMORY**  Failure due to lack of memory.
+There is no good way for userspace to handle this (unlikely) error.
+In a future build this error will no longer occur.
 
 **ZX_ERR_BAD_STATE**  The job object is in the dead state.
 

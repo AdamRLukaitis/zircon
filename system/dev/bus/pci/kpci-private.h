@@ -14,7 +14,7 @@ typedef struct kpci_device {
 
     // only set for non-shadow devices
     pciroot_protocol_t pciroot;
-    platform_device_protocol_t pdev;
+    pdev_protocol_t pdev;
 
     // only set for shadow devices
     zx_handle_t pciroot_rpcch;
@@ -43,11 +43,6 @@ typedef enum {
     PCI_OP_GET_BTI,
     PCI_OP_MAX,
 } pci_op_t;
-
-extern _Atomic zx_txid_t pci_global_txid;
-static inline uint32_t pci_next_txid(void) {
-    return atomic_fetch_add(&pci_global_txid, 1);
-}
 
 typedef struct {
     uint16_t offset;

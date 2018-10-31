@@ -73,7 +73,16 @@
 #define X86_MSR_PKG_POWER_LIMIT         0x00000610 /* Package power limits */
 #define X86_MSR_PKG_POWER_LIMIT_PL1_CLAMP   (1 << 16)
 #define X86_MSR_PKG_POWER_LIMIT_PL1_ENABLE  (1 << 15)
+#define X86_MSR_PKG_ENERGY_STATUS       0x00000611 /* Package energy status */
 #define X86_MSR_PKG_POWER_INFO          0x00000614 /* Package power range info */
+#define X86_MSR_DRAM_POWER_LIMIT        0x00000618 /* DRAM RAPL power limit control */
+#define X86_MSR_DRAM_ENERGY_STATUS      0x00000619 /* DRAM energy status */
+#define X86_MSR_PP0_POWER_LIMIT         0x00000638 /* PP0 RAPL power limit control */
+#define X86_MSR_PP0_ENERGY_STATUS       0x00000639 /* PP0 energy status */
+#define X86_MSR_PP1_POWER_LIMIT         0x00000640 /* PP1 RAPL power limit control */
+#define X86_MSR_PP1_ENERGY_STATUS       0x00000641 /* PP1 energy status */
+#define X86_MSR_PLATFORM_ENERGY_COUNTER 0x0000064d /* Platform energy counter */
+#define X86_MSR_PLATFORM_POWER_LIMIT    0x0000065c /* Platform power limit control */
 
 /* EFLAGS/RFLAGS */
 #define X86_FLAGS_CF                    (1<<0)
@@ -109,6 +118,75 @@
                                          X86_FLAGS_AC | \
                                          X86_FLAGS_ID)
 
+/* DR6 */
+#define X86_DR6_B0 (1ul << 0)
+#define X86_DR6_B1 (1ul << 1)
+#define X86_DR6_B2 (1ul << 2)
+#define X86_DR6_B3 (1ul << 3)
+#define X86_DR6_BD (1ul << 13)
+#define X86_DR6_BS (1ul << 14)
+#define X86_DR6_BT (1ul << 15)
+
+// NOTE: DR6 is used as a read-only status registers, and it is not writeable through userspace.
+//       Any bits attempted to be written will be ignored.
+#define X86_DR6_USER_MASK (X86_DR6_B0 | \
+                           X86_DR6_B1 | \
+                           X86_DR6_B2 | \
+                           X86_DR6_B3 | \
+                           X86_DR6_BD | \
+                           X86_DR6_BS | \
+                           X86_DR6_BT)
+/* Only bits in X86_DR6_USER_MASK are writeable.
+ * Bits 12 and 32:63 must be written with 0, the rest as 1s */
+#define X86_DR6_MASK (0xffff0ff0ul)
+
+/* DR7 */
+#define X86_DR7_L0    (1ul << 0)
+#define X86_DR7_G0    (1ul << 1)
+#define X86_DR7_L1    (1ul << 2)
+#define X86_DR7_G1    (1ul << 3)
+#define X86_DR7_L2    (1ul << 4)
+#define X86_DR7_G2    (1ul << 5)
+#define X86_DR7_L3    (1ul << 6)
+#define X86_DR7_G3    (1ul << 7)
+#define X86_DR7_LE    (1ul << 8)
+#define X86_DR7_GE    (1ul << 9)
+#define X86_DR7_GD    (1ul << 13)
+#define X86_DR7_RW0   (3ul << 16)
+#define X86_DR7_LEN0  (3ul << 18)
+#define X86_DR7_RW1   (3ul << 20)
+#define X86_DR7_LEN1  (3ul << 22)
+#define X86_DR7_RW2   (3ul << 24)
+#define X86_DR7_LEN2  (3ul << 26)
+#define X86_DR7_RW3   (3ul << 28)
+#define X86_DR7_LEN3  (3ul << 30)
+
+// NOTE1: Even though the GD bit is writable, we disable it for the write_state syscall because it
+//        complicates a lot the reasoning about how to access the registers. This is because
+//        enabling this bit would make any other access to debug registers to issue an exception.
+//        New syscalls should be define to lock/unlock debug registers.
+// NOTE2: LE/GE bits are normally ignored, but the manual recommends always setting it to 1 in
+//        order to be backwards compatible. Hence they are not writable from userspace.
+#define X86_DR7_USER_MASK (X86_DR7_L0 |   \
+                           X86_DR7_G0 |   \
+                           X86_DR7_L1 |   \
+                           X86_DR7_G1 |   \
+                           X86_DR7_L2 |   \
+                           X86_DR7_G2 |   \
+                           X86_DR7_L3 |   \
+                           X86_DR7_G3 |   \
+                           X86_DR7_RW0 |  \
+                           X86_DR7_LEN0 | \
+                           X86_DR7_RW1 |  \
+                           X86_DR7_LEN1 | \
+                           X86_DR7_RW2 |  \
+                           X86_DR7_LEN2 | \
+                           X86_DR7_RW3 |  \
+                           X86_DR7_LEN3)
+
+/* Bits 11:12, 14:15 and 32:63 must be cleared to 0. Bit 10 must be set to 1. */
+#define X86_DR7_MASK ((1ul << 10) | X86_DR7_LE | X86_DR7_GE)
+
 #ifndef __ASSEMBLER__
 
 #include <zircon/compiler.h>
@@ -116,19 +194,32 @@
 
 __BEGIN_CDECLS
 
-/* Bit masks for xsave feature states; state components are
+/* Indices of xsave feature states; state components are
  * enumerated in Intel Vol 1 section 13.1 */
-#define X86_XSAVE_STATE_X87                  (1<<0)
-#define X86_XSAVE_STATE_SSE                  (1<<1)
-#define X86_XSAVE_STATE_AVX                  (1<<2)
-#define X86_XSAVE_STATE_MPX_BNDREG           (1<<3)
-#define X86_XSAVE_STATE_MPX_BNDCSR           (1<<4)
-#define X86_XSAVE_STATE_AVX512_OPMASK        (1<<5)
-#define X86_XSAVE_STATE_AVX512_LOWERZMM_HIGH (1<<6)
-#define X86_XSAVE_STATE_AVX512_HIGHERZMM     (1<<7)
-#define X86_XSAVE_STATE_PT                   (1<<8)
-#define X86_XSAVE_STATE_PKRU                 (1<<9)
+#define X86_XSAVE_STATE_INDEX_X87                  0
+#define X86_XSAVE_STATE_INDEX_SSE                  1
+#define X86_XSAVE_STATE_INDEX_AVX                  2
+#define X86_XSAVE_STATE_INDEX_MPX_BNDREG           3
+#define X86_XSAVE_STATE_INDEX_MPX_BNDCSR           4
+#define X86_XSAVE_STATE_INDEX_AVX512_OPMASK        5
+#define X86_XSAVE_STATE_INDEX_AVX512_LOWERZMM_HIGH 6
+#define X86_XSAVE_STATE_INDEX_AVX512_HIGHERZMM     7
+#define X86_XSAVE_STATE_INDEX_PT                   8
+#define X86_XSAVE_STATE_INDEX_PKRU                 9
 
+/* Bit masks for xsave feature states. */
+#define X86_XSAVE_STATE_BIT_X87                  (1 << X86_XSAVE_STATE_INDEX_X87)
+#define X86_XSAVE_STATE_BIT_SSE                  (1 << X86_XSAVE_STATE_INDEX_SSE)
+#define X86_XSAVE_STATE_BIT_AVX                  (1 << X86_XSAVE_STATE_INDEX_AVX)
+#define X86_XSAVE_STATE_BIT_MPX_BNDREG           (1 << X86_XSAVE_STATE_INDEX_MPX_BNDREG)
+#define X86_XSAVE_STATE_BIT_MPX_BNDCSR           (1 << X86_XSAVE_STATE_INDEX_MPX_BNDCSR)
+#define X86_XSAVE_STATE_BIT_AVX512_OPMASK        (1 << X86_XSAVE_STATE_INDEX_AVX512_OPMASK)
+#define X86_XSAVE_STATE_BIT_AVX512_LOWERZMM_HIGH (1 << X86_XSAVE_STATE_INDEX_AVX512_LOWERZMM_HIGH)
+#define X86_XSAVE_STATE_BIT_AVX512_HIGHERZMM     (1 << X86_XSAVE_STATE_INDEX_AVX512_HIGHERZMM)
+#define X86_XSAVE_STATE_BIT_PT                   (1 << X86_XSAVE_STATE_INDEX_PT)
+#define X86_XSAVE_STATE_BIT_PKRU                 (1 << X86_XSAVE_STATE_INDEX_PKRU)
+
+// Maximum buffer size needed for xsave and variants. To allocate, see ...BUFFER_SIZE below.
 #define X86_MAX_EXTENDED_REGISTER_SIZE 1024
 
 enum x86_extended_register_feature {
@@ -151,10 +242,14 @@ void x86_extended_register_init(void);
 bool x86_extended_register_enable_feature(enum x86_extended_register_feature);
 
 size_t x86_extended_register_size(void);
-/* Initialize a state vector */
-void x86_extended_register_init_state(void *register_state);
+
+/* Initialize a state vector. The passed in buffer must be X86_EXTENDED_REGISTER_SIZE big and it
+ * must be 64-byte aligned. This function will initialize it for use in save and restore. */
+void x86_extended_register_init_state(void* buffer);
+
 /* Save current state to state vector */
 void x86_extended_register_save_state(void *register_state);
+
 /* Restore a state created by x86_extended_register_init_state or
  * x86_extended_register_save_state */
 void x86_extended_register_restore_state(void *register_state);
@@ -167,6 +262,90 @@ void x86_set_extended_register_pt_state(bool threads);
 
 uint64_t x86_xgetbv(uint32_t reg);
 void x86_xsetbv(uint32_t reg, uint64_t val);
+
+struct x86_xsave_legacy_area {
+    uint16_t fcw;  /* FPU control word. */
+    uint16_t fsw;  /* FPU status word. */
+    uint8_t ftw;   /* Abridged FPU tag word (not the same as the FTW register, see
+                    * Intel manual sec 10.5.1.1: "x87 State". */
+    uint8_t reserved;
+    uint16_t fop;  /* FPU opcode. */
+    uint64_t fip;  /* FPU instruction pointer. */
+    uint64_t fdp;  /* FPU data pointer. */
+    uint32_t mxcsr;  /* SSE control status register. */
+    uint32_t mxcsr_mask;
+
+    /* The x87/MMX state. For x87 the each "st" entry has the low 80 bits used for the register
+     * contents. For MMX, the low 64 bits are used. The higher bits are unused. */
+    struct {
+        uint64_t low;
+        uint64_t high;
+    } st[8];
+
+    /* SSE registers. */
+    struct {
+        uint64_t low;
+        uint64_t high;
+    } xmm[16];
+} __PACKED;
+
+/* Returns the address within the given xsave area of the requested state component. The state
+ * component indexes formats are described in section 13.4 of the Intel Software Developer's manual.
+ * Use the X86_XSAVE_STATE_INDEX_* macros above for the component indices.
+ *
+ * The given register state must have previously been filled with the variant of XSAVE that the
+ * system is using. Since the save area can be compressed, the offset of each component can vary
+ * depending on the contents.
+ *
+ * The components 0 and 1 are special and refer to the legacy area. In both cases a pointer to the
+ * x86_xsave_legacy_area will be returned. Note that "mark_present=true" will only affect the
+ * requested component, so if you're writing to both x87 and SSE states, make two separate calls
+ * even though the returned pointer will be the same.
+ *
+ * Some parts of the xsave area are can be marked as unused to optimize. If you plan on
+ * writing to the area, set mark_present = true which will ensure that the corresponding area is
+ * marked used. Without this, the registers might not be restored when the thread is resumed. This
+ * is not currently supported for components >= 2. This means that to set AVX registers, for
+ * example, AVX needed to have been previously used by the thread in question. This capability can
+ * be added in the future if required.
+ *
+ * The size of the component will be placed in *size.
+ *
+ * This function will return null and fill 0 into *size if the component is not present. */
+void* x86_get_extended_register_state_component(void* register_state, uint32_t component,
+                                                bool mark_present, uint32_t* size);
+
+/* Kernel tracking of the current state of the x86 debug registers for a particular thread */
+typedef struct x86_debug_state {
+    uint64_t dr[4];
+    uint64_t dr6;
+    uint64_t dr7;
+} x86_debug_state_t;
+
+
+/* Disables the HW debug functionalities for the current thread.
+ * There is no "enable" call. To do this, use the x86_write_debug_state call. */
+void x86_disable_debug_state(void);
+/* Checks whether the given state is valid to install on a running thread */
+bool x86_validate_debug_state(x86_debug_state_t* debug_state);
+
+/* Only update the status section of |debug_state| (DR6). All other state will not be modified */
+void x86_read_debug_status(x86_debug_state_t* debug_state);
+// TODO(donosoc): write x86_write_debug_status(x86_debug_state_t*), which is for internal use by
+//                Zircon to keep DR6 up to date.
+
+/* Read from the CPU registers into |debug_state|. */
+void x86_read_hw_debug_regs(x86_debug_state_t* debug_state);
+/* Write from the |debug_state| into the CPU registers.
+ *
+ * IMPORTANT: This function is used in the context switch, so no validation is done, just writing.
+ *            In any other context (eg. setting debug values from a syscall), you *MUST* call
+ *            x86_validate_debug_state first. */
+void x86_write_hw_debug_regs(const x86_debug_state_t* debug_state);
+
+/* Handles the context switch for debug HW functionality (drN registers).
+ * Will only copy over state if it's enabled (non-zero). */
+void x86_debug_state_context_switch(thread_t* old_thread, thread_t* new_thread);
 
 __END_CDECLS
 

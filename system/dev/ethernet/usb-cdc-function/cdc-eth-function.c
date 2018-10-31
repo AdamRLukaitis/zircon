@@ -16,12 +16,12 @@
 #include <ddk/driver.h>
 #include <ddk/protocol/ethernet.h>
 #include <ddk/protocol/usb-function.h>
-#include <ddk/usb-request.h>
 #include <inet6/inet6.h>
+#include <usb/usb-request.h>
 #include <zircon/listnode.h>
 #include <zircon/process.h>
 #include <zircon/syscalls.h>
-#include <zircon/device/usb-device.h>
+#include <zircon/device/usb-peripheral.h>
 #include <zircon/hw/usb-cdc.h>
 
 #define BULK_REQ_SIZE   2048
@@ -153,12 +153,7 @@ typedef struct {
 };
 
 static zx_status_t cdc_generate_mac_address(usb_cdc_t* cdc) {
-    size_t actual;
-    zx_status_t status = zx_cprng_draw(cdc->mac_addr, sizeof(cdc->mac_addr), &actual);
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "%s: cdc_generate_mac_address: zx_cprng_draw failed\n", __FUNCTION__);
-        return status;
-    }
+    zx_cprng_draw(cdc->mac_addr, sizeof(cdc->mac_addr));
 
     // set most significant byte so we are using a locally managed address
     // TODO(voydanoff) add a way to configure a real MAC address here
@@ -208,7 +203,7 @@ static zx_status_t cdc_ethmac_start(void* ctx_cookie, ethmac_ifc_t* ifc, void* e
     } else {
         cdc->ethmac_ifc = ifc;
         cdc->ethmac_cookie = ethmac_cookie;
-        cdc->ethmac_ifc->status(ethmac_cookie, cdc->online ? ETH_STATUS_ONLINE : 0);
+        cdc->ethmac_ifc->status(ethmac_cookie, cdc->online ? ETHMAC_STATUS_ONLINE : 0);
     }
     mtx_unlock(&cdc->ethmac_mutex);
 
@@ -227,7 +222,8 @@ static zx_status_t cdc_send_locked(usb_cdc_t* cdc, ethmac_netbuf_t* netbuf) {
 
     // Send data
     tx_req->header.length = length;
-    ssize_t bytes_copied = usb_request_copyto(tx_req, byte_data, tx_req->header.length, 0);
+    ssize_t bytes_copied = usb_request_copy_to(tx_req, byte_data,
+                                                    tx_req->header.length, 0);
     if (bytes_copied < 0) {
         zxlogf(LERROR, "%s: failed to copy data into send req (error %zd)\n", __FUNCTION__,
                 bytes_copied);
@@ -285,8 +281,8 @@ static void cdc_intr_complete(usb_request_t* req, void* cookie) {
 
 static zx_status_t cdc_alloc_interrupt_req(usb_cdc_t* cdc, usb_request_t** out_req) {
     usb_request_t* req;
-    zx_status_t status = usb_function_req_alloc(&cdc->function, &req, INTR_MAX_PACKET,
-                                                cdc->intr_addr);
+    zx_status_t status = usb_request_alloc(&req, INTR_MAX_PACKET,
+                                                cdc->intr_addr, sizeof(usb_request_t));
     if (status != ZX_OK) {
         zxlogf(ERROR, "%s: usb_request_alloc failed %d\n", __FUNCTION__, status);
         return status;
@@ -326,13 +322,15 @@ static zx_status_t cdc_send_notifications(usb_cdc_t* cdc) {
 
     status = cdc_alloc_interrupt_req(cdc, &req);
     if (status != ZX_OK) return status;
-    usb_request_copyto(req, &network_notification, sizeof(network_notification), 0);
+    usb_request_copy_to(req, &network_notification,
+                             sizeof(network_notification), 0);
     req->header.length = sizeof(network_notification);
     usb_function_queue(&cdc->function, req);
 
     status = cdc_alloc_interrupt_req(cdc, &req);
     if (status != ZX_OK) return status;
-    usb_request_copyto(req, &speed_notification, sizeof(speed_notification), 0);
+    usb_request_copy_to(req, &speed_notification,
+                             sizeof(speed_notification), 0);
     req->header.length = sizeof(speed_notification);
     usb_function_queue(&cdc->function, req);
 
@@ -487,7 +485,7 @@ static zx_status_t cdc_set_interface(void* ctx, unsigned interface, unsigned alt
     mtx_lock(&cdc->ethmac_mutex);
     cdc->online = online;
     if (cdc->ethmac_ifc) {
-        cdc->ethmac_ifc->status(cdc->ethmac_cookie, online ? ETH_STATUS_ONLINE : 0);
+        cdc->ethmac_ifc->status(cdc->ethmac_cookie, online ? ETHMAC_STATUS_ONLINE : 0);
     }
     mtx_unlock(&cdc->ethmac_mutex);
 
@@ -607,7 +605,7 @@ zx_status_t usb_cdc_bind(void* ctx, zx_device_t* parent) {
     // allocate bulk out usb requests
     usb_request_t* req;
     for (int i = 0; i < BULK_TX_COUNT; i++) {
-        status = usb_function_req_alloc(&cdc->function, &req, BULK_REQ_SIZE, cdc->bulk_out_addr);
+        status = usb_request_alloc(&req, BULK_REQ_SIZE, cdc->bulk_out_addr, sizeof(usb_request_t));
         if (status != ZX_OK) {
             goto fail;
         }
@@ -617,7 +615,7 @@ zx_status_t usb_cdc_bind(void* ctx, zx_device_t* parent) {
     }
     // allocate bulk in usb requests
     for (int i = 0; i < BULK_RX_COUNT; i++) {
-        status = usb_function_req_alloc(&cdc->function, &req, BULK_REQ_SIZE, cdc->bulk_in_addr);
+        status = usb_request_alloc(&req, BULK_REQ_SIZE, cdc->bulk_in_addr, sizeof(usb_request_t));
         if (status != ZX_OK) {
             goto fail;
         }

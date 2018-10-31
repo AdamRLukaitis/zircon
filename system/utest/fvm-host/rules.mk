@@ -6,7 +6,7 @@ LOCAL_DIR := $(GET_LOCAL_DIR)
 
 MODULE := $(LOCAL_DIR)
 
-MODULE_TYPE := hostapp
+MODULE_TYPE := hosttest
 
 MODULE_SRCS += \
     $(LOCAL_DIR)/main.cpp \
@@ -17,7 +17,7 @@ MODULE_SRCS += \
     system/host/fvm/format/minfs.cpp \
     system/host/fvm/format/blobfs.cpp \
 
-MODULE_NAME := fvm-host-test
+MODULE_NAME := fvm-test
 
 MODULE_COMPILEFLAGS := \
     -Werror-implicit-function-declaration \
@@ -26,6 +26,7 @@ MODULE_COMPILEFLAGS := \
     -Isystem/uapp/lz4/include \
     -Isystem/host/fvm/include \
     -Isystem/ulib/fbl/include \
+    -Isystem/ulib/fit/include \
     -Isystem/ulib/fvm/include \
     -Isystem/ulib/digest/include \
     -Ithird_party/ulib/uboringssl/include \
@@ -36,6 +37,7 @@ MODULE_COMPILEFLAGS := \
     -Isystem/ulib/minfs/include \
     -Isystem/ulib/unittest/include \
     -Isystem/ulib/fs/include \
+    -Isystem/ulib/fzl/include \
     -Isystem/ulib/fdio/include \
 
 MODULE_HOST_LIBS := \
@@ -46,9 +48,8 @@ MODULE_HOST_LIBS := \
     system/ulib/pretty.hostlib \
     system/ulib/minfs.hostlib \
     system/ulib/fbl.hostlib \
+    system/ulib/fs.hostlib \
     system/ulib/digest.hostlib \
     system/uapp/blobfs.hostlib \
-
-MODULE_DEFINES += DISABLE_THREAD_ANNOTATIONS
 
 include make/module.mk

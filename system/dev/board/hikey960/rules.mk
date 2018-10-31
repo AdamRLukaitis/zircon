@@ -12,9 +12,10 @@ MODULE_SRCS += \
     $(LOCAL_DIR)/hikey960.c \
     $(LOCAL_DIR)/hikey960-devices.c \
     $(LOCAL_DIR)/hikey960-i2c.c \
+    $(LOCAL_DIR)/hikey960-usb.c \
 
 MODULE_STATIC_LIBS := \
-    system/dev/soc/hi3660 \
+    system/dev/lib/hi3660 \
     system/dev/gpio/pl061 \
     system/ulib/ddk \
     system/ulib/sync

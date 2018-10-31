@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include <inttypes.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -75,7 +76,7 @@ nbfile* netboot_get_buffer(const char* name, size_t size) {
 // Wait for a keypress from a set of valid keys. If 0 < timeout_s < INT_MAX, the
 // first key in the set of valid keys will be returned after timeout_s seconds
 // if no other valid key is pressed.
-char key_prompt(char* valid_keys, int timeout_s) {
+char key_prompt(const char* valid_keys, int timeout_s) {
     if (strlen(valid_keys) < 1) return 0;
     if (timeout_s <= 0) return valid_keys[0];
 
@@ -99,10 +100,10 @@ char key_prompt(char* valid_keys, int timeout_s) {
         return 0;
     }
 
-    int wait_idx = 0;
-    int key_idx = wait_idx;
+    size_t wait_idx = 0;
+    size_t key_idx = wait_idx;
     WaitList[wait_idx++] = gSys->ConIn->WaitForKey;
-    int timer_idx = wait_idx;  // timer should always be last
+    size_t timer_idx = wait_idx;  // timer should always be last
     WaitList[wait_idx++] = TimerEvent;
 
     bool cur_vis = gConOut->Mode->CursorVisible;
@@ -166,7 +167,7 @@ void do_select_fb() {
         printf("Choose a framebuffer mode or press (b) to return to the menu\n");
         char key = key_prompt("b0123456789", INT_MAX);
         if (key == 'b') break;
-        if (key - '0' >= max_mode) {
+        if ((uint32_t)(key - '0') >= max_mode) {
             printf("invalid mode: %c\n", key);
             continue;
         }
@@ -183,7 +184,7 @@ void do_select_fb() {
 }
 
 void do_bootmenu(bool have_fb) {
-    char* menukeys;
+    const char* menukeys;
     if (have_fb)
         menukeys = "rfx";
     else
@@ -332,6 +333,9 @@ static inline void swap_to_head(const char c, char* s, const size_t n) {
     s[i] = tmp;
 }
 
+size_t kernel_zone_size;
+efi_physical_addr kernel_zone_base;
+
 EFIAPI efi_status efi_main(efi_handle img, efi_system_table* sys) {
     xefi_init(img, sys);
     gConOut->ClearScreen(gConOut);
@@ -373,6 +377,23 @@ EFIAPI efi_status efi_main(efi_handle img, efi_system_table* sys) {
                gop->Mode->FrameBufferBase);
     }
 
+    // Set aside space for the kernel down at the 1MB mark up front
+    // to avoid other allocations getting in the way.
+    // The kernel itself is about 1MB, but we leave generous space
+    // for its BSS afterwards.
+    //
+    // Previously we requested 32MB but that caused issues. When the kernel
+    // becomes relocatable this won't be an problem. See ZX-2368.
+    kernel_zone_base = 0x100000;
+    kernel_zone_size = 6 * 1024 * 1024;
+
+    if (gBS->AllocatePages(AllocateAddress, EfiLoaderData,
+                          BYTES_TO_PAGES(kernel_zone_size), &kernel_zone_base)) {
+        printf("boot: cannot obtain memory for kernel @ %p\n", (void*) kernel_zone_base);
+        kernel_zone_size = 0;
+    }
+    printf("KALLOC DONE\n");
+
     // Default boot defaults to network
     const char* defboot = cmdline_get("bootloader.default", "network");
     const char* nodename = cmdline_get("zircon.nodename", "");
@@ -397,10 +418,11 @@ EFIAPI efi_status efi_main(efi_handle img, efi_system_table* sys) {
     printf("\n\n");
     print_cmdline();
 
-    // First look for a self-contained zirconboot image
+    // First look for a self-contained zircon boot image
     size_t zedboot_size = 0;
-    void* zedboot_kernel = xefi_load_file(L"zedboot.bin", &zedboot_size, 0);
+    void* zedboot_kernel = NULL;
 
+    zedboot_kernel = xefi_load_file(L"zedboot.bin", &zedboot_size, 0);
     switch (identify_image(zedboot_kernel, zedboot_size)) {
     case IMAGE_COMBO:
         printf("zedboot.bin is a valid kernel+ramdisk combo image\n");
@@ -415,24 +437,31 @@ EFIAPI efi_status efi_main(efi_handle img, efi_system_table* sys) {
     // Look for a kernel image on disk
     size_t ksz = 0;
     unsigned ktype = IMAGE_INVALID;
-    void* kernel = xefi_load_file(L"zircon.bin", &ksz, 0);
+    void* kernel = NULL;
 
-    switch ((ktype = identify_image(kernel, ksz))) {
-    case IMAGE_EMPTY:
-        break;
-    case IMAGE_KERNEL:
-        printf("zircon.bin is a kernel image\n");
-        break;
-    case IMAGE_COMBO:
-        printf("zircon.bin is a kernel+ramdisk combo image\n");
-        break;
-    case IMAGE_RAMDISK:
-        printf("zircon.bin is a ramdisk?!\n");
-    case IMAGE_INVALID:
-        printf("zircon.bin is not a valid kernel or combo image\n");
-        ktype = IMAGE_INVALID;
-        ksz = 0;
-        kernel = NULL;
+    kernel = image_load_from_disk(img, sys, &ksz);
+    if (kernel != NULL) {
+        printf("zircon image loaded from zircon partition\n");
+        ktype = IMAGE_COMBO;
+    } else {
+        kernel = xefi_load_file(L"zircon.bin", &ksz, 0);
+        switch ((ktype = identify_image(kernel, ksz))) {
+        case IMAGE_EMPTY:
+            break;
+        case IMAGE_KERNEL:
+            printf("zircon.bin is a kernel image\n");
+            break;
+        case IMAGE_COMBO:
+            printf("zircon.bin is a kernel+ramdisk combo image\n");
+            break;
+        case IMAGE_RAMDISK:
+            printf("zircon.bin is a ramdisk?!\n");
+        case IMAGE_INVALID:
+            printf("zircon.bin is not a valid kernel or combo image\n");
+            ktype = IMAGE_INVALID;
+            ksz = 0;
+            kernel = NULL;
+        }
     }
 
     if (!have_network && zedboot_kernel == NULL && kernel == NULL) {
@@ -441,7 +470,7 @@ EFIAPI efi_status efi_main(efi_handle img, efi_system_table* sys) {
 
     char valid_keys[5];
     memset(valid_keys, 0, sizeof(valid_keys));
-    int key_idx = 0;
+    size_t key_idx = 0;
 
     if (have_network) {
         valid_keys[key_idx++] = 'n';

@@ -13,32 +13,46 @@ MODULE_TYPE := userapp
 MODULE_GROUP := core
 
 MODULE_SRCS += \
-    $(LOCAL_DIR)/devhost-shared.c \
-    $(LOCAL_DIR)/devmgr.c \
-    $(LOCAL_DIR)/devmgr-binding.c \
-    $(LOCAL_DIR)/devmgr-coordinator.c \
-    $(LOCAL_DIR)/devmgr-devfs.c \
-    $(LOCAL_DIR)/devmgr-drivers.c \
-    $(LOCAL_DIR)/devmgr-fdio.c
+    $(LOCAL_DIR)/bootfs.cpp \
+    $(LOCAL_DIR)/devhost-shared.cpp \
+    $(LOCAL_DIR)/devmgr.cpp \
+    $(LOCAL_DIR)/devmgr-binding.cpp \
+    $(LOCAL_DIR)/devmgr-coordinator.cpp \
+    $(LOCAL_DIR)/devmgr-devfs.cpp \
+    $(LOCAL_DIR)/devmgr-drivers.cpp \
+    $(LOCAL_DIR)/devmgr-fdio.cpp
 
 # userboot supports loading via the dynamic linker, so libc (system/ulib/c)
 # can be linked dynamically.  But it doesn't support any means to look
 # up other shared libraries, so everything else must be linked statically.
 
+# We can avoid the fuchsia.crash dependency if crashsvc connects directly to the
+# analyzer.
+MODULE_FIDL_LIBS := \
+    system/fidl/fuchsia-crash \
+    system/fidl/fuchsia-io \
+    system/fidl/fuchsia-mem \
+
 # ddk is needed only for ddk/device.h
 MODULE_HEADER_DEPS := \
-    system/ulib/ddk
+    system/ulib/ddk \
+    system/ulib/zircon-internal
 
 MODULE_STATIC_LIBS := \
     system/ulib/fidl \
-    system/ulib/gpt \
     system/ulib/bootdata \
     system/ulib/loader-service \
-    system/ulib/memfs \
+    system/ulib/async \
     system/ulib/async-loop \
+    system/ulib/sync \
     third_party/ulib/lz4 \
     system/ulib/port \
     system/ulib/driver-info \
+    system/ulib/memfs \
+    system/ulib/fs \
+    system/ulib/fbl \
+    system/ulib/zx \
+    system/ulib/zxcpp \
 
 MODULE_LIBS := \
     system/ulib/async.default \
@@ -59,12 +73,14 @@ MODULE_TYPE := userapp
 MODULE_GROUP := core
 
 MODULE_SRCS := \
-    $(LOCAL_DIR)/block-watcher.c \
-    $(LOCAL_DIR)/devmgr-fdio.c \
-    $(LOCAL_DIR)/fshost.c \
+    $(LOCAL_DIR)/bootfs.cpp \
+    $(LOCAL_DIR)/block-watcher.cpp \
+    $(LOCAL_DIR)/devmgr-fdio.cpp \
+    $(LOCAL_DIR)/fshost.cpp \
     $(LOCAL_DIR)/vfs-rpc.cpp
 
 MODULE_STATIC_LIBS := \
+    system/ulib/memfs.cpp \
     system/ulib/memfs \
     system/ulib/fs \
     system/ulib/loader-service \
@@ -75,9 +91,11 @@ MODULE_STATIC_LIBS := \
     system/ulib/bootdata \
     system/ulib/fbl \
     system/ulib/gpt \
+    system/ulib/sync \
     system/ulib/trace \
     system/ulib/zx \
     system/ulib/zxcpp \
+    third_party/ulib/cksum \
     third_party/ulib/lz4 \
 
 MODULE_LIBS := \
@@ -88,6 +106,9 @@ MODULE_LIBS := \
     system/ulib/trace-engine \
     system/ulib/zircon \
     system/ulib/c
+
+MODULE_FIDL_LIBS := \
+    system/fidl/fuchsia-io \
 
 include make/module.mk
 
@@ -116,7 +137,7 @@ MODULE_TYPE := userapp
 MODULE_GROUP := core
 
 MODULE_SRCS := \
-	$(LOCAL_DIR)/devhost-main.c
+	$(LOCAL_DIR)/devhost-main.cpp
 
 MODULE_LIBS := system/ulib/driver system/ulib/fdio system/ulib/c
 
@@ -132,11 +153,11 @@ MODULE_TYPE := driver
 MODULE_NAME := dmctl
 
 MODULE_SRCS := \
-	$(LOCAL_DIR)/dmctl.c \
-	$(LOCAL_DIR)/devhost-shared.c \
+	$(LOCAL_DIR)/dmctl.cpp \
+	$(LOCAL_DIR)/devhost-shared.cpp \
 
-MODULE_STATIC_LIBS := system/ulib/ddk system/ulib/port
+MODULE_STATIC_LIBS := system/ulib/ddk system/ulib/port system/ulib/fbl system/ulib/zx
 
-MODULE_LIBS := system/ulib/driver system/ulib/launchpad system/ulib/fdio system/ulib/zircon system/ulib/c
+MODULE_LIBS := system/ulib/driver system/ulib/zircon system/ulib/c
 
 include make/module.mk

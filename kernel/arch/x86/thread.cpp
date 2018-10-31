@@ -23,15 +23,15 @@
 
 void arch_thread_initialize(thread_t* t, vaddr_t entry_point) {
     // create a default stack frame on the stack
-    vaddr_t stack_top = (vaddr_t)t->stack + t->stack_size;
+    vaddr_t stack_top = t->stack.top;
 
     // make sure the top of the stack is 16 byte aligned for ABI compliance
     stack_top = ROUNDDOWN(stack_top, 16);
-    t->stack_top = stack_top;
+    t->stack.top = stack_top;
 
     // make sure we start the frame 8 byte unaligned (relative to the 16 byte alignment) because
     // of the way the context switch will pop the return address off the stack. After the first
-    // context switch, this leaves the stack in unaligned relative to how a called function expects it.
+    // context switch, this leaves the stack unaligned relative to how a called function expects it.
     stack_top -= 8;
     struct x86_64_context_switch_frame* frame = (struct x86_64_context_switch_frame*)(stack_top);
 
@@ -58,12 +58,20 @@ void arch_thread_initialize(thread_t* t, vaddr_t entry_point) {
     t->arch.sp = (vaddr_t)frame;
 #if __has_feature(safe_stack)
     t->arch.unsafe_sp =
-        ROUNDDOWN((vaddr_t)t->unsafe_stack + t->stack_size, 16);
+        ROUNDDOWN(t->stack.unsafe_base + t->stack.size, 16);
 #endif
 
     // initialize the fs, gs and kernel bases to 0.
     t->arch.fs_base = 0;
     t->arch.gs_base = 0;
+
+    // Initialize the debug registers to 0.
+    t->arch.track_debug_state = false;
+    for (size_t i = 0; i < 4; i++) {
+      t->arch.debug_state.dr[i] = 0;
+    }
+    t->arch.debug_state.dr6 = ~X86_DR6_USER_MASK;
+    t->arch.debug_state.dr7 = ~X86_DR7_USER_MASK;
 }
 
 void arch_thread_construct_first(thread_t* t) {
@@ -85,13 +93,16 @@ void* arch_thread_get_blocked_fp(struct thread* t) {
     return (void*)frame->rbp;
 }
 
-__NO_SAFESTACK __attribute__((target("fsgsbase"))) void arch_context_switch(thread_t* oldthread, thread_t* newthread) {
+__NO_SAFESTACK __attribute__((target("fsgsbase")))
+void arch_context_switch(thread_t* oldthread, thread_t* newthread) {
     x86_extended_register_context_switch(oldthread, newthread);
+
+    x86_debug_state_context_switch(oldthread, newthread);
 
     //printf("cs 0x%llx\n", kstack_top);
 
     /* set the tss SP0 value to point at the top of our stack */
-    x86_set_tss_sp(newthread->stack_top);
+    x86_set_tss_sp(newthread->stack.top);
 
     /* Save the user fs_base register value.  The new rdfsbase instruction
      * is much faster than reading the MSR, so use the former in
@@ -152,4 +163,18 @@ __NO_SAFESTACK __attribute__((target("fsgsbase"))) void arch_context_switch(thre
 #endif
 
     x86_64_context_switch(&oldthread->arch.sp, newthread->arch.sp);
+}
+
+void x86_debug_state_context_switch(thread_t *old_thread, thread_t *new_thread) {
+    // If the new thread has debug state, so we install it, replacing the current contents.
+    if (unlikely(new_thread->arch.track_debug_state)) {
+      x86_write_hw_debug_regs(&new_thread->arch.debug_state);
+      return;
+    }
+
+    // If the old thread had debug state running and the new one doesn't uses it, disable the
+    // debug capabilities.
+    if (unlikely(old_thread->arch.track_debug_state)) {
+      x86_disable_debug_state();
+    }
 }

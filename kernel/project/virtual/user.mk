@@ -17,9 +17,10 @@ MODULES += \
     kernel/object \
     kernel/syscalls \
 
-# include all core, dev, uapp, ulib and utest from system/...
+# include all core, dev, fidl, uapp, ulib and utest from system/...
 MODULES += $(patsubst %/rules.mk,%,$(wildcard system/core/*/rules.mk))
 MODULES += $(patsubst %/rules.mk,%,$(wildcard system/dev/*/*/rules.mk))
+MODULES += $(patsubst %/rules.mk,%,$(wildcard system/fidl/*/rules.mk))
 MODULES += $(patsubst %/rules.mk,%,$(wildcard system/uapp/*/rules.mk))
 MODULES += $(patsubst %/rules.mk,%,$(wildcard system/ulib/*/rules.mk))
 ifeq ($(call TOBOOL,$(DISABLE_UTEST)),false)
@@ -28,10 +29,8 @@ endif
 
 # include all uapp, udev, ulib and utest from third_party/...
 MODULES += $(patsubst %/rules.mk,%,$(wildcard third_party/uapp/*/rules.mk))
-MODULES += $(patsubst %/rules.mk,%,$(wildcard third_party/udev/*/rules.mk))
+MODULES += $(patsubst %/rules.mk,%,$(wildcard third_party/dev/*/*/rules.mk))
 MODULES += $(patsubst %/rules.mk,%,$(wildcard third_party/ulib/*/rules.mk))
 ifeq ($(call TOBOOL,$(DISABLE_UTEST)),false)
 MODULES += $(patsubst %/rules.mk,%,$(wildcard third_party/utest/*/rules.mk))
 endif
-
-EXTRA_BUILDDEPS += $(USER_BOOTDATA)

@@ -9,6 +9,7 @@
 #include <trace.h>
 
 #include <kernel/event.h>
+#include <kernel/lockdep.h>
 #include <kernel/thread.h>
 #include <platform.h>
 
@@ -20,15 +21,12 @@
 #include <object/process_dispatcher.h>
 #include <object/wait_state_observer.h>
 
-#include <fbl/auto_lock.h>
 #include <fbl/inline_array.h>
 #include <fbl/ref_ptr.h>
 
 #include <zircon/types.h>
 
 #include "priv.h"
-
-using fbl::AutoLock;
 
 #define LOCAL_TRACE 0
 
@@ -38,6 +36,7 @@ constexpr uint32_t kMaxWaitHandleCount = 16u;
 // ensure public headers agree
 static_assert(ZX_WAIT_MANY_MAX_ITEMS == kMaxWaitHandleCount, "");
 
+// zx_status_t zx_object_wait_one
 zx_status_t sys_object_wait_one(zx_handle_t handle_value,
                                 zx_signals_t signals,
                                 zx_time_t deadline,
@@ -51,7 +50,7 @@ zx_status_t sys_object_wait_one(zx_handle_t handle_value,
 
     auto up = ProcessDispatcher::GetCurrent();
     {
-        AutoLock lock(up->handle_table_lock());
+        Guard<fbl::Mutex> guard{up->handle_table_lock()};
 
         Handle* handle = up->GetHandleLocked(handle_value);
         if (!handle)
@@ -64,23 +63,22 @@ zx_status_t sys_object_wait_one(zx_handle_t handle_value,
             return result;
     }
 
-#if WITH_LIB_KTRACE
     auto koid = static_cast<uint32_t>(up->GetKoidForHandle(handle_value));
     ktrace(TAG_WAIT_ONE, koid, signals, (uint32_t)deadline, (uint32_t)(deadline >> 32));
-#endif
 
     // event_wait() will return ZX_OK if already signaled,
     // even if the deadline has passed.  It will return ZX_ERR_TIMED_OUT
     // after the deadline passes if the event has not been
     // signaled.
-    result = event.Wait(deadline);
+    {
+        ThreadDispatcher::AutoBlocked by(ThreadDispatcher::Blocked::WAIT_ONE);
+        result = event.Wait(deadline);
+    }
 
     // Regardless of wait outcome, we must call End().
     auto signals_state = wait_state_observer.End();
 
-#if WITH_LIB_KTRACE
     ktrace(TAG_WAIT_ONE_DONE, koid, signals_state, result, 0);
-#endif
 
     if (observed) {
         zx_status_t status = observed.copy_to_user(signals_state);
@@ -94,8 +92,9 @@ zx_status_t sys_object_wait_one(zx_handle_t handle_value,
     return result;
 }
 
-zx_status_t sys_object_wait_many(user_inout_ptr<zx_wait_item_t> user_items, uint32_t count, zx_time_t deadline) {
-    LTRACEF("count %u\n", count);
+// zx_status_t zx_object_wait_many
+zx_status_t sys_object_wait_many(user_inout_ptr<zx_wait_item_t> user_items, size_t count, zx_time_t deadline) {
+    LTRACEF("count %zu\n", count);
 
     if (!count) {
         zx_status_t result = thread_sleep_etc(deadline, /*interruptable=*/true);
@@ -119,7 +118,7 @@ zx_status_t sys_object_wait_many(user_inout_ptr<zx_wait_item_t> user_items, uint
     size_t num_added = 0;
     {
         auto up = ProcessDispatcher::GetCurrent();
-        AutoLock lock(up->handle_table_lock());
+        Guard<fbl::Mutex> guard{up->handle_table_lock()};
 
         for (; num_added != count; ++num_added) {
             Handle* handle = up->GetHandleLocked(items[num_added].handle);
@@ -147,7 +146,10 @@ zx_status_t sys_object_wait_many(user_inout_ptr<zx_wait_item_t> user_items, uint
     // even if deadline has passed.  It will return ZX_ERR_TIMED_OUT
     // after the deadline passes if the event has not been
     // signaled.
-    result = event.Wait(deadline);
+    {
+        ThreadDispatcher::AutoBlocked by(ThreadDispatcher::Blocked::WAIT_MANY);
+        result = event.Wait(deadline);
+    }
 
     // Regardless of wait outcome, we must call End().
     zx_signals_t combined = 0;
@@ -164,6 +166,7 @@ zx_status_t sys_object_wait_many(user_inout_ptr<zx_wait_item_t> user_items, uint
     return result;
 }
 
+// zx_status_t zx_object_wait_async
 zx_status_t sys_object_wait_async(zx_handle_t handle_value, zx_handle_t port_handle,
                                   uint64_t key, zx_signals_t signals, uint32_t options) {
     LTRACEF("handle %x\n", handle_value);
@@ -176,7 +179,7 @@ zx_status_t sys_object_wait_async(zx_handle_t handle_value, zx_handle_t port_han
         return status;
 
     {
-        AutoLock lock(up->handle_table_lock());
+        Guard<fbl::Mutex> guard{up->handle_table_lock()};
         Handle* handle = up->GetHandleLocked(handle_value);
         if (!handle)
             return ZX_ERR_BAD_HANDLE;

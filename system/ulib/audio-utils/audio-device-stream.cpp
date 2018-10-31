@@ -5,22 +5,24 @@
 #include <audio-utils/audio-device-stream.h>
 #include <audio-utils/audio-input.h>
 #include <audio-utils/audio-output.h>
+#include <fbl/algorithm.h>
+#include <fbl/auto_call.h>
+#include <fbl/limits.h>
 #include <fcntl.h>
 #include <inttypes.h>
-#include <zircon/assert.h>
-#include <zircon/device/audio.h>
-#include <zircon/process.h>
-#include <zircon/syscalls.h>
+#include <lib/fdio/io.h>
 #include <lib/zx/channel.h>
 #include <lib/zx/handle.h>
 #include <lib/zx/vmar.h>
 #include <lib/zx/vmo.h>
-#include <fbl/algorithm.h>
-#include <fbl/auto_call.h>
-#include <fbl/limits.h>
-#include <fdio/io.h>
 #include <stdio.h>
 #include <string.h>
+#include <zircon/assert.h>
+#include <zircon/device/audio.h>
+#include <zircon/process.h>
+#include <zircon/syscalls.h>
+#include <zircon/time.h>
+#include <zircon/types.h>
 
 namespace audio {
 namespace utils {
@@ -46,19 +48,11 @@ zx_status_t DoCallImpl(const zx::channel& channel,
     args.rd_num_handles = resp_handle_out ? 1 : 0;
 
     uint32_t bytes, handles;
-    zx_status_t read_status, write_status;
 
-    write_status = channel.call(0, zx::deadline_after(CALL_TIMEOUT), &args, &bytes, &handles,
-                                &read_status);
-
-    if (write_status != ZX_OK) {
-        if (write_status == ZX_ERR_CALL_FAILED) {
-            printf("Cmd read failure (cmd %04x, res %d)\n", req.hdr.cmd, read_status);
-            return read_status;
-        } else {
-            printf("Cmd write failure (cmd %04x, res %d)\n", req.hdr.cmd, write_status);
-            return write_status;
-        }
+    zx_status_t status = channel.call(0, zx::deadline_after(CALL_TIMEOUT), &args, &bytes, &handles);
+    if (status != ZX_OK) {
+        printf("Cmd failure (cmd %04x, res %d)\n", req.hdr.cmd, status);
+        return status;
     }
 
     // If the caller wants to know the size of the response length, let them
@@ -271,6 +265,25 @@ zx_status_t AudioDeviceStream::SetMute(bool mute) {
     return res;
 }
 
+zx_status_t AudioDeviceStream::SetAgc(bool enabled) {
+    audio_stream_cmd_set_gain_req  req;
+    audio_stream_cmd_set_gain_resp resp;
+
+    req.hdr.cmd = AUDIO_STREAM_CMD_SET_GAIN;
+    req.hdr.transaction_id = 1;
+    req.flags = enabled
+              ? static_cast<audio_set_gain_flags_t>(AUDIO_SGF_AGC_VALID | AUDIO_SGF_AGC)
+              : AUDIO_SGF_AGC_VALID;
+
+    zx_status_t res = DoCall(stream_ch_, req, &resp);
+    if (res != ZX_OK)
+        printf("Failed to %sable AGC for stream! (res %d)\n", enabled ? "en" : "dis", res);
+    else
+        printf("Stream AGC is now %sabled\n", enabled ? "en" : "dis");
+
+    return res;
+}
+
 zx_status_t AudioDeviceStream::SetGain(float gain) {
     audio_stream_cmd_set_gain_req  req;
     audio_stream_cmd_set_gain_resp resp;
@@ -302,6 +315,30 @@ zx_status_t AudioDeviceStream::GetGain(audio_stream_cmd_get_gain_resp_t* out_gai
     return DoNoFailCall(stream_ch_, req, out_gain);
 }
 
+zx_status_t AudioDeviceStream::GetUniqueId(audio_stream_cmd_get_unique_id_resp_t* out_id) const {
+    if (out_id == nullptr)
+        return ZX_ERR_INVALID_ARGS;
+
+    audio_stream_cmd_get_unique_id_req req;
+    req.hdr.cmd = AUDIO_STREAM_CMD_GET_UNIQUE_ID;
+    req.hdr.transaction_id = 1;
+
+    return DoNoFailCall(stream_ch_, req, out_id);
+}
+
+zx_status_t AudioDeviceStream::GetString(audio_stream_string_id_t id,
+                                         audio_stream_cmd_get_string_resp_t* out_str) const {
+    if (out_str == nullptr)
+        return ZX_ERR_INVALID_ARGS;
+
+    audio_stream_cmd_get_string_req req;
+    req.hdr.cmd = AUDIO_STREAM_CMD_GET_STRING;
+    req.hdr.transaction_id = 1;
+    req.id = id;
+
+    return DoNoFailCall(stream_ch_, req, out_str);
+}
+
 zx_status_t AudioDeviceStream::PlugMonitor(float duration) {
     zx_time_t deadline = zx_deadline_after(ZX_SEC(static_cast<double>(duration)));
     audio_stream_cmd_plug_detect_resp resp;
@@ -323,7 +360,8 @@ zx_status_t AudioDeviceStream::PlugMonitor(float duration) {
                                                                zx_time_t plug_time) {
         printf("Plug State now : %s (%.3lf sec since last change).\n",
                plug_state ? "plugged" : "unplugged",
-               static_cast<double>(plug_time - last_plug_time) / ZX_SEC(1));
+               static_cast<double>(zx_time_sub_time(plug_time, last_plug_time)) /
+                   static_cast<double>(ZX_SEC(1)));
 
         last_plug_state = plug_state;
         last_plug_time  = plug_time;
@@ -376,11 +414,11 @@ zx_status_t AudioDeviceStream::PlugMonitor(float duration) {
                 duration);
 
         while (true) {
-            zx_time_t now = zx_clock_get(ZX_CLOCK_MONOTONIC);
+            zx_time_t now = zx_clock_get_monotonic();
             if (now >= deadline)
                 break;
 
-            zx_time_t next_wake = fbl::min(deadline, now + ZX_MSEC(100u));
+            zx_time_t next_wake = fbl::min(deadline, zx_time_add_duration(now, ZX_MSEC(100u)));
 
             zx_signals_t sigs;
             zx_status_t res = stream_ch_.wait_one(ZX_CHANNEL_PEER_CLOSED, zx::time(next_wake), &sigs);
@@ -535,9 +573,9 @@ zx_status_t AudioDeviceStream::GetBuffer(uint32_t frames, uint32_t irqs_per_ring
     // Map the VMO into our address space
     // TODO(johngro) : How do I specify the cache policy for this mapping?
     uint32_t flags = input_
-                   ? ZX_VM_FLAG_PERM_READ
-                   : ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE;
-    res = zx::vmar::root_self().map(0u, rb_vmo_,
+                   ? ZX_VM_PERM_READ
+                   : ZX_VM_PERM_READ | ZX_VM_PERM_WRITE;
+    res = zx::vmar::root_self()->map(0u, rb_vmo_,
                                     0u, rb_sz_,
                                     flags, reinterpret_cast<uintptr_t*>(&rb_virt_));
 
@@ -591,7 +629,7 @@ zx_status_t AudioDeviceStream::StopRingBuffer() {
 void AudioDeviceStream::ResetRingBuffer() {
     if (rb_virt_ != nullptr) {
         ZX_DEBUG_ASSERT(rb_sz_ != 0);
-        zx::vmar::root_self().unmap(reinterpret_cast<uintptr_t>(rb_virt_), rb_sz_);
+        zx::vmar::root_self()->unmap(reinterpret_cast<uintptr_t>(rb_virt_), rb_sz_);
     }
     rb_ch_.reset();
     rb_vmo_.reset();

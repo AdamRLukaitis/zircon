@@ -9,16 +9,21 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <fbl/algorithm.h>
 #include <fbl/alloc_checker.h>
 #include <fbl/auto_call.h>
 #include <fbl/type_support.h>
 #include <fbl/unique_fd.h>
 #include <fbl/unique_ptr.h>
-#include <fdio/limits.h>
-#include <fdio/util.h>
-#include <fdio/vfs.h>
 #include <fs/client.h>
+#include <fuchsia/io/c/fidl.h>
+#include <lib/fdio/limits.h>
+#include <lib/fdio/util.h>
+#include <lib/fdio/vfs.h>
+#include <lib/fzl/fdio.h>
+#include <lib/zx/channel.h>
 #include <zircon/compiler.h>
+#include <zircon/device/block.h>
 #include <zircon/device/vfs.h>
 #include <zircon/processargs.h>
 #include <zircon/syscalls.h>
@@ -26,6 +31,18 @@
 namespace {
 
 using fbl::unique_fd;
+
+zx_status_t MountFs(int fd, zx_handle_t root) {
+    zx_status_t status;
+    fzl::FdioCaller caller(fbl::move(fbl::unique_fd(fd)));
+    zx_status_t io_status = fuchsia_io_DirectoryAdminMount(caller.borrow_channel(),
+                                                           root, &status);
+    caller.release().release();
+    if (io_status != ZX_OK) {
+        return io_status;
+    }
+    return status;
+}
 
 void UnmountHandle(zx_handle_t root, bool wait_until_ready) {
     // We've entered a failure case where the filesystem process (which may or may not be alive)
@@ -51,20 +68,20 @@ public:
                       LaunchCallback cb);
 
     DISALLOW_COPY_AND_ASSIGN_ALLOW_MOVE(Mounter);
+
 private:
     zx_status_t PrepareHandles(unique_fd device);
     zx_status_t MakeDirAndMount(const mount_options_t& options);
-    zx_status_t LaunchAndMount(LaunchCallback cb, const mount_options_t& options,
-                               const char** argv, int argc);
-    zx_status_t MountNativeFs(const char* binary, unique_fd device,
-                              const mount_options_t& options, LaunchCallback cb);
-    zx_status_t MountFat(unique_fd device, const mount_options_t& options,
-                         LaunchCallback cb);
+    zx_status_t LaunchAndMount(LaunchCallback cb, const mount_options_t& options, const char** argv,
+                               int argc);
+    zx_status_t MountNativeFs(const char* binary, unique_fd device, const mount_options_t& options,
+                              LaunchCallback cb);
+    zx_status_t MountFat(unique_fd device, const mount_options_t& options, LaunchCallback cb);
 
     zx_handle_t root_ = ZX_HANDLE_INVALID;
     const char* path_;
     int fd_;
-    uint32_t flags_ = 0;  // Currently not used.
+    uint32_t flags_ = 0; // Currently not used.
     size_t num_handles_ = 0;
     zx_handle_t handles_[FDIO_MAX_HANDLES * 2];
     uint32_t ids_[FDIO_MAX_HANDLES * 2];
@@ -96,16 +113,15 @@ zx_status_t Mounter::PrepareHandles(unique_fd device) {
 }
 
 zx_status_t Mounter::MakeDirAndMount(const mount_options_t& options) {
-    auto cleanup = fbl::MakeAutoCall([this, options]() {
-        UnmountHandle(root_, options.wait_until_ready);
-    });
+    auto cleanup =
+        fbl::MakeAutoCall([this, options]() { UnmountHandle(root_, options.wait_until_ready); });
 
     // Open the parent path as O_ADMIN, and sent the mkdir+mount command
     // to that directory.
     char parent_path[PATH_MAX];
     const char* name;
     strcpy(parent_path, path_);
-    char *last_slash = strrchr(parent_path, '/');
+    char* last_slash = strrchr(parent_path, '/');
     if (last_slash == NULL) {
         strcpy(parent_path, ".");
         name = path_;
@@ -122,29 +138,23 @@ zx_status_t Mounter::MakeDirAndMount(const mount_options_t& options) {
         return ZX_ERR_IO;
     }
 
-    size_t config_size = sizeof(mount_mkdir_config_t) + strlen(name) + 1;
-    fbl::AllocChecker checker;
-    fbl::unique_ptr<char[]> config_buffer(new(&checker) char[config_size]);
-    mount_mkdir_config_t* config = reinterpret_cast<mount_mkdir_config_t*>(config_buffer.get());
-    if (!checker.check()) {
-        return ZX_ERR_NO_MEMORY;
-    }
-    config->fs_root = root_;
-    config->flags = flags_;
-    strcpy(config->name, name);
-
     cleanup.cancel();
 
-    // Ioctl will close root for us if an error occurs
-    return static_cast<zx_status_t>(ioctl_vfs_mount_mkdir_fs(parent.get(), config, config_size));
+    zx_status_t status;
+    fzl::FdioCaller caller(fbl::move(parent));
+    zx_status_t io_status = fuchsia_io_DirectoryAdminMountAndCreate(
+            caller.borrow_channel(), root_, name, strlen(name), flags_, &status);
+    if (io_status != ZX_OK) {
+        return io_status;
+    }
+    return status;
 }
 
 // Calls the 'launch callback' and mounts the remote handle to the target vnode, if successful.
 zx_status_t Mounter::LaunchAndMount(LaunchCallback cb, const mount_options_t& options,
                                     const char** argv, int argc) {
-    auto cleanup = fbl::MakeAutoCall([this, options]() {
-        UnmountHandle(root_, options.wait_until_ready);
-    });
+    auto cleanup =
+        fbl::MakeAutoCall([this, options]() { UnmountHandle(root_, options.wait_until_ready); });
 
     zx_status_t status = cb(argc, argv, handles_, ids_, num_handles_);
     if (status != ZX_OK) {
@@ -167,8 +177,7 @@ zx_status_t Mounter::LaunchAndMount(LaunchCallback cb, const mount_options_t& op
     if (options.create_mountpoint) {
         return MakeDirAndMount(options);
     }
-    // Ioctl will close root for us if an error occurs
-    return static_cast<zx_status_t>(ioctl_vfs_mount_fs(fd_, &root_));
+    return MountFs(fd_, root_);
 }
 
 zx_status_t Mounter::MountNativeFs(const char* binary, unique_fd device,
@@ -198,12 +207,14 @@ zx_status_t Mounter::MountNativeFs(const char* binary, unique_fd device,
     if (options.collect_metrics) {
         argv[argc++] = "--metrics";
     }
+    if (options.enable_journal) {
+        argv[argc++] = "--journal";
+    }
     argv[argc++] = "mount";
     return LaunchAndMount(cb, options, argv, argc);
 }
 
-zx_status_t Mounter::MountFat(unique_fd device, const mount_options_t& options,
-                              LaunchCallback cb) {
+zx_status_t Mounter::MountFat(unique_fd device, const mount_options_t& options, LaunchCallback cb) {
     zx_status_t status = PrepareHandles(fbl::move(device));
     if (status != ZX_OK) {
         return status;
@@ -224,11 +235,11 @@ zx_status_t Mounter::MountFat(unique_fd device, const mount_options_t& options,
         blockfd_arg,
         "mount",
     };
-    return LaunchAndMount(cb, options, argv, countof(argv));
+    return LaunchAndMount(cb, options, argv, fbl::count_of(argv));
 }
 
-zx_status_t Mounter::Mount(unique_fd device, disk_format_t format,
-                           const mount_options_t& options, LaunchCallback cb) {
+zx_status_t Mounter::Mount(unique_fd device, disk_format_t format, const mount_options_t& options,
+                           LaunchCallback cb) {
     switch (format) {
     case DISK_FORMAT_MINFS:
         return MountNativeFs("/boot/bin/minfs", fbl::move(device), options, cb);
@@ -241,17 +252,59 @@ zx_status_t Mounter::Mount(unique_fd device, disk_format_t format,
     }
 }
 
-}  // namespace
+} // namespace
+
+const mount_options_t default_mount_options = {
+    .readonly = false,
+    .verbose_mount = false,
+    .collect_metrics = false,
+    .wait_until_ready = true,
+    .create_mountpoint = false,
+    .enable_journal = false,
+};
+
+const mkfs_options_t default_mkfs_options = {
+    .fvm_data_slices = 1,
+    .verbose = false,
+};
+
+const fsck_options_t default_fsck_options = {
+    .verbose = false,
+    .never_modify = false,
+    .always_modify = false,
+    .force = false,
+};
 
 disk_format_t detect_disk_format(int fd) {
-    uint8_t data[HEADER_SIZE];
-    if (read(fd, data, sizeof(data)) != sizeof(data)) {
-        fprintf(stderr, "Error reading block device\n");
+    if (lseek(fd, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "detect_disk_format: Cannot seek to start of device.\n");
+        return DISK_FORMAT_UNKNOWN;
+    }
+
+    block_info_t info;
+    ssize_t r;
+    if ((r = ioctl_block_get_info(fd, &info)) < 0) {
+        fprintf(stderr, "detect_disk_format: Could not acquire block device info\n");
+        return DISK_FORMAT_UNKNOWN;
+    }
+
+    // We expect to read HEADER_SIZE bytes, but we may need to read
+    // extra to read a multiple of the underlying block size.
+    const size_t buffer_size = fbl::round_up(static_cast<size_t>(HEADER_SIZE),
+                                             static_cast<size_t>(info.block_size));
+
+    uint8_t data[buffer_size];
+    if (read(fd, data, buffer_size) != static_cast<ssize_t>(buffer_size)) {
+        fprintf(stderr, "detect_disk_format: Error reading block device.\n");
         return DISK_FORMAT_UNKNOWN;
     }
 
     if (!memcmp(data, fvm_magic, sizeof(fvm_magic))) {
         return DISK_FORMAT_FVM;
+    }
+
+    if (!memcmp(data, zxcrypt_magic, sizeof(zxcrypt_magic))) {
+        return DISK_FORMAT_ZXCRYPT;
     }
 
     if (!memcmp(data + 0x200, gpt_magic, sizeof(gpt_magic))) {
@@ -278,8 +331,8 @@ disk_format_t detect_disk_format(int fd) {
     return DISK_FORMAT_UNKNOWN;
 }
 
-zx_status_t fmount(int device_fd, int mount_fd, disk_format_t df,
-                   const mount_options_t* options, LaunchCallback cb) {
+zx_status_t fmount(int device_fd, int mount_fd, disk_format_t df, const mount_options_t* options,
+                   LaunchCallback cb) {
     Mounter mounter(mount_fd);
     return mounter.Mount(unique_fd(device_fd), df, *options, cb);
 }
@@ -301,13 +354,19 @@ zx_status_t mount(int device_fd, const char* mount_path, disk_format_t df,
 
 zx_status_t fumount(int mount_fd) {
     zx_handle_t h;
-    zx_status_t status = static_cast<zx_status_t>(ioctl_vfs_unmount_node(mount_fd, &h));
-    if (status < 0) {
-        fprintf(stderr, "Could not unmount filesystem: %d\n", status);
-    } else {
-        status = vfs_unmount_handle(h, ZX_TIME_INFINITE);
+    zx_status_t status;
+    fzl::FdioCaller caller(fbl::move(fbl::unique_fd(mount_fd)));
+    zx_status_t io_status = fuchsia_io_DirectoryAdminUnmountNode(caller.borrow_channel(),
+                                                                 &status, &h);
+    caller.release().release();
+    if (io_status != ZX_OK) {
+        return io_status;
     }
-    return status;
+    zx::channel c(h);
+    if (status != ZX_OK) {
+        return status;
+    }
+    return vfs_unmount_handle(c.release(), ZX_TIME_INFINITE);
 }
 
 zx_status_t umount(const char* mount_path) {

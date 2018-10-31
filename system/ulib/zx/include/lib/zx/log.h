@@ -26,7 +26,7 @@ public:
         return *this;
     }
 
-    static zx_status_t create(log* result, uint32_t flags);
+    static zx_status_t create(uint32_t flags, log* result);
 
     zx_status_t write(uint32_t len, const void* buffer, uint32_t flags) const {
         return zx_log_write(get(), len, buffer, flags);
@@ -37,6 +37,6 @@ public:
     }
 };
 
-using unowned_log = const unowned<log>;
+using unowned_log = unowned<log>;
 
 } // namespace zx

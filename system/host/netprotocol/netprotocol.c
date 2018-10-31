@@ -46,19 +46,12 @@ static struct timeval netboot_timeout_init(int msec) {
     return end_tv;
 }
 
-static int netboot_timeout_get_msec(const struct timeval *end_tv) {
+static int netboot_timeout_get_msec(const struct timeval* end_tv) {
     struct timeval wait_tv;
     struct timeval now_tv;
     gettimeofday(&now_tv, NULL);
     timersub(end_tv, &now_tv, &wait_tv);
     return wait_tv.tv_sec * 1000 + wait_tv.tv_usec / 1000;
-}
-
-static bool netboot_timer_is_expired(const struct timeval *end_tv) {
-    struct timeval now_tv;
-    gettimeofday(&now_tv, NULL);
-
-    return timercmp(&now_tv, end_tv, >=);
 }
 
 static int netboot_bind_to_cmd_port(int socket) {
@@ -75,7 +68,7 @@ static int netboot_bind_to_cmd_port(int socket) {
     return -1;
 }
 
-static int netboot_send_query(int socket, unsigned port, const char *ifname) {
+static int netboot_send_query(int socket, unsigned port, const char* ifname) {
     const char* hostname = "*";
     size_t hostname_len = strlen(hostname) + 1;
 
@@ -115,9 +108,12 @@ static int netboot_send_query(int socket, unsigned port, const char *ifname) {
         size_t sz = sizeof(nbmsg) + hostname_len;
         addr.sin6_scope_id = in6->sin6_scope_id;
 
-        int r;
-        if ((r = sendto(socket, &m, sz, 0, (struct sockaddr*)&addr, sizeof(addr))) != sz) {
-            fprintf(stderr, "error: cannot send %d %s\n", errno, strerror(errno));
+        ssize_t r = sendto(socket, &m, sz, 0,
+                           (struct sockaddr*)&addr, sizeof(addr));
+        if (r < 0) {
+            fprintf(stderr, "error: sendto: %s\n", strerror(errno));
+        } else if ((size_t)r != sz) {
+            fprintf(stderr, "error: sendto: short count %zu != %zu\n", r, sz);
         }
     }
 
@@ -129,8 +125,10 @@ static bool netboot_receive_query(int socket, on_device_cb callback, void* data)
     socklen_t rlen = sizeof(ra);
     memset(&ra, 0, sizeof(ra));
     msg m;
-    int r = recvfrom(socket, &m, sizeof(m), 0, (void*)&ra, &rlen);
-    if (r > sizeof(nbmsg)) {
+    ssize_t r = recvfrom(socket, &m, sizeof(m), 0, (void*)&ra, &rlen);
+    if (r < 0) {
+        fprintf(stderr, "error: recvfrom: %s\n", strerror(errno));
+    } else if ((size_t)r > sizeof(nbmsg)) {
         r -= sizeof(nbmsg);
         m.data[r] = 0;
         if ((m.hdr.magic == NB_MAGIC) &&
@@ -155,17 +153,17 @@ static bool netboot_receive_query(int socket, on_device_cb callback, void* data)
 }
 
 static struct option default_opts[] = {
-    {"help",        no_argument,       NULL, 'h'},
-    {"timeout",     required_argument, NULL, 't'},
-    {"nowait",      no_argument,       NULL, 'n'},
-    {"block-size",  required_argument, NULL, 'b'},
+    {"help", no_argument, NULL, 'h'},
+    {"timeout", required_argument, NULL, 't'},
+    {"nowait", no_argument, NULL, 'n'},
+    {"block-size", required_argument, NULL, 'b'},
     {"window-size", required_argument, NULL, 'w'},
-    {NULL,          0,                 NULL, 0},
+    {NULL, 0, NULL, 0},
 };
 
 static const struct option netboot_zero_opt = {NULL, 0, NULL, 0};
 
-static size_t netboot_count_opts(const struct option *opts) {
+static size_t netboot_count_opts(const struct option* opts) {
     if (!opts) {
         return 0;
     }
@@ -176,7 +174,7 @@ static size_t netboot_count_opts(const struct option *opts) {
     return count;
 }
 
-static void netboot_copy_opts(struct option *dst_opts, const struct option *src_opts) {
+static void netboot_copy_opts(struct option* dst_opts, const struct option* src_opts) {
     if (!src_opts) {
         return;
     }
@@ -186,16 +184,16 @@ static void netboot_copy_opts(struct option *dst_opts, const struct option *src_
     }
 }
 
-int netboot_handle_custom_getopt(int argc, char * const *argv,
-                                 const struct option *custom_opts,
+int netboot_handle_custom_getopt(int argc, char* const* argv,
+                                 const struct option* custom_opts,
                                  size_t num_custom_opts0,
-                                 bool (*opt_callback)(int ch, int argc, char * const *argv)) {
+                                 bool (*opt_callback)(int ch, int argc, char* const* argv)) {
     size_t num_default_opts = netboot_count_opts(default_opts);
     size_t num_custom_opts = netboot_count_opts(custom_opts);
 
-    struct option *combined_opts;
+    struct option* combined_opts;
     combined_opts = (struct option*)malloc(sizeof(struct option) *
-                                           (num_default_opts + num_custom_opts +1));
+                                           (num_default_opts + num_custom_opts + 1));
 
     netboot_copy_opts(combined_opts, default_opts);
     netboot_copy_opts(combined_opts + num_default_opts, custom_opts);
@@ -206,24 +204,24 @@ int netboot_handle_custom_getopt(int argc, char * const *argv,
     int ch;
     while ((ch = getopt_long_only(argc, argv, "t:", combined_opts, NULL)) != -1) {
         switch (ch) {
-            case 't':
-                netboot_timeout = atoi(optarg);
+        case 't':
+            netboot_timeout = atoi(optarg);
+            break;
+        case 'n':
+            netboot_wait = false;
+            break;
+        case 'b':
+            tftp_block_size = atoi(optarg);
+            break;
+        case 'w':
+            tftp_window_size = atoi(optarg);
+            break;
+        default:
+            if (opt_callback && opt_callback(ch, argc, argv)) {
                 break;
-            case 'n':
-                netboot_wait = false;
-                break;
-            case 'b':
-                tftp_block_size = atoi(optarg);
-                break;
-            case 'w':
-                tftp_window_size = atoi(optarg);
-                break;
-            default:
-                if (opt_callback && opt_callback(ch, argc, argv)) {
-                    break;
-                } else {
-                    goto err;
-                }
+            } else {
+                goto err;
+            }
         }
     }
     retval = optind;
@@ -232,7 +230,7 @@ err:
     return retval;
 }
 
-int netboot_handle_getopt(int argc, char * const *argv) {
+int netboot_handle_getopt(int argc, char* const* argv) {
     return netboot_handle_custom_getopt(argc, argv, NULL, 0, NULL);
 }
 
@@ -262,11 +260,16 @@ int netboot_discover(unsigned port, const char* ifname, on_device_cb callback, v
     }
 
     if (netboot_bind_to_cmd_port(s) < 0) {
-        fprintf(stderr, "cannot bind to command port: %s\n", strerror(errno));
+        fprintf(stderr, "error: cannot bind to command port: %s\n", strerror(errno));
+        close(s);
         return -1;
     }
 
-    netboot_send_query(s, port, ifname);
+    if (netboot_send_query(s, port, ifname) < 0) {
+        fprintf(stderr, "error: failed to send netboot query\n");
+        close(s);
+        return -1;
+    }
 
     struct pollfd fds;
     fds.fd = s;
@@ -275,9 +278,12 @@ int netboot_discover(unsigned port, const char* ifname, on_device_cb callback, v
     bool first_wait = netboot_wait;
 
     struct timeval end_tv = netboot_timeout_init(first_wait ? 3600000 : netboot_timeout);
-    do {
-
+    for (;;) {
         int wait_ms = netboot_timeout_get_msec(&end_tv);
+        if (wait_ms < 0) {
+            // Expired.
+            break;
+        }
 
         int r = poll(&fds, 1, wait_ms);
         if (r > 0 && (fds.revents & POLLIN)) {
@@ -293,7 +299,7 @@ int netboot_discover(unsigned port, const char* ifname, on_device_cb callback, v
             end_tv = netboot_timeout_init(netboot_timeout);
             first_wait = 0;
         }
-    } while (!netboot_timer_is_expired(&end_tv));
+    }
 
     close(s);
     if (received_packets) {
@@ -306,7 +312,7 @@ int netboot_discover(unsigned port, const char* ifname, on_device_cb callback, v
 
 typedef struct netboot_open_cookie {
     struct sockaddr_in6 addr;
-    const char *hostname;
+    const char* hostname;
     uint32_t index;
 } netboot_open_cookie_t;
 

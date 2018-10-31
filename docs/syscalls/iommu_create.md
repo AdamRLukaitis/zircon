@@ -9,8 +9,8 @@ iommu_create - create a new IOMMU object in the kernel
 ```
 #include <zircon/syscalls.h>
 
-zx_status_t zx_iommu_create(zx_handle_t root_rsrc, uint32_t type,
-                            const void* desc, uint32_t desc_len, zx_handle_t* out);
+zx_status_t zx_iommu_create(zx_handle_t root_resource, uint32_t type,
+                            const void* desc, size_t desc_size, zx_handle_t* out);
 ```
 
 ## DESCRIPTION
@@ -33,6 +33,10 @@ done with it.
 *desc* must be a valid pointer to a value of type *zx_iommu_desc_dummy_t*.
 *desc_len* must be *sizeof(zx_iommu_desc_dummy_t)*.
 
+## RIGHTS
+
+TODO(ZX-2399)
+
 ## RETURN VALUE
 
 **iommu_create**() returns ZX_OK and a handle to the new IOMMU
@@ -41,23 +45,25 @@ is returned.
 
 ## ERRORS
 
-**ZX_ERR_BAD_HANDLE**  *root_rsrc* is not a valid handle.
+**ZX_ERR_BAD_HANDLE**  *root_resource* is not a valid handle.
 
-**ZX_ERR_WRONG_TYPE**  *root_rsrc* is not a resource handle.
+**ZX_ERR_WRONG_TYPE**  *root_resource* is not a resource handle.
 
-**ZX_ERR_ACCESS_DENIED**  *root_rsrc* handle does not have sufficient privileges.
+**ZX_ERR_ACCESS_DENIED**  *root_resource* handle does not have sufficient privileges.
 
 **ZX_ERR_NOT_SUPPORTED** *type* is not a defined value or is not
 supported on this system.
 
-**ZX_ERR_INVALID_ARGS**  *desc_len* is larger than *ZX_IOMMU_MAX_DESC_LEN*,
+**ZX_ERR_INVALID_ARGS**  *desc_size* is larger than *ZX_IOMMU_MAX_DESC_LEN*,
 *desc* is an invalid pointer, *out* is an invalid pointer, or the contents of
 *desc* are not valid for the given *type*.
 
-**ZX_ERR_NO_MEMORY**  (Temporary) Failure due to lack of memory.
+**ZX_ERR_NO_MEMORY**  Failure due to lack of memory.
+There is no good way for userspace to handle this (unlikely) error.
+In a future build this error will no longer occur.
 
 ## SEE ALSO
 
 [bti_create](bti_create.md),
-[bti_pin](bti_unpin.md),
-[bti_unpin](bti_unpin.md).
+[bti_pin](bti_pin.md),
+[pmt_unpin](pmt_unpin.md).

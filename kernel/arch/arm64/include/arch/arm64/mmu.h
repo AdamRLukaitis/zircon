@@ -21,10 +21,6 @@
 
 #ifndef MMU_KERNEL_SIZE_SHIFT
 #define KERNEL_ASPACE_BITS (NBITS(0xffffffffffffffff-KERNEL_ASPACE_BASE))
-#define KERNEL_BASE_BITS (NBITS(0xffffffffffffffff-KERNEL_BASE))
-#if KERNEL_BASE_BITS > KERNEL_ASPACE_BITS
-#define KERNEL_ASPACE_BITS KERNEL_BASE_BITS /* KERNEL_BASE should not be below KERNEL_ASPACE_BASE */
-#endif
 
 #if KERNEL_ASPACE_BITS < 25
 #define MMU_KERNEL_SIZE_SHIFT (25)
@@ -237,8 +233,11 @@
 #define MMU_S2_PTE_ATTR_S2AP_RO                 BM(6, 2, 1)
 #define MMU_S2_PTE_ATTR_S2AP_RW                 BM(6, 2, 3)
 
+#define MMU_S2_PTE_ATTR_ATTR_INDEX_MASK         BM(2, 4, 0xf)
 /* Normal, Outer Write-Back Cacheable, Inner Write-Back Cacheable. */
 #define MMU_S2_PTE_ATTR_NORMAL_MEMORY           BM(2, 4, 0xf)
+/* Normal, Outer Non-cacheable, Inner Non-cacheable. */
+#define MMU_S2_PTE_ATTR_NORMAL_UNCACHED         BM(2, 4, 0x5)
 /* Device, Device-nGnRnE memory. */
 #define MMU_S2_PTE_ATTR_STRONGLY_ORDERED        BM(2, 4, 0x0)
 /* Device, Device-nGnRE memory. */

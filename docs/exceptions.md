@@ -2,7 +2,7 @@
 
 ## Introduction
 
-Exception handling support in Zircon was impired by similar support in Mach.
+Exception handling support in Zircon was inspired by similar support in Mach.
 
 Exceptions are mainly used for debugging. Outside of debugging
 one generally uses ["signals"](signals.md).
@@ -18,13 +18,14 @@ handling" is at a high level (though it certainly can if there is a need).
 
 ## The basics
 
-Exceptions are handled by binding a Zircon Port to the Exception Port
-of the desired object: thread, process, or job. This is done with the
+Exceptions are handled from userspace by binding a Zircon Port to the
+Exception Port of the desired object: thread, process, or job.
+This is done with the
 [**task_bind_exception_port**() system call](syscalls/task_bind_exception_port.md).
 
 Example:
 
-```
+```cpp
   zx_handle_t eport;
   auto status = zx_port_create(0, &eport);
   // ... check status ...
@@ -41,20 +42,21 @@ after which the receiver must reply with either "exception handled"
 or "exception not handled".
 The thread stays paused until then, or until the port is unbound,
 either explicitly or by the port being closed (say because the handler
-process exited).
+process exited). If the port is unbound, for whatever reason, the
+exception is processed as if the reply was "exception not handled".
 
 Here is a simple exception handling loop.
 The main components of it are the call to the
 [**port_wait**() system call](syscalls/port_wait.md)
 to wait for an exception, or anything else that's interesting, to happen,
 and the call to the
-[**thread_resume**() system call](syscalls/thread_resume.md)
+[**task_resume_from_exception**() system call](syscalls/task_resume_from_exception.md)
 to indicate the handler is finished processing the exception.
 
-```
+```cpp
   while (true) {
     zx_port_packet_t packet;
-    auto status = zx_port_wait(eport, ZX_TIME_INFINITE, packet, 1);
+    auto status = zx_port_wait(eport, ZX_TIME_INFINITE, packet);
     // ... check status ...
     if (packet.key != child_key) {
       // ... do something else, depending on what else the port is used for ...
@@ -70,10 +72,10 @@ to indicate the handler is finished processing the exception.
                                  &thread);
     // ... check status ...
     bool handled = process_exception(child, thread, &packet);
-    uint32_t resume_flags = ZX_RESUME_EXCEPTION;
+    uint32_t resume_flags = 0;
     if (!handled)
       resume_flags |= ZX_RESUME_TRY_NEXT;
-    status = zx_task_resume(thread, resume_flags);
+    status = zx_task_resume_from_exception(thread, eport, resume_flags);
     // ... check status ...
     status = zx_handle_close(thread);
     assert(status == ZX_OK);
@@ -83,7 +85,7 @@ to indicate the handler is finished processing the exception.
 To unbind an exception port, pass **ZX_HANDLE_INVALID** for the
 exception port:
 
-```
+```cpp
   uint32_t options = 0;
   status = zx_task_bind_exception_port(child, ZX_HANDLE_INVALID,
                                        key, options);
@@ -101,9 +103,10 @@ defined by the port message protocol. The packet contents are defined by
 the *zx_packet_exception_t* type defined in
 [`<zircon/syscalls/port.h>`](../system/public/zircon/syscalls/port.h).
 
-The exception handler is intended to read the message, decide how it
+The exception handler is expected to read the message, decide how it
 wants to process the exception, and then resume the thread that got the
-exception with the [**task_resume**() system call](syscalls/task_resume.md).
+exception with the
+[**task_resume_from_exception**() system call](syscalls/task_resume_from_exception.md).
 
 Resuming the thread can be done in either of two ways:
 
@@ -112,24 +115,36 @@ If the thread gets another exception then exception processing begins
 again anew. An example of when one would do this is when resuming after a
 debugger breakpoint.
 
-```
-  auto status = zx_task_resume(thread, ZX_RESUME_EXCEPTION);
+```cpp
+  auto status = zx_task_resume_from_exception(thread, eport, 0);
   // ... check status ...
 ```
 
 - Resume exception processing, marking the exception as "unhandled" by the
-current handler, and giving the next exception port in the search order a
+current handler, thus giving the next exception port in the search order a
 chance to process the exception. An example of when one would do this is
 when the exception is not one the handler intends to process.
 
-```
-  auto status = zx_task_resume(thread,
-      ZX_RESUME_EXCEPTION | ZX_RESUME_TRY_NEXT);
+```cpp
+  auto status = zx_task_resume_from_exception(thread, eport,
+      ZX_RESUME_TRY_NEXT);
   // ... check status ...
 ```
 
 If there are no remaining exception ports to try the kernel terminates
-the process.
+the process, as if *zx_task_kill(process)* was called.
+The return code of a process terminated by an exception is an
+unspecified non-zero value.
+The return code can be obtained with *zx_object_get_info(ZX_INFO_PROCESS)*.
+Example:
+
+```cpp
+    zx_info_process_t info;
+    auto status = zx_object_get_info(process, ZX_INFO_PROCESS, &info,
+                                     sizeof(info), nullptr, nullptr);
+    // ... check status ...
+    int return_code = info.return_code;
+```
 
 Resuming the thread requires a handle of the thread, which the handler
 may not yet have. The handle is obtained with the
@@ -142,7 +157,7 @@ exception report. See the above trivial exception handler example.
 Exception ports are searched in the following order:
 
 - *Debugger* - The debugger exception port is associated with processes, and
-is for things like gdb and lldb. To bind to the debugger exception port
+is for things like zxdb and gdb. To bind to the debugger exception port
 pass **ZX_EXCEPTION_PORT_DEBUGGER** in *options* when binding an
 exception port to the process.
 There is only one debugger exception port per process.
@@ -158,17 +173,12 @@ jobs have a hierarchy. First the process's job is searched. If it has a bound
 exception port then the exception is delivered to that port. If it does not
 have a bound exception port, or if the handler returns **ZX_RESUME_TRY_NEXT**,
 then that job's parent job is searched, and so on right up to the root job.
-
-- *System* - This is the last port searched and gives the system a chance to
-process the exception before the kernel kills the process.
+There is only one job exception port per job.
 
 If no exception port handles the exception then the kernel finishes
 exception processing by killing the process.
 
 Notes:
-
-- The "system" exception port is going away, to be supplanted by
-the root job.
 
 - The search order is different than that of Mach. In Zircon the
 debugger exception port is tried first, before all other ports.
@@ -198,23 +208,22 @@ debugger exception port. These exceptions are:
 
 ## Interaction with thread suspension
 
-Although the same system call, **zx_thread_resume**(),is used to resume
-threads from both exceptions and suspensions, they are treated separately.
+Exceptions and thread suspensions are treated separately.
 In other words, a thread can be both in an exception and be suspended.
 This can happen if the thread is suspended while waiting for a response
 from an exception handler. The thread stays paused until it is resumed
-for both the exception and the suspension: two calls to
-**zx_thread_resume**() are required, one for the exception:
+for both the exception and the suspension:
 
-```
-  auto status = zx_task_resume(thread, ZX_RESUME_EXCEPTION);
+```cpp
+  auto status = zx_task_resume_from_exception(thread, eport, 0);
   // ... check status ...
 ```
 
 and one for the suspension:
 
-```
-  auto status = zx_task_resume(thread, 0);
+```cpp
+  // suspend_token was obtained by an earlier call to zx_task_suspend().
+  auto status = zx_handle_close(suspend_token);
   // ... check status ...
 ```
 
@@ -243,7 +252,7 @@ to have signals regarding each thread sent to the port.
 In other words, there is still just one system call involved to wait
 for something interesting to happen.
 
-```
+```cpp
   uint64_t key = some_key_denoting_the_thread;
   bool is_suspended = thread_is_suspended(thread);
   zx_signals_t signals = ZX_THREAD_TERMINATED;
@@ -278,7 +287,7 @@ When it is suspended **ZX_THREAD_RUNNING** is deasserted, and
 asserted. When a thread terminates both **ZX_THREAD_RUNNING** and
 **ZX_THREAD_SUSPENDED** are deasserted and **ZX_THREAD_TERMINATED**
 is asserted. However, signals are OR'd into the state maintained by
-by the port thus you may see any combination of requested signals
+the port thus you may see any combination of requested signals
 when **zx_port_wait**() returns.
 
 ## Comparison with Posix (and Linux)
@@ -295,9 +304,11 @@ ZX_EXCP_*                    SIG*
 task_bind_exception_port()   ptrace(ATTACH,DETACH)
 task_resume()                kill(SIGCONT),ptrace(CONT)
 task_suspend()               kill(SIGSTOP),ptrace(KILL(SIGSTOP))
-N/A                          kill()
+N/A                          kill(everything_other_than_SIGKILL)
+task_kill()                  kill(SIGKILL)
 TBD                          signal()/sigaction()
 port_wait()                  wait*()
+TBD                          W*() macros from sys/wait.h
 zx_packet_exception_t        siginfo_t
 zx_exception_context_t       siginfo_t
 thread_read_state            ptrace(GETREGS,GETREGSET)
@@ -317,10 +328,12 @@ is always run on a separate thread.
 There are three good example programs in the Zircon tree to use to
 further one's understanding of exceptions and signals in Zircon.
 
-- `system/core/crashlogger`
+- `system/core/crashsvc`, `system/core/crashanalyzer`
 
-This is the crashlogger "daemon", it currently prints backtraces
-of crashing programs.
+`crashsvc` is the main crash logging service. It delegates the
+processing of the crash to various programs.
+One of those programs is `crashanalyzer` which prints a backtrace
+of the crashing thread.
 
 - `system/utest/exception`
 
@@ -343,6 +356,13 @@ In Posix one is able to specify handlers for particular signals,
 whereas in Zircon there is currently just the exception port,
 and the handler is expected to understand all possible exceptions.
 This is tracked as ZX-560.
+
+- W*() macros from sys/wait.h
+
+When a process exits because of an exception, no information is provided
+on which exception the process got (e.g., segfault). At present only a
+non-specific non-zero exit code is returned.
+This is tracked as ZX-1974.
 
 - more selectiveness in which exceptions to see
 
@@ -388,9 +408,6 @@ This is tracked as ZX-567.
 
 This is tracked as ZX-562. The basic discussion is about only allowing
 appropriate processes to resume a thread in an exception.
-The same thing applies to thread suspension: IWBN if when a process
-suspends a thread, then another process can't come along and resume it
-against the suspender's wishes.
 
 - no way to obtain currently bound port or to chain handlers
 

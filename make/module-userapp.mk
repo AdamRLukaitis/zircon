@@ -17,7 +17,7 @@ ifeq ($(MODULE_INSTALL_PATH),)
 MODULE_INSTALL_PATH := bin
 endif
 
-MODULE_USERAPP_OBJECT := $(patsubst %.mod.o,%.elf,$(MODULE_OBJECT))
+MODULE_USERAPP_OBJECT := $(MODULE_OUTNAME).elf
 ALLUSER_APPS += $(MODULE_USERAPP_OBJECT)
 ALLUSER_MODULES += $(MODULE)
 
@@ -32,8 +32,21 @@ ifeq ($(and $(filter $(subst $(COMMA),$(SPACE),$(BOOTFS_DEBUG_MODULES)),$(MODULE
 USER_MANIFEST_DEBUG_INPUTS += $(MODULE_USERAPP_OBJECT)
 endif
 
-MODULE_ALIBS := $(foreach lib,$(MODULE_STATIC_LIBS),$(call TOBUILDDIR,$(lib))/lib$(notdir $(lib)).a)
+MODULE_ALIBS := $(foreach lib,$(MODULE_STATIC_LIBS) $(MODULE_FIDL_LIBS),$(call TOBUILDDIR,$(lib))/lib$(notdir $(lib)).a)
+
+# Link profile runtime into everything compiled with profile instrumentation.
+# The static profile runtime library must come after all static libraries
+# whose instrumented code might call into it.  It depends on libzircon, so
+# make sure we're linking that in if we're not already.
+ifeq ($(strip $(call TOBOOL,$(USE_PROFILE)) \
+	      $(filter $(NO_PROFILE),$(MODULE_COMPILEFLAGS))),true)
+MODULE_ALIBS += $(PROFILE_LIB)
+MODULE_LIBS := $(filter-out system/ulib/zircon,$(MODULE_LIBS)) \
+	       system/ulib/zircon
+endif
+
 MODULE_SOLIBS := $(foreach lib,$(MODULE_LIBS),$(call TOBUILDDIR,$(lib))/lib$(notdir $(lib)).so.abi)
+MODULE_EXTRA_OBJS += $(foreach lib,$(MODULE_FIDL_LIBS),$(call TOBUILDDIR,$(lib))/gen/obj/tables.cpp.o)
 
 # Include this in every link.
 MODULE_EXTRA_OBJS += scripts/dso_handle.ld
@@ -50,7 +63,7 @@ $(MODULE_USERAPP_OBJECT): $(USER_SCRT1_OBJ) $(MODULE_OBJS) $(MODULE_EXTRA_OBJS) 
 	@$(MKDIR)
 	$(call BUILDECHO,linking userapp $@)
 	$(NOECHO)$(USER_LD) $(GLOBAL_LDFLAGS) $(ARCH_LDFLAGS) $(_LDFLAGS) \
-		$(_OBJS) $(_LIBS) $(LIBGCC) -o $@
+		$(_OBJS) --start-group $(_LIBS) --end-group $(LIBGCC) -o $@
 
 EXTRA_IDFILES += $(MODULE_USERAPP_OBJECT).id
 

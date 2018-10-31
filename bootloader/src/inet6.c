@@ -113,7 +113,7 @@ void ip6_init(void* macaddr) {
     printf("snmaddr: %s\n", ip6toa(tmp, &snm_ip6_addr));
 }
 
-mac_addr eth_addr() {
+mac_addr eth_addr(void) {
     return ll_mac_addr;
 }
 
@@ -455,10 +455,11 @@ middle_zeros:
         out += sprintf(out, ":");
         return _out;
     }
-    while (x < end) {
-        out += sprintf(out, ":%x", n);
+    out += sprintf(out, ":%x", n);
+    while (x < (end - 2)) {
         x += 2;
         n = (x[0] << 8) | x[1];
+        out += sprintf(out, ":%x", n);
     }
     return _out;
 }

@@ -10,16 +10,19 @@
 #include <arch/x86/asm.h>
 #include <arch/x86/descriptor.h>
 
-.section .rodata
-
-.align 8
-DATA(_gdtr)
-    .short _gdt_end - _gdt - 1
-    .quad _gdt
+.section .rodata.gdt,"a",%progbits
+// Intentionlly misalign this by 6 so that the address word holding _temp_gdt
+// is naturally aligned.  This address gets fixed up by apply_fixups (image.S).
+.balign 8
+.skip 6
+DATA(_temp_gdtr)
+    .short _temp_gdt_end - _temp_gdt - 1
+    .quad _temp_gdt
+END_DATA(_temp_gdtr)
 
 .data
 .align 8
-DATA(_gdt)
+DATA(_temp_gdt)
     /* null entry */
     .int 0
     .int 0
@@ -81,6 +84,6 @@ DATA(_gdt)
     .int   0x00000000       /* reserved/sbz */
 .endr
 
-END_DATA(_gdt)
+END_DATA(_temp_gdt)
 
-DATA(_gdt_end)
+DATA(_temp_gdt_end)

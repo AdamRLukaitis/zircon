@@ -5,14 +5,15 @@
 #ifndef ZIRCON_SYSTEM_ULIB_SYSLOG_FX_LOGGER_H_
 #define ZIRCON_SYSTEM_ULIB_SYSLOG_FX_LOGGER_H_
 
+#include <lib/syslog/logger.h>
+
+#include <fbl/mutex.h>
 #include <fbl/string.h>
 #include <fbl/unique_fd.h>
 #include <fbl/vector.h>
 #include <lib/zx/process.h>
 #include <lib/zx/socket.h>
 #include <lib/zx/thread.h>
-
-#include "syslog/logger.h"
 
 namespace {
 
@@ -24,7 +25,7 @@ zx_koid_t GetKoid(zx_handle_t handle) {
 }
 
 zx_koid_t GetCurrentProcessKoid() {
-    auto koid = GetKoid(zx::process::self().get());
+    auto koid = GetKoid(zx_process_self());
     ZX_DEBUG_ASSERT(koid != ZX_KOID_INVALID);
     return koid;
 }
@@ -95,6 +96,8 @@ private:
 
     // string representation to print in fallback mode
     fbl::String tagstr_;
+
+    fbl::Mutex fallback_mutex_;
 };
 
 #endif // ZIRCON_SYSTEM_ULIB_SYSLOG_FX_LOGGER_H_

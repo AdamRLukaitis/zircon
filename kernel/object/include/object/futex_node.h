@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <kernel/lockdep.h>
 #include <kernel/thread.h>
 #include <kernel/wait.h>
 #include <list.h>
@@ -34,15 +35,16 @@ public:
     static FutexNode* RemoveNodeFromList(FutexNode* list_head, FutexNode* node);
 
     static FutexNode* WakeThreads(FutexNode* node, uint32_t count,
-                                  uintptr_t old_hash_key, bool* out_any_woken);
+                                  uintptr_t old_hash_key);
 
     static FutexNode* RemoveFromHead(FutexNode* list_head,
                                      uint32_t count,
                                      uintptr_t old_hash_key,
                                      uintptr_t new_hash_key);
 
-    // This must be called with |mutex| held and returns without |mutex| held.
-    zx_status_t BlockThread(fbl::Mutex* mutex, zx_time_t deadline) TA_REL(mutex);
+    // This must be called with a guard held in the calling scope. Releases the
+    // guard and does not reacquire it.
+    zx_status_t BlockThread(Guard<fbl::Mutex>&& adopt_guard, zx_time_t deadline);
 
     void set_hash_key(uintptr_t key) {
         hash_key_ = key;
@@ -56,7 +58,7 @@ private:
     static void RelinkAsAdjacent(FutexNode* node1, FutexNode* node2);
     static void SpliceNodes(FutexNode* node1, FutexNode* node2);
 
-    bool WakeThread();
+    void WakeThread();
 
     void MarkAsNotInQueue();
 
@@ -69,7 +71,7 @@ private:
     uintptr_t hash_key_;
 
     // Used for waking the thread corresponding to the FutexNode.
-    wait_queue_t wait_queue_;
+    WaitQueue wait_queue_;
 
     // queue_prev_ and queue_next_ are used for maintaining a circular
     // doubly-linked list of threads that are waiting on one futex address.

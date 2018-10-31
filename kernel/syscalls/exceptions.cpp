@@ -33,9 +33,7 @@ static zx_status_t object_unbind_exception_port(zx_handle_t obj_handle, bool deb
 
     auto job = DownCastDispatcher<JobDispatcher>(&dispatcher);
     if (job) {
-        if (debugger)
-            return ZX_ERR_INVALID_ARGS;
-        return job->ResetExceptionPort(quietly)
+        return job->ResetExceptionPort(debugger, quietly)
                    ? ZX_OK
                    : ZX_ERR_BAD_STATE;  // No port was bound.
     }
@@ -77,9 +75,12 @@ static zx_status_t task_bind_exception_port(zx_handle_t obj_handle, zx_handle_t 
 
     auto job = DownCastDispatcher<JobDispatcher>(&dispatcher);
     if (job) {
+        ExceptionPort::Type type;
         if (debugger)
-            return ZX_ERR_INVALID_ARGS;
-        status = ExceptionPort::Create(ExceptionPort::Type::JOB,
+            type = ExceptionPort::Type::JOB_DEBUGGER;
+        else
+            type = ExceptionPort::Type::JOB;
+        status = ExceptionPort::Create(type,
                                        fbl::move(port), key, &eport);
         if (status != ZX_OK)
             return status;
@@ -128,6 +129,7 @@ static zx_status_t task_bind_exception_port(zx_handle_t obj_handle, zx_handle_t 
     return ZX_ERR_WRONG_TYPE;
 }
 
+// zx_status_t zx_task_bind_exception_port
 zx_status_t sys_task_bind_exception_port(zx_handle_t obj_handle, zx_handle_t eport_handle,
                                            uint64_t key, uint32_t options) {
     LTRACE_ENTRY;
@@ -150,6 +152,9 @@ zx_status_t sys_task_bind_exception_port(zx_handle_t obj_handle, zx_handle_t epo
     }
 }
 
+// zx_status_t zx_task_resume
+// TODO(ZX-2720): This function is deprecated.
+// Remove it when all uses have been eliminated.
 zx_status_t sys_task_resume(zx_handle_t handle, uint32_t options) {
     LTRACE_ENTRY;
 
@@ -174,18 +179,46 @@ zx_status_t sys_task_resume(zx_handle_t handle, uint32_t options) {
         return ZX_ERR_WRONG_TYPE;
 
     if (options & ZX_RESUME_EXCEPTION) {
-        ThreadDispatcher::ExceptionStatus estatus;
         if (options & ZX_RESUME_TRY_NEXT) {
-            estatus = ThreadDispatcher::ExceptionStatus::TRY_NEXT;
+            return thread->MarkExceptionNotHandled(nullptr);
         } else {
-            estatus = ThreadDispatcher::ExceptionStatus::RESUME;
+            return thread->MarkExceptionHandled(nullptr);
         }
-        return thread->MarkExceptionHandled(estatus);
     } else {
         if (options != 0) {
             return ZX_ERR_INVALID_ARGS;
         }
 
-        return thread->Resume();
+        // There should be no more uses of this function to resume from
+        // suspensions, and we don't want to allow new ones.
+        return ZX_ERR_BAD_STATE;
+    }
+}
+
+// zx_status_t zx_task_resume_from_exception
+zx_status_t sys_task_resume_from_exception(zx_handle_t task_handle, zx_handle_t eport_handle,
+                                           uint32_t options) {
+    LTRACE_ENTRY;
+
+    auto up = ProcessDispatcher::GetCurrent();
+
+    fbl::RefPtr<ThreadDispatcher> thread;
+    zx_status_t status = up->GetDispatcher(task_handle, &thread);
+    if (status != ZX_OK)
+        return status;
+
+    fbl::RefPtr<PortDispatcher> eport;
+    status = up->GetDispatcher(eport_handle, &eport);
+    if (status != ZX_OK)
+        return status;
+
+    // Currently the only option is the ZX_RESUME_TRY_NEXT bit.
+    if (options != 0 && options != ZX_RESUME_TRY_NEXT)
+        return ZX_ERR_INVALID_ARGS;
+
+    if (options & ZX_RESUME_TRY_NEXT) {
+        return thread->MarkExceptionNotHandled(eport.get());
+    } else {
+        return thread->MarkExceptionHandled(eport.get());
     }
 }

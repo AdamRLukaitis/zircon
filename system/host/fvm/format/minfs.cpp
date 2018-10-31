@@ -2,16 +2,25 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <fvm/fvm-sparse.h>
+
 #include "fvm/format.h"
 
 MinfsFormat::MinfsFormat(fbl::unique_fd fd, const char* type)
     : Format() {
     if (!strcmp(type, kDataTypeName)) {
         memcpy(type_, kDataType, sizeof(kDataType));
+        flags_ |= fvm::kSparseFlagZxcrypt;
+
+    } else if (!strcmp(type, kDataUnsafeTypeName)) {
+        memcpy(type_, kDataType, sizeof(kDataType));
+
     } else if (!strcmp(type, kSystemTypeName)) {
         memcpy(type_, kSystemType, sizeof(kSystemType));
+
     } else if (!strcmp(type, kDefaultTypeName)) {
         memcpy(type_, kDefaultType, sizeof(kDefaultType));
+
     } else {
         fprintf(stderr, "Unrecognized type for minfs: %s\n", type);
         exit(-1);
@@ -39,7 +48,7 @@ MinfsFormat::MinfsFormat(fbl::unique_fd fd, const char* type)
         exit(-1);
     }
 
-    if (minfs_check_info(&info_, bc_.get()) != ZX_OK) {
+    if (CheckSuperblock(&info_, bc_.get()) != ZX_OK) {
         fprintf(stderr, "Check info failed\n");
         exit(-1);
     }
@@ -87,7 +96,7 @@ zx_status_t MinfsFormat::MakeFvmReady(size_t slice_size, uint32_t vpart_index) {
 
     zx_status_t status;
     // Check if bitmaps are the wrong size, slice extents run on too long, etc.
-    if ((status = minfs_check_info(&fvm_info_, bc_.get())) != ZX_OK) {
+    if ((status = CheckSuperblock(&fvm_info_, bc_.get())) != ZX_OK) {
         fprintf(stderr, "Check info failed\n");
         return status;
     }
@@ -105,6 +114,7 @@ zx_status_t MinfsFormat::GetVsliceRange(unsigned extent_index, vslice_info_t* vs
         vslice_info->slice_count = 1;
         vslice_info->block_offset = 0;
         vslice_info->block_count = 1;
+        vslice_info->zero_fill = true;
         return ZX_OK;
     }
     case 1: {
@@ -112,6 +122,7 @@ zx_status_t MinfsFormat::GetVsliceRange(unsigned extent_index, vslice_info_t* vs
         vslice_info->slice_count = fvm_info_.ibm_slices;
         vslice_info->block_offset = info_.ibm_block;
         vslice_info->block_count = info_.abm_block - info_.ibm_block;
+        vslice_info->zero_fill = true;
         return ZX_OK;
     }
     case 2: {
@@ -119,6 +130,7 @@ zx_status_t MinfsFormat::GetVsliceRange(unsigned extent_index, vslice_info_t* vs
         vslice_info->slice_count = fvm_info_.abm_slices;
         vslice_info->block_offset = info_.abm_block;
         vslice_info->block_count = info_.ino_block - info_.abm_block;
+        vslice_info->zero_fill = true;
         return ZX_OK;
     }
     case 3: {
@@ -126,6 +138,7 @@ zx_status_t MinfsFormat::GetVsliceRange(unsigned extent_index, vslice_info_t* vs
         vslice_info->slice_count = fvm_info_.ino_slices;
         vslice_info->block_offset = info_.ino_block;
         vslice_info->block_count = info_.dat_block - info_.ino_block;
+        vslice_info->zero_fill = true;
         return ZX_OK;
     }
     case 4: {
@@ -133,6 +146,7 @@ zx_status_t MinfsFormat::GetVsliceRange(unsigned extent_index, vslice_info_t* vs
         vslice_info->slice_count = fvm_info_.dat_slices;
         vslice_info->block_offset = info_.dat_block;
         vslice_info->block_count = info_.block_count;
+        vslice_info->zero_fill = false;
         return ZX_OK;
     }
     }

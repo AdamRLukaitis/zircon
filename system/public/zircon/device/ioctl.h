@@ -40,11 +40,11 @@
 // device protocol families
 #define IOCTL_FAMILY_CONSOLE        0x10
 #define IOCTL_FAMILY_INPUT          0x11
-#define IOCTL_FAMILY_DISPLAY        0x12
+// 0x12 unused
 #define IOCTL_FAMILY_BLOCK          0x13
 #define IOCTL_FAMILY_I2C            0x14
 #define IOCTL_FAMILY_TPM            0x15
-#define IOCTL_FAMILY_USB            0x16
+#define IOCTL_FAMILY_USB_DEVICE     0x16
 #define IOCTL_FAMILY_HID            0x17
 // 0x18 unused
 #define IOCTL_FAMILY_AUDIO          0x19
@@ -55,14 +55,14 @@
 #define IOCTL_FAMILY_GPU            0x1E
 #define IOCTL_FAMILY_RTC            0x1F  // ioctls for RTC
 #define IOCTL_FAMILY_ETH            0x20
-#define IOCTL_FAMILY_IPT            0x21  // ioctls for Intel PT
+#define IOCTL_FAMILY_INSNTRACE      0x21  // ioctls for instruction tracing
 #define IOCTL_FAMILY_RAMDISK        0x22
 #define IOCTL_FAMILY_SDMMC          0x23
 #define IOCTL_FAMILY_WLAN           0x24
 #define IOCTL_FAMILY_PTY            0x25
 #define IOCTL_FAMILY_NETCONFIG      0x26
 #define IOCTL_FAMILY_ETHERTAP       0x27
-#define IOCTL_FAMILY_USB_DEVICE     0x28
+#define IOCTL_FAMILY_USB_PERIPHERAL 0x28
 #define IOCTL_FAMILY_USB_VIRT_BUS   0x29
 #define IOCTL_FAMILY_CPUPERF        0x2A
 #define IOCTL_FAMILY_POWER          0x30
@@ -72,6 +72,17 @@
 #define IOCTL_FAMILY_WLANPHY        0x34
 #define IOCTL_FAMILY_SERIAL         0x35
 #define IOCTL_FAMILY_WLANTAP        0x36
+#define IOCTL_FAMILY_DISPLAY_CONTROLLER 0x37
+#define IOCTL_FAMILY_DEBUG          0x38
+#define IOCTL_FAMILY_AUDIO_CODEC    0x39
+#define IOCTL_FAMILY_BACKLIGHT      0x3A
+#define IOCTL_FAMILY_NAND_TEST      0x3B
+#define IOCTL_FAMILY_TEE            0x3C
+#define IOCTL_FAMILY_SKIP_BLOCK     0x3D
+#define IOCTL_FAMILY_USB_TEST       0x3E
+#define IOCTL_FAMILY_CLK            0x3F
+// 0x40 unused.
+#define IOCTL_FAMILY_QMI            0x41
 
 // IOCTL constructor
 // --K-FFNN

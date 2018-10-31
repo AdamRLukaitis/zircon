@@ -5,6 +5,7 @@
 # license that can be found in the LICENSE file or at
 # https://opensource.org/licenses/MIT
 
+ifeq ($(call TOBOOL, $(ENABLE_USER_PCI)), false)
 LOCAL_DIR := $(GET_LOCAL_DIR)
 MODULE := $(LOCAL_DIR)
 
@@ -18,7 +19,12 @@ MODULE_SRCS += \
 	$(LOCAL_DIR)/pcie_irqs.cpp \
 	$(LOCAL_DIR)/pcie_quirks.cpp \
 	$(LOCAL_DIR)/pcie_root.cpp \
-	$(LOCAL_DIR)/pcie_upstream_node.cpp
+	$(LOCAL_DIR)/pcie_upstream_node.cpp \
+	$(LOCAL_DIR)/address_provider/mmio.cpp \
+	$(LOCAL_DIR)/address_provider/pio.cpp \
+	$(LOCAL_DIR)/address_provider/designware.cpp \
+	$(LOCAL_DIR)/address_provider/ecam_region.cpp \
+
 
 MODULE_DEPS += \
     kernel/lib/zxcpp \
@@ -27,5 +33,5 @@ MODULE_DEPS += \
     kernel/lib/region-alloc
 
 MODULE_CPPFLAGS += -Wno-invalid-offsetof
-
 include make/module.mk
+endif

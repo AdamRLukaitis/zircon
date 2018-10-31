@@ -2,13 +2,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <unistd.h>
+
 #include <fbl/alloc_checker.h>
 #include <fbl/unique_ptr.h>
-#include <unistd.h>
+#include <fvm/fvm-lz4.h>
 
 #include "fvm/container.h"
 
-#define DEFAULT_SLICE_SIZE (64lu * (1 << 20))
+#define DEFAULT_SLICE_SIZE (8lu * (1 << 20))
 
 int usage(void) {
     fprintf(stderr, "usage: fvm [ output_path ] [ command ] [ <flags>* ] [ <input_paths>* ]\n");
@@ -18,10 +20,12 @@ int usage(void) {
     fprintf(stderr, " add : Adds a Minfs or Blobfs partition to an FVM (input path is"
                     " required)\n");
     fprintf(stderr, " extend : Extends an FVM container to the specified size (length is"
-                        " required)\n");
+                    " required)\n");
     fprintf(stderr, " sparse : Creates a sparse file. One or more input paths are required.\n");
     fprintf(stderr, " verify : Report basic information about sparse/fvm files and run fsck on"
-                        " contained partitions\n");
+                    " contained partitions\n");
+    fprintf(stderr, " decompress : Decompresses a compressed sparse file. --sparse input path is"
+                    " required.\n");
     fprintf(stderr, "Flags (neither or both of offset/length must be specified):\n");
     fprintf(stderr, " --slice [bytes] - specify slice size (default: %zu)\n", DEFAULT_SLICE_SIZE);
     fprintf(stderr, " --offset [bytes] - offset at which container begins (fvm only)\n");
@@ -29,9 +33,11 @@ int usage(void) {
     fprintf(stderr, " --compress - specify that file should be compressed (sparse only)\n");
     fprintf(stderr, "Input options:\n");
     fprintf(stderr, " --blob [path] - Add path as blob type (must be blobfs)\n");
-    fprintf(stderr, " --data [path] - Add path as data type (must be minfs)\n");
+    fprintf(stderr, " --data [path] - Add path as encrypted data type (must be minfs)\n");
+    fprintf(stderr, " --data-unsafe [path] - Add path as unencrypted data type (must be minfs)\n");
     fprintf(stderr, " --system [path] - Add path as system type (must be minfs)\n");
     fprintf(stderr, " --default [path] - Add generic path\n");
+    fprintf(stderr, " --sparse [path] - Path to compressed sparse file\n");
     exit(-1);
 }
 
@@ -68,24 +74,56 @@ size_t get_disk_size(const char* path, size_t offset) {
     return 0;
 }
 
+int parse_size(const char* size_str, size_t* out) {
+    char* end;
+    size_t size = strtoull(size_str, &end, 10);
+
+    switch (end[0]) {
+    case 'K':
+    case 'k':
+        size *= 1024;
+        end++;
+        break;
+    case 'M':
+    case 'm':
+        size *= (1024 * 1024);
+        end++;
+        break;
+    case 'G':
+    case 'g':
+        size *= (1024 * 1024 * 1024);
+        end++;
+        break;
+    }
+
+    if (end[0] || size == 0) {
+        fprintf(stderr, "Bad size: %s\n", size_str);
+        return -1;
+    }
+
+    *out = size;
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         usage();
     }
 
     unsigned i = 1;
-    const char* path = argv[i++]; // Output path
+    const char* path = argv[i++];    // Output path
     const char* command = argv[i++]; // Command
 
     size_t length = 0;
     size_t offset = 0;
     size_t slice_size = DEFAULT_SLICE_SIZE;
     bool should_unlink = true;
-    compress_type_t compress = NONE;
-
+    uint32_t flags = 0;
     while (i < argc) {
         if (!strcmp(argv[i], "--slice") && i + 1 < argc) {
-            slice_size = atoll(argv[++i]);
+            if (parse_size(argv[++i], &slice_size) < 0) {
+                return -1;
+            }
             if (!slice_size ||
                 slice_size % blobfs::kBlobfsBlockSize ||
                 slice_size % minfs::kMinfsBlockSize) {
@@ -95,12 +133,16 @@ int main(int argc, char** argv) {
             }
         } else if (!strcmp(argv[i], "--offset") && i + 1 < argc) {
             should_unlink = false;
-            offset = atoll(argv[++i]);
+            if (parse_size(argv[++i], &offset) < 0) {
+                return -1;
+            }
         } else if (!strcmp(argv[i], "--length") && i + 1 < argc) {
-            length = atoll(argv[++i]);
+            if (parse_size(argv[++i], &length) < 0) {
+                return -1;
+            }
         } else if (!strcmp(argv[i], "--compress")) {
             if (!strcmp(argv[++i], "lz4")) {
-                compress = LZ4;
+                flags |= fvm::kSparseFlagLz4;
             } else {
                 fprintf(stderr, "Invalid compression type\n");
                 return -1;
@@ -125,7 +167,7 @@ int main(int argc, char** argv) {
         // If length was specified, an offset was not, we were asked to create a
         // file, and the file does not exist, truncate it to the given length.
         if (length != 0 && offset == 0) {
-            fbl::unique_fd fd(open(path, O_CREAT|O_EXCL|O_WRONLY, 0644));
+            fbl::unique_fd fd(open(path, O_CREAT | O_EXCL | O_WRONLY, 0644));
 
             if (fd) {
                 ftruncate(fd.get(), length);
@@ -189,7 +231,7 @@ int main(int argc, char** argv) {
         }
 
         fbl::unique_ptr<SparseContainer> sparseContainer;
-        if (SparseContainer::Create(path, slice_size, compress, &sparseContainer) != ZX_OK) {
+        if (SparseContainer::Create(path, slice_size, flags, &sparseContainer) != ZX_OK) {
             return -1;
         }
 
@@ -202,11 +244,33 @@ int main(int argc, char** argv) {
         }
     } else if (!strcmp(command, "verify")) {
         fbl::unique_ptr<Container> containerData;
-        if (Container::Create(path, offset, length, &containerData) != ZX_OK) {
+        if (Container::Create(path, offset, length, flags, &containerData) != ZX_OK) {
             return -1;
         }
 
         if (containerData->Verify() != ZX_OK) {
+            return -1;
+        }
+    } else if (!strcmp(command, "decompress")) {
+        if (argc - i != 2) {
+            usage();
+            return -1;
+        }
+
+        char* input_type = argv[i];
+        char* input_path = argv[i + 1];
+
+        if (strcmp(input_type, "--sparse")) {
+            usage();
+            return -1;
+        }
+
+        if (fvm::decompress_sparse(input_path, path) != ZX_OK) {
+            return -1;
+        }
+
+        fbl::unique_ptr<SparseContainer> sparseData(new SparseContainer(path, slice_size, flags));
+        if (sparseData->Verify() != ZX_OK) {
             return -1;
         }
     } else {

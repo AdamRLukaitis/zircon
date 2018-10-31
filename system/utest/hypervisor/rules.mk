@@ -22,6 +22,10 @@ MODULE_LIBS := \
     system/ulib/zircon \
 
 MODULE_STATIC_LIBS := \
+    system/ulib/fbl \
     system/ulib/zx \
+
+MODULE_FIDL_LIBS := \
+    system/fidl/fuchsia-sysinfo \
 
 include make/module.mk

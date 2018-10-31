@@ -8,7 +8,7 @@
 #include <zircon/process.h>
 #include <zircon/processargs.h>
 #include <zircon/syscalls.h>
-#include <fdio/util.h>
+#include <lib/fdio/util.h>
 #include <stdio.h>
 #include <sys/param.h>
 #include <string.h>
@@ -100,8 +100,8 @@ bool vdso_unmap_test(void) {
 bool vdso_map_test(void) {
     BEGIN_TEST;
 
-    zx_handle_t vmo = zx_get_startup_handle(PA_HND(PA_VMO_VDSO, 0));
-    ASSERT_NE(vmo, ZX_HANDLE_INVALID, "zx_get_startup_handle(PA_HND(PA_VMO_VDSO, 0))");
+    zx_handle_t vmo = zx_take_startup_handle(PA_HND(PA_VMO_VDSO, 0));
+    ASSERT_NE(vmo, ZX_HANDLE_INVALID, "zx_take_startup_handle(PA_HND(PA_VMO_VDSO, 0))");
 
     // Since we already have a vDSO mapping, loading it again should fail.
     void* h = dlopen_vmo(vmo, RTLD_LOCAL);
@@ -122,8 +122,8 @@ bool vdso_map_test(void) {
     // segment can be mapped executable.
     uintptr_t addr;
     zx_status_t status = zx_vmar_map(
-        vmar, 0, vmo, 0, PAGE_SIZE,
-        ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_EXECUTE, &addr);
+        vmar, ZX_VM_PERM_READ | ZX_VM_PERM_EXECUTE, 0, vmo, 0,
+        PAGE_SIZE, &addr);
     EXPECT_EQ(status, ZX_ERR_ACCESS_DENIED, "map vDSO data as executable");
 
     zx_handle_close(proc);

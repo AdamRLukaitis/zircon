@@ -16,6 +16,7 @@ class port;
 class guest;
 class fifo;
 class interrupt;
+class pmt;
 
 // The default traits supports:
 // - event
@@ -24,7 +25,6 @@ class interrupt;
 // - job
 // - vmo
 // - bti
-// - log
 // - resource
 // - timer
 template <typename T> struct object_traits {
@@ -57,8 +57,15 @@ template <> struct object_traits<fifo> {
 
 template <> struct object_traits<log> {
     static constexpr bool supports_duplication = true;
-    static constexpr bool supports_user_signal = false;
+    static constexpr bool supports_user_signal = true;
     static constexpr bool supports_wait = true;
+    static constexpr bool has_peer_handle = false;
+};
+
+template <> struct object_traits<pmt> {
+    static constexpr bool supports_duplication = false;
+    static constexpr bool supports_user_signal = false;
+    static constexpr bool supports_wait = false;
     static constexpr bool has_peer_handle = false;
 };
 

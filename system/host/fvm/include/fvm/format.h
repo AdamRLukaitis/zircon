@@ -35,6 +35,7 @@ static constexpr char kBlobfsName[] = "blobfs";
 // Guid type names
 static constexpr char kDefaultTypeName[] = "default";
 static constexpr char kDataTypeName[] = "data";
+static constexpr char kDataUnsafeTypeName[] = "data-unsafe";
 static constexpr char kSystemTypeName[] = "system";
 static constexpr char kBlobTypeName[] = "blob";
 
@@ -89,6 +90,8 @@ public:
     virtual uint32_t BlockSize() const = 0;
     virtual uint32_t BlocksPerSlice() const = 0;
 
+    uint32_t Flags() const { return flags_; }
+
     uint32_t VpartIndex() const {
         CheckFvmReady();
         return vpart_index_;
@@ -99,6 +102,9 @@ protected:
     uint32_t vpart_index_;
     uint8_t guid_[FVM_GUID_LEN];
     uint8_t type_[GPT_GUID_LEN];
+    uint32_t flags_;
+
+    Format();
 
     void CheckFvmReady() const {
         if (!fvm_ready_) {
@@ -135,13 +141,13 @@ private:
     // Input superblock
     union {
         char blk_[minfs::kMinfsBlockSize];
-        minfs::minfs_info_t info_;
+        minfs::Superblock info_;
     };
 
     // Output superblock
     union {
         char fvm_blk_[minfs::kMinfsBlockSize];
-        minfs::minfs_info_t fvm_info_;
+        minfs::Superblock fvm_info_;
     };
 };
 
@@ -167,12 +173,15 @@ private:
     // Input superblock
     union {
         char blk_[blobfs::kBlobfsBlockSize];
-        blobfs::blobfs_info_t info_;
+        blobfs::Superblock info_;
     };
 
     // Output superblock
     union {
         char fvm_blk_[blobfs::kBlobfsBlockSize];
-        blobfs::blobfs_info_t fvm_info_;
+        blobfs::Superblock fvm_info_;
     };
+
+    uint32_t BlocksToSlices(uint32_t block_count) const;
+    uint32_t SlicesToBlocks(uint32_t slice_count) const;
 };

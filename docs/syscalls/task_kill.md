@@ -23,10 +23,22 @@ signal. When the procedure completes, as observed by the signal, the task and
 all its children are considered to be in the dead state and most operations
 will no longer succeed.
 
+If *handle* is a job and the syscall is sucessful, the job cannot longer be
+used to create new processes.
+
+## RIGHTS
+
+TODO(ZX-2399)
+
 ## RETURN VALUE
 
 On success, **zx_task_kill**() returns **ZX_OK**. If a process or thread uses
 this syscall to kill itself, this syscall does not return.
+
+## NOTES
+
+When using this syscall on a process, the return code for the process
+is -1 as reported by **object_get_info**() via the ZX_INFO_PROCESS topic.
 
 ## ERRORS
 

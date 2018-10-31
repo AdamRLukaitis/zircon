@@ -8,11 +8,13 @@
 #include <ddk/protocol/i2c.h>
 #include <ddk/protocol/platform-device.h>
 #include <ddktl/device.h>
+#include <ddktl/mmio.h>
 #include <ddktl/device-internal.h>
 #include <zircon/listnode.h>
 #include <lib/zx/bti.h>
 #include <lib/zx/vmo.h>
 #include <fbl/mutex.h>
+#include <fbl/optional.h>
 #include <fbl/vector.h>
 
 #include <audio-proto/audio-proto.h>
@@ -67,7 +69,7 @@ private:
         : TdmAudioStreamBase(parent),
           TdmOutputStreamProtocol(),
           default_domain_(fbl::move(default_domain)),
-          create_time_(zx_clock_get(ZX_CLOCK_MONOTONIC)) { }
+          create_time_(zx_clock_get_monotonic()) { }
 
     virtual ~TdmOutputStream();
 
@@ -82,18 +84,25 @@ private:
     void DeactivateStreamChannel(const dispatcher::Channel* channel);
 
     zx_status_t OnGetStreamFormatsLocked(dispatcher::Channel* channel,
-                                         const audio_proto::StreamGetFmtsReq& req)
+                                         const audio_proto::StreamGetFmtsReq& req) const
         __TA_REQUIRES(lock_);
     zx_status_t OnSetStreamFormatLocked(dispatcher::Channel* channel,
                                         const audio_proto::StreamSetFmtReq& req,
                                         bool privileged)
         __TA_REQUIRES(lock_);
-    zx_status_t OnGetGainLocked(dispatcher::Channel* channel, const audio_proto::GetGainReq& req)
+    zx_status_t OnGetGainLocked(dispatcher::Channel* channel,
+                                const audio_proto::GetGainReq& req) const
         __TA_REQUIRES(lock_);
     zx_status_t OnSetGainLocked(dispatcher::Channel* channel, const audio_proto::SetGainReq& req)
         __TA_REQUIRES(lock_);
     zx_status_t OnPlugDetectLocked(dispatcher::Channel* channel,
                                    const audio_proto::PlugDetectReq& req) __TA_REQUIRES(lock_);
+    zx_status_t OnGetUniqueIdLocked(dispatcher::Channel* channel,
+                                    const audio_proto::GetUniqueIdReq& req) const
+        __TA_REQUIRES(lock_);
+    zx_status_t OnGetStringLocked(dispatcher::Channel* channel,
+                                  const audio_proto::GetStringReq& req) const
+        __TA_REQUIRES(lock_);
 
     // Thunks for dispatching ring buffer channel events.
     zx_status_t ProcessRingBufferChannel(dispatcher::Channel * channel);
@@ -106,8 +115,9 @@ private:
 
     // Stream command handlers
     // Ring buffer command handlers
-    zx_status_t OnGetFifoDepthLocked(dispatcher::Channel* channel,
-            const audio_proto::RingBufGetFifoDepthReq& req) __TA_REQUIRES(lock_);
+    zx_status_t OnGetFifoDepthLocked(
+            dispatcher::Channel* channel,
+            const audio_proto::RingBufGetFifoDepthReq& req) const __TA_REQUIRES(lock_);
     zx_status_t OnGetBufferLocked(dispatcher::Channel* channel,
             const audio_proto::RingBufGetBufferReq& req) __TA_REQUIRES(lock_);
     zx_status_t OnStartLocked(dispatcher::Channel* channel, const audio_proto::RingBufStartReq& req)
@@ -125,8 +135,7 @@ private:
 
 
     // control registers for the tdm block
-    aml_tdm_regs_t* regs_ = nullptr;
-    zx::vmo regs_vmo_;
+    fbl::optional<ddk::MmioBuffer> mmio_;
 
     fbl::RefPtr<dispatcher::Timer> notify_timer_;
 
@@ -135,7 +144,7 @@ private:
     // sample rates).
     fbl::Vector<audio_stream_format_range_t> supported_formats_;
 
-    platform_device_protocol_t pdev_;
+    pdev_protocol_t pdev_;
     i2c_protocol_t i2c_;
 
     fbl::unique_ptr<Tas57xx> left_sub_;

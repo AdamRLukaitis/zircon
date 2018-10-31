@@ -11,11 +11,21 @@ MODULE_TYPE := driver
 MODULE_SRCS := \
     $(LOCAL_DIR)/usb-bus.c \
     $(LOCAL_DIR)/usb-device.c \
-    $(LOCAL_DIR)/usb-interface.c \
     $(LOCAL_DIR)/util.c \
 
-MODULE_STATIC_LIBS := system/ulib/ddk system/ulib/sync
+MODULE_STATIC_LIBS := \
+    system/dev/lib/usb \
+    system/ulib/ddk \
+    system/ulib/fidl \
+    system/ulib/sync \
+    system/ulib/utf_conversion \
+    system/dev/lib/usb \
 
-MODULE_LIBS := system/ulib/driver system/ulib/zircon system/ulib/c
+MODULE_LIBS := \
+    system/ulib/driver \
+    system/ulib/zircon \
+    system/ulib/c \
+
+MODULE_FIDL_LIBS := system/fidl/zircon-usb-device
 
 include make/module.mk

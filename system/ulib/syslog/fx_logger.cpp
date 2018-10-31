@@ -3,11 +3,12 @@
 // found in the LICENSE file.
 
 #include <fbl/algorithm.h>
+#include <fbl/auto_lock.h>
 #include <fbl/string_buffer.h>
 #include <zircon/assert.h>
 
-#include <syslog/logger.h>
-#include <syslog/wire_format.h>
+#include <lib/syslog/logger.h>
+#include <lib/syslog/wire_format.h>
 
 #include "fx_logger.h"
 
@@ -19,7 +20,7 @@ thread_local zx_koid_t tls_thread_koid{ZX_KOID_INVALID};
 
 zx_koid_t GetCurrentThreadKoid() {
     if (unlikely(tls_thread_koid == ZX_KOID_INVALID)) {
-        tls_thread_koid = GetKoid(zx::thread::self().get());
+        tls_thread_koid = GetKoid(zx_thread_self());
     }
     ZX_DEBUG_ASSERT(tls_thread_koid != ZX_KOID_INVALID);
     return tls_thread_koid;
@@ -28,6 +29,10 @@ zx_koid_t GetCurrentThreadKoid() {
 } // namespace
 
 void fx_logger::ActivateFallback(int fallback_fd) {
+    fbl::AutoLock lock(&fallback_mutex_);
+    if (logger_fd_.load(fbl::memory_order_relaxed) != -1) {
+        return;
+    }
     ZX_DEBUG_ASSERT(fallback_fd >= -1);
     if (tagstr_.empty()) {
         for (size_t i = 0; i < tags_.size(); i++) {
@@ -42,14 +47,14 @@ void fx_logger::ActivateFallback(int fallback_fd) {
         fallback_fd = STDERR_FILENO;
     }
     // Do not change fd_to_close_ as we don't want to close fallback_fd.
-    // We will still close original cosole_fd_
+    // We will still close original console_fd_
     logger_fd_.store(fallback_fd, fbl::memory_order_relaxed);
 }
 
 zx_status_t fx_logger::VLogWriteToSocket(fx_log_severity_t severity,
                                          const char* tag, const char* msg,
                                          va_list args, bool perform_format) {
-    zx_time_t time = zx_clock_get(ZX_CLOCK_MONOTONIC);
+    zx_time_t time = zx_clock_get_monotonic();
     fx_log_packet_t packet;
     memset(&packet, 0, sizeof(packet));
     constexpr size_t kDataSize = sizeof(packet.data);
@@ -84,6 +89,7 @@ zx_status_t fx_logger::VLogWriteToSocket(fx_log_severity_t severity,
     // Write msg
     int n = static_cast<int>(kDataSize - pos);
     int count = 0;
+    size_t msg_pos = pos;
     if (!perform_format) {
         size_t write_len =
             fbl::min(strlen(msg), static_cast<size_t>(n - 1));
@@ -103,8 +109,16 @@ zx_status_t fx_logger::VLogWriteToSocket(fx_log_severity_t severity,
         constexpr size_t kEllipsisSize = sizeof(kEllipsis) - 1;
         memcpy(packet.data + kDataSize - 1 - kEllipsisSize, kEllipsis,
                kEllipsisSize);
+        count = n - 1;
     }
-    auto status = socket_.write(0, &packet, sizeof(packet), nullptr);
+    auto size = sizeof(packet.metadata) + msg_pos + count + 1;
+    ZX_DEBUG_ASSERT(size <= sizeof(packet));
+    auto status = socket_.write(0, &packet, size, nullptr);
+    if (status == ZX_ERR_BAD_STATE || status == ZX_ERR_PEER_CLOSED) {
+        ActivateFallback(-1);
+        return VLogWriteToFd(logger_fd_.load(fbl::memory_order_relaxed),
+                             severity, tag, packet.data + msg_pos, args, false);
+    }
     if (status != ZX_OK) {
         dropped_logs_.fetch_add(1);
     }
@@ -114,7 +128,7 @@ zx_status_t fx_logger::VLogWriteToSocket(fx_log_severity_t severity,
 zx_status_t fx_logger::VLogWriteToFd(int fd, fx_log_severity_t severity,
                                      const char* tag, const char* msg,
                                      va_list args, bool perform_format) {
-    zx_time_t time = zx_clock_get(ZX_CLOCK_MONOTONIC);
+    zx_time_t time = zx_clock_get_monotonic();
     constexpr char kEllipsis[] = "...";
     constexpr size_t kEllipsisSize = sizeof(kEllipsis) - 1;
     constexpr size_t kMaxMessageSize = 2043;

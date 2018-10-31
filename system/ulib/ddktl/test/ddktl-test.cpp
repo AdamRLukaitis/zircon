@@ -38,7 +38,7 @@ static void inline update_test_report(bool success, test_report_t* report) {
     }
 }
 
-zx_status_t ddktl_test_func(void* cookie, test_report_t* report, const void* arg, size_t arglen) {
+zx_status_t ddktl_test_func(void* cookie, const void* arg, size_t arglen, test_report_t* report) {
     auto dev = static_cast<zx_device_t*>(cookie);
 
     test_protocol_t proto;
@@ -61,15 +61,16 @@ zx_status_t ddktl_test_func(void* cookie, test_report_t* report, const void* arg
 
 }  // namespace
 
-extern "C" zx_status_t ddktl_test_bind(void* ctx, zx_device_t* dev, void** cookie) {
+extern "C" zx_status_t ddktl_test_bind(void* ctx, zx_device_t* parent) {
     test_protocol_t proto;
     auto status =
-        device_get_protocol(dev, ZX_PROTOCOL_TEST, reinterpret_cast<void*>(&proto));
+        device_get_protocol(parent, ZX_PROTOCOL_TEST, reinterpret_cast<void*>(&proto));
     if (status != ZX_OK) {
         return status;
     }
 
-    proto.ops->set_test_func(proto.ctx, ddktl_test_func, dev);
+    const test_func_t test = {ddktl_test_func, parent};
+    proto.ops->set_test_func(proto.ctx, &test);
 
     return ZX_OK;
 }

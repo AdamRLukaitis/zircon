@@ -15,6 +15,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <fbl/algorithm.h>
+
 #define LOCAL_TRACE 0
 #define LTRACEF(str, x...)                                  \
     do {                                                    \
@@ -54,6 +56,23 @@ bool handle_valid_on_closed_handle_fails() {
     END_TEST;
 }
 
+// Tests that ZX_INFO_TASK_STATS does not return ZX_ERR_BAD_STATE
+// when the task has not yet started.
+bool task_stats_unstarted() {
+    BEGIN_TEST;
+    zx_handle_t vmar;
+    zx_handle_t process;
+    static const char pname[] = "object-info-unstarted";
+    ASSERT_EQ(zx_process_create(zx_job_default(), pname, sizeof(pname),
+                                /* options */ 0u, &process, &vmar),
+              ZX_OK);
+    zx_info_task_stats_t info;
+    EXPECT_EQ(zx_object_get_info(process, ZX_INFO_TASK_STATS, &info,
+                                 sizeof(info), nullptr, nullptr),
+              ZX_OK);
+    END_TEST;
+}
+
 // Tests that ZX_INFO_TASK_STATS seems to work.
 bool task_stats_smoke() {
     BEGIN_TEST;
@@ -72,27 +91,27 @@ bool task_stats_smoke() {
 }
 
 // Structs to keep track of VMARs/mappings in the test child process.
-typedef struct test_mapping {
+struct TestMapping {
     uintptr_t base;
     size_t size;
     uint32_t flags; // ZX_INFO_MAPS_MMU_FLAG_PERM_{READ,WRITE,EXECUTE}
-} test_mapping_t;
+};
 
 // A VMO that the test process maps or has a handle to.
-typedef struct test_vmo {
+struct TestVmo {
     zx_koid_t koid;
     size_t size;
     uint32_t flags; // ZX_INFO_VMO_VIA_{HANDLE,MAPPING}
-} test_vmo_t;
+};
 
-typedef struct test_mapping_info {
+struct TestMappingInfo {
     uintptr_t vmar_base;
     size_t vmar_size;
     size_t num_mappings;
-    test_mapping_t* mappings; // num_mappings entries
+    TestMapping* mappings; // num_mappings entries
     size_t num_vmos;
-    test_vmo_t* vmos; // num_vmos entries
-} test_mapping_info_t;
+    TestVmo* vmos; // num_vmos entries
+};
 
 // Gets the koid of the object pointed to by |handle|.
 zx_status_t get_koid(zx_handle_t handle, zx_koid_t* koid) {
@@ -109,9 +128,9 @@ zx_status_t get_koid(zx_handle_t handle, zx_koid_t* koid) {
 // process, so tests should use this instead.
 // This handle is leaked, and we expect our process teardown to clean it up
 // naturally.
-zx_handle_t get_test_process_etc(const test_mapping_info_t** info) {
+zx_handle_t get_test_process_etc(const TestMappingInfo** info) {
     static zx_handle_t test_process = ZX_HANDLE_INVALID;
-    static test_mapping_info_t* test_info = nullptr;
+    static TestMappingInfo* test_info = nullptr;
 
     if (info != nullptr) {
         *info = nullptr;
@@ -184,19 +203,20 @@ zx_handle_t get_test_process_etc(const test_mapping_info_t** info) {
 
         static const size_t kNumMappings = 8;
         // Leaked on failure. Never freed on success.
-        test_mapping_info_t* ti = (test_mapping_info_t*)malloc(sizeof(*ti));
+        TestMappingInfo* ti = (TestMappingInfo*)malloc(sizeof(*ti));
         ti->num_mappings = kNumMappings;
         ti->mappings =
-            (test_mapping_t*)malloc(kNumMappings * sizeof(test_mapping_t));
+            (TestMapping*)malloc(kNumMappings * sizeof(TestMapping));
 
         // Big enough to fit all of the mappings with some slop.
         ti->vmar_size = PAGE_SIZE * kNumMappings * 16;
         zx_handle_t sub_vmar;
-        s = zx_vmar_allocate(vmar, /* offset */ 0,
+        s = zx_vmar_allocate(vmar,
+                             ZX_VM_CAN_MAP_READ |
+                                 ZX_VM_CAN_MAP_WRITE |
+                                 ZX_VM_CAN_MAP_EXECUTE,
+                             /* offset */ 0,
                              ti->vmar_size,
-                             ZX_VM_FLAG_CAN_MAP_READ |
-                                 ZX_VM_FLAG_CAN_MAP_WRITE |
-                                 ZX_VM_FLAG_CAN_MAP_EXECUTE,
                              &sub_vmar, &ti->vmar_base);
         if (s != ZX_OK) {
             EXPECT_EQ(s, ZX_OK, "zx_vmar_allocate");
@@ -222,7 +242,7 @@ zx_handle_t get_test_process_etc(const test_mapping_info_t** info) {
 
         // Record the VMOs now that we have both of them.
         ti->num_vmos = 2;
-        ti->vmos = (test_vmo_t*)malloc(2 * sizeof(test_vmo_t));
+        ti->vmos = (TestVmo*)malloc(2 * sizeof(TestVmo));
         ti->vmos[0].koid = unmapped_vmo_koid;
         ti->vmos[0].size = unmapped_vmo_size;
         ti->vmos[0].flags = ZX_INFO_VMO_VIA_HANDLE;
@@ -232,24 +252,23 @@ zx_handle_t get_test_process_etc(const test_mapping_info_t** info) {
 
         // Map each page of the VMO to some arbitray location in the VMAR.
         for (size_t i = 0; i < kNumMappings; i++) {
-            test_mapping_t* m = &ti->mappings[i];
+            TestMapping* m = &ti->mappings[i];
             m->size = PAGE_SIZE;
 
             // Pick flags for this mapping; cycle through different
             // combinations for the test. Must always have READ set
             // to be mapped.
-            m->flags = ZX_VM_FLAG_PERM_READ;
+            m->flags = ZX_VM_PERM_READ;
             if (i & 1) {
-                m->flags |= ZX_VM_FLAG_PERM_WRITE;
+                m->flags |= ZX_VM_PERM_WRITE;
             }
             if (i & 2) {
-                m->flags |= ZX_VM_FLAG_PERM_EXECUTE;
+                m->flags |= ZX_VM_PERM_EXECUTE;
             }
 
-            s = zx_vmar_map(sub_vmar, /* vmar_offset (ignored) */ 0,
+            s = zx_vmar_map(sub_vmar, m->flags, /* vmar_offset (ignored) */ 0,
                             vmo, /* vmo_offset */ i * PAGE_SIZE,
                             /* len */ PAGE_SIZE,
-                            m->flags,
                             &m->base);
             if (s != ZX_OK) {
                 char msg[32];
@@ -274,10 +293,28 @@ zx_handle_t get_test_process() {
     return get_test_process_etc(nullptr);
 }
 
+// Tests that ZX_INFO_PROCESS_MAPS does not return ZX_ERR_BAD_STATE
+// when the process has not yet started.
+bool process_maps_unstarted() {
+    BEGIN_TEST;
+    zx_handle_t vmar;
+    zx_handle_t process;
+    static const char pname[] = "object-info-unstarted";
+    ASSERT_EQ(zx_process_create(zx_job_default(), pname, sizeof(pname),
+                                /* options */ 0u, &process, &vmar),
+              ZX_OK);
+    size_t actual, avail;
+    zx_info_maps_t maps;
+    EXPECT_EQ(zx_object_get_info(process, ZX_INFO_PROCESS_MAPS, &maps, 0,
+                                 &actual, &avail),
+              ZX_OK);
+    END_TEST;
+}
+
 // Tests that ZX_INFO_PROCESS_MAPS seems to work.
 bool process_maps_smoke() {
     BEGIN_TEST;
-    const test_mapping_info_t* test_info;
+    const TestMappingInfo* test_info;
     const zx_handle_t process = get_test_process_etc(&test_info);
     ASSERT_NONNULL(test_info, "get_test_process_etc");
 
@@ -322,7 +359,7 @@ bool process_maps_smoke() {
         // All entries should be children of the root VMAR.
         EXPECT_GT(entry->depth, 1u, msg);
         EXPECT_TRUE(entry->type >= ZX_INFO_MAPS_TYPE_ASPACE &&
-                        entry->type < ZX_INFO_MAPS_TYPE_LAST,
+                        entry->type <= ZX_INFO_MAPS_TYPE_MAPPING,
                     msg);
 
         if (entry->type == ZX_INFO_MAPS_TYPE_VMAR &&
@@ -347,7 +384,7 @@ bool process_maps_smoke() {
                 // Look for it in the expected mappings.
                 bool found = false;
                 for (size_t j = 0; j < test_info->num_mappings; j++) {
-                    const test_mapping_t* t = &test_info->mappings[j];
+                    const TestMapping* t = &test_info->mappings[j];
                     if (t->base == entry->base && t->size == entry->size) {
                         // Make sure we don't see duplicates.
                         EXPECT_EQ(0u, saw_mapping & (1 << j), msg);
@@ -569,10 +606,10 @@ bool partially_unmapped_buffer_fails() {
     zx_handle_t vmar;
     uintptr_t vmar_addr;
     ASSERT_EQ(zx_vmar_allocate(zx_vmar_root_self(),
+                               ZX_VM_CAN_MAP_READ |
+                                   ZX_VM_CAN_MAP_WRITE |
+                                   ZX_VM_CAN_MAP_SPECIFIC,
                                0, 2 * PAGE_SIZE,
-                               ZX_VM_FLAG_CAN_MAP_READ |
-                                   ZX_VM_FLAG_CAN_MAP_WRITE |
-                                   ZX_VM_FLAG_CAN_MAP_SPECIFIC,
                                &vmar, &vmar_addr),
               ZX_OK);
 
@@ -582,11 +619,11 @@ bool partially_unmapped_buffer_fails() {
 
     // Map the first page of the VMAR.
     uintptr_t vmo_addr;
-    ASSERT_EQ(zx_vmar_map(vmar, 0, vmo, 0, PAGE_SIZE,
-                          ZX_VM_FLAG_SPECIFIC |
-                              ZX_VM_FLAG_PERM_READ |
-                              ZX_VM_FLAG_PERM_WRITE,
-                          &vmo_addr),
+    ASSERT_EQ(zx_vmar_map(vmar,
+                          ZX_VM_SPECIFIC |
+                              ZX_VM_PERM_READ |
+                              ZX_VM_PERM_WRITE,
+                          0, vmo, 0, PAGE_SIZE, &vmo_addr),
               ZX_OK);
     ASSERT_EQ(vmar_addr, vmo_addr);
 
@@ -639,7 +676,7 @@ bool bad_avail_fails() {
 // Tests that ZX_INFO_PROCESS_VMOS seems to work.
 bool process_vmos_smoke() {
     BEGIN_TEST;
-    const test_mapping_info_t* test_info;
+    const TestMappingInfo* test_info;
     const zx_handle_t process = get_test_process_etc(&test_info);
     ASSERT_NONNULL(test_info, "get_test_process_etc");
 
@@ -676,7 +713,7 @@ bool process_vmos_smoke() {
         // Look for it in the expected VMOs. We won't find all VMOs here,
         // since we don't track the vDSO or mini-process stack.
         for (size_t j = 0; j < test_info->num_vmos; j++) {
-            const test_vmo_t* t = &test_info->vmos[j];
+            const TestVmo* t = &test_info->vmos[j];
             if (t->koid == entry->koid && t->size == entry->size_bytes) {
                 // These checks aren't appropriate for all VMOs.
                 // The VMOs we track are:
@@ -878,14 +915,14 @@ bool handle_count_valid() {
     ASSERT_EQ(zx_event_create(0u, &event[0]), ZX_OK);
     EXPECT_EQ(handle_count_or_zero(event[0]), 1u);
 
-    for (size_t i = 1; i != countof(event); ++i) {
+    for (size_t i = 1; i != fbl::count_of(event); ++i) {
         ASSERT_EQ(zx_handle_duplicate(
                       event[0], ZX_RIGHT_SIGNAL, &event[i]),
                   ZX_OK);
         EXPECT_EQ(handle_count_or_zero(event[0]), i + 1);
     }
 
-    for (size_t i = countof(event) - 1; i != 0; --i) {
+    for (size_t i = fbl::count_of(event) - 1; i != 0; --i) {
         ASSERT_EQ(zx_handle_close(event[i]), ZX_OK);
         EXPECT_EQ(handle_count_or_zero(event[0]), i);
     }
@@ -953,18 +990,20 @@ RUN_TEST(handle_valid_on_valid_handle_succeeds);
 RUN_TEST(handle_valid_on_closed_handle_fails);
 RUN_TEST((invalid_handle_fails<ZX_INFO_HANDLE_VALID, void*>));
 
+RUN_TEST(task_stats_unstarted);
 RUN_TEST(task_stats_smoke);
 RUN_SINGLE_ENTRY_TESTS(ZX_INFO_TASK_STATS, zx_info_task_stats_t, zx_process_self);
 RUN_TEST((wrong_handle_type_fails<ZX_INFO_TASK_STATS, zx_info_task_stats_t, get_test_job>));
 RUN_TEST((wrong_handle_type_fails<ZX_INFO_TASK_STATS, zx_info_task_stats_t, zx_thread_self>));
 
+RUN_TEST(process_maps_unstarted);
 RUN_TEST(process_maps_smoke);
 RUN_MULTI_ENTRY_TESTS(ZX_INFO_PROCESS_MAPS, zx_info_maps_t, get_test_process);
 RUN_TEST((self_fails<ZX_INFO_PROCESS_MAPS, zx_info_maps_t>))
 RUN_TEST((wrong_handle_type_fails<ZX_INFO_PROCESS_MAPS, zx_info_maps_t, get_test_job>));
 RUN_TEST((wrong_handle_type_fails<ZX_INFO_PROCESS_MAPS, zx_info_maps_t, zx_thread_self>));
 RUN_TEST((missing_rights_fails<ZX_INFO_PROCESS_MAPS, zx_info_maps_t, get_test_process,
-                               ZX_RIGHT_READ>));
+                               ZX_RIGHT_INSPECT>));
 
 RUN_TEST(process_vmos_smoke);
 RUN_MULTI_ENTRY_TESTS(ZX_INFO_PROCESS_VMOS, zx_info_vmo_t, get_test_process);
@@ -972,7 +1011,7 @@ RUN_TEST((self_fails<ZX_INFO_PROCESS_VMOS, zx_info_vmo_t>))
 RUN_TEST((wrong_handle_type_fails<ZX_INFO_PROCESS_VMOS, zx_info_vmo_t, get_test_job>));
 RUN_TEST((wrong_handle_type_fails<ZX_INFO_PROCESS_VMOS, zx_info_vmo_t, zx_thread_self>));
 RUN_TEST((missing_rights_fails<ZX_INFO_PROCESS_VMOS, zx_info_vmo_t, get_test_process,
-                               ZX_RIGHT_READ>));
+                               ZX_RIGHT_INSPECT>));
 
 RUN_TEST(job_processes_smoke);
 RUN_MULTI_ENTRY_TESTS(ZX_INFO_JOB_PROCESSES, zx_koid_t, get_test_job);

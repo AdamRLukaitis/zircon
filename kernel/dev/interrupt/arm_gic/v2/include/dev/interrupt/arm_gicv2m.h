@@ -6,11 +6,10 @@
 // https://opensource.org/licenses/MIT
 
 #pragma once
+
 #include <sys/types.h>
 #include <zircon/compiler.h>
 #include <zircon/types.h>
-
-__BEGIN_CDECLS
 
 /**
  * Structure used to hold information about a GICv2m register frame
@@ -48,5 +47,3 @@ void arm_gicv2m_init(const paddr_t* reg_frames, const vaddr_t* reg_frames_virt, 
  *     appear to be corrupt or invalid (internal error)
  */
 zx_status_t arm_gicv2m_get_frame_info(uint frame_ndx, arm_gicv2m_frame_info_t* out_info);
-
-__END_CDECLS

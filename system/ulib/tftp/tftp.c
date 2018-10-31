@@ -324,7 +324,8 @@ tftp_status tftp_generate_request(tftp_session* session,
     memcpy(body, remote_filename, remote_filename_len);
     body += remote_filename_len + 1;
     left -= remote_filename_len + 1;
-    strncpy(session->filename, local_filename, sizeof(session->filename));
+    strncpy(session->filename, local_filename, sizeof(session->filename) - 1);
+    session->filename[sizeof(session->filename) - 1] = '\0';
     switch (mode) {
     case MODE_NETASCII:
         append_option_name(&body, &left, kNetascii);
@@ -443,7 +444,8 @@ tftp_status tftp_handle_request(tftp_session* session,
 
     xprintf("filename = '%s', mode = '%s'\n", option, value);
 
-    strncpy(session->filename, option, sizeof(session->filename));
+    strncpy(session->filename, option, sizeof(session->filename) - 1);
+    session->filename[sizeof(session->filename) - 1] = '\0';
     char* mode = value;
     if (!strncasecmp(mode, kNetascii, strlen(kNetascii))) {
         session->mode = MODE_NETASCII;
@@ -565,7 +567,7 @@ tftp_status tftp_handle_request(tftp_session* session,
                                                       cookie)) {
             case TFTP_ERR_SHOULD_WAIT:
                 // The open_write() callback can return an ERR_SHOULD_WAIT response if it isn't
-                // prepared to service another requst at the moment and the client should retry
+                // prepared to service another request at the moment and the client should retry
                 // later.
                 xprintf("Denying write request received when not ready\n");
                 set_error(session, TFTP_ERR_CODE_BUSY, resp, resp_len, "not ready to receive");
@@ -590,7 +592,7 @@ tftp_status tftp_handle_request(tftp_session* session,
             file_size = session->file_interface.open_read(session->filename, cookie);
             if (file_size == TFTP_ERR_SHOULD_WAIT) {
                 // The open_read() callback can return an ERR_SHOULD_WAIT response if it isn't
-                // prepared to service another requst at the moment and the client should retry
+                // prepared to service another request at the moment and the client should retry
                 // later.
                 xprintf("Denying read request received when not ready\n");
                 set_error(session, TFTP_ERR_CODE_BUSY, resp, resp_len, "not ready to send");
@@ -821,6 +823,9 @@ tftp_status tftp_handle_error(tftp_session* session,
                               size_t* resp_len,
                               uint32_t* timeout_ms,
                               void* cookie) {
+    if (err_len < sizeof(tftp_err_msg)) {
+        return TFTP_ERR_BUFFER_TOO_SMALL;
+    }
     uint16_t err_code = ntohs(err->err_code);
 
     // There's no need to respond to an error
@@ -956,6 +961,10 @@ tftp_status tftp_process_msg(tftp_session* session,
                              size_t* outlen,
                              uint32_t* timeout_ms,
                              void* cookie) {
+    if (inlen < sizeof(tftp_msg)) {
+        return TFTP_ERR_BUFFER_TOO_SMALL;
+    }
+
     tftp_msg* msg = incoming;
     tftp_msg* resp = outgoing;
 
@@ -1307,4 +1316,3 @@ tftp_status tftp_handle_msg(tftp_session* session,
     }
     return ret;
 }
-

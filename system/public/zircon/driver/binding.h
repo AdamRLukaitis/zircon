@@ -94,10 +94,11 @@ __BEGIN_CDECLS;
 #define BIND_USB_SUBCLASS     0x0203
 #define BIND_USB_PROTOCOL     0x0204
 
-// Platform device binding variables at 0x03XX
+// Platform bus binding variables at 0x03XX
 #define BIND_PLATFORM_DEV_VID 0x0300
 #define BIND_PLATFORM_DEV_PID 0x0301
 #define BIND_PLATFORM_DEV_DID 0x0302
+#define BIND_PLATFORM_PROTO   0x0303
 
 // ACPI binding variables at 0x04XX
 // The _HID is a 7- or 8-byte string. Because a bind property is 32-bit, use 2
@@ -122,6 +123,24 @@ __BEGIN_CDECLS;
 #define BIND_SERIAL_CLASS           0x0600
 #define BIND_SERIAL_VID             0x0601
 #define BIND_SERIAL_PID             0x0602
+
+// NAND binding variables at 0x07XX
+#define BIND_NAND_CLASS             0x0700
+
+// Bluetooth binding variables at 0x08XX
+#define BIND_BT_GATT_SVC_UUID16     0x0800
+// 128-bit UUID is split across 4 32-bit unsigned ints
+#define BIND_BT_GATT_SVC_UUID128_1     0x0801
+#define BIND_BT_GATT_SVC_UUID128_2     0x0802
+#define BIND_BT_GATT_SVC_UUID128_3     0x0803
+#define BIND_BT_GATT_SVC_UUID128_4     0x0804
+
+// SDIO binding variables at 0x09XX
+#define BIND_SDIO_VID             0x0900
+#define BIND_SDIO_PID             0x0901
+
+// I2C binding variables at 0x0AXX
+#define BIND_I2C_CLASS            0x0A00
 
 // TEMPORARY binding variables at 0xfXX
 // I2C_ADDR is a temporary way to bind the i2c touchscreen on the Acer12. This
@@ -205,8 +224,8 @@ typedef struct {
     (__has_feature(address_sanitizer) ? ZIRCON_DRIVER_NOTE_FLAG_ASAN : 0)
 
 typedef struct {
-    alignas(4) zircon_driver_note_header_t header;
-    alignas(4) zircon_driver_note_payload_t payload;
+    zircon_driver_note_header_t header;
+    zircon_driver_note_payload_t payload;
 } zircon_driver_note_t;
 
 static_assert(offsetof(zircon_driver_note_t, payload) ==
@@ -227,6 +246,18 @@ static_assert(offsetof(zircon_driver_note_t, payload) ==
 // warning/error about that.  The attribute must appear on the "extern"
 // declaration of the variable instead.
 
+// We explicitly align the note to 4 bytes.  That's its natural alignment
+// anyway, but the compilers sometimes like to over-align as an
+// optimization while other tools sometimes like to complain if SHT_NOTE
+// sections are over-aligned (since this could result in padding being
+// inserted that makes it violate the ELF note format).  Standard C11
+// doesn't permit alignas(...) on a type but we could use __ALIGNED(4) on
+// all the types (i.e. GNU __attribute__ syntax instead of C11 syntax).
+// But the alignment of the types is not actually the issue: it's the
+// compiler deciding to over-align the individual object regardless of its
+// type's alignment, so we have to explicitly set the alignment of the
+// object to defeat any compiler default over-alignment.
+
 #define ZIRCON_DRIVER_BEGIN(Driver,Ops,VendorName,Version,BindCount) \
 zx_driver_rec_t __zircon_driver_rec__ __EXPORT = {\
     /* .ops = */ &(Ops),\
@@ -234,7 +265,7 @@ zx_driver_rec_t __zircon_driver_rec__ __EXPORT = {\
     /* .log_flags = */ 7, /* DDK_LOG_ERROR | DDK_LOG_WARN | DDK_LOG_INFO */\
 };\
 extern const struct zircon_driver_note __zircon_driver_note__ __EXPORT;\
-__SECTION(".note.zircon.driver." #Driver) ZIRCON_DRIVER_NOTE_ASAN \
+alignas(4) __SECTION(".note.zircon.driver." #Driver) ZIRCON_DRIVER_NOTE_ASAN \
 const struct zircon_driver_note {\
     zircon_driver_note_t note;\
     zx_bind_inst_t binding[BindCount];\

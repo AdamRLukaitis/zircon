@@ -26,8 +26,6 @@
 #include <zircon/rights.h>
 #include <zircon/types.h>
 
-using fbl::AutoLock;
-
 #define LOCAL_TRACE 0
 
 KCOUNTER(channel_packet_depth_1, "kernel.channel.depth.1");
@@ -58,7 +56,7 @@ zx_status_t ChannelDispatcher::Create(fbl::RefPtr<Dispatcher>* dispatcher0,
     ch0->Init(ch1);
     ch1->Init(ch0);
 
-    *rights = ZX_DEFAULT_CHANNEL_RIGHTS;
+    *rights = default_rights();
     *dispatcher0 = fbl::move(ch0);
     *dispatcher1 = fbl::move(ch1);
     return ZX_OK;
@@ -87,22 +85,22 @@ ChannelDispatcher::~ChannelDispatcher() {
 
     switch (max_message_count_) {
     case 0 ... 1:
-        kcounter_add(channel_packet_depth_1, 1u);
+        kcounter_add(channel_packet_depth_1, 1);
         break;
     case 2 ... 4:
-        kcounter_add(channel_packet_depth_4, 1u);
+        kcounter_add(channel_packet_depth_4, 1);
         break;
     case 5 ... 16:
-        kcounter_add(channel_packet_depth_16, 1u);
+        kcounter_add(channel_packet_depth_16, 1);
         break;
     case 17 ... 64:
-        kcounter_add(channel_packet_depth_64, 1u);
+        kcounter_add(channel_packet_depth_64, 1);
         break;
     case 65 ... 256:
-        kcounter_add(channel_packet_depth_256, 1u);
+        kcounter_add(channel_packet_depth_256, 1);
         break;
     default:
-        kcounter_add(channel_packet_depth_unbounded, 1u);
+        kcounter_add(channel_packet_depth_unbounded, 1);
         break;
     }
 }
@@ -110,7 +108,7 @@ ChannelDispatcher::~ChannelDispatcher() {
 zx_status_t ChannelDispatcher::add_observer(StateObserver* observer) {
     canary_.Assert();
 
-    AutoLock lock(get_lock());
+    Guard<fbl::Mutex> guard{get_lock()};
     StateObserver::CountInfo cinfo =
         {{{message_count_, ZX_CHANNEL_READABLE}, {0u, 0u}}};
     AddObserverLocked(observer, &cinfo);
@@ -118,20 +116,15 @@ zx_status_t ChannelDispatcher::add_observer(StateObserver* observer) {
 }
 
 void ChannelDispatcher::RemoveWaiter(MessageWaiter* waiter) {
-    AutoLock lock(get_lock());
+    Guard<fbl::Mutex> guard{get_lock()};
     if (!waiter->InContainer()) {
         return;
     }
     waiters_.erase(*waiter);
 }
 
-void ChannelDispatcher::on_zero_handles() {
+void ChannelDispatcher::on_zero_handles_locked() {
     canary_.Assert();
-
-    AutoLock lock(get_lock());
-    // Detach other endpoint
-
-    fbl::RefPtr<ChannelDispatcher> other = fbl::move(peer_);
 
     // (3A) Abort any waiting Call operations
     // because we've been canceled by reason
@@ -141,20 +134,15 @@ void ChannelDispatcher::on_zero_handles() {
         auto waiter = waiters_.pop_front();
         waiter->Cancel(ZX_ERR_CANCELED);
     }
-
-    // Ensure other endpoint detaches us
-    if (other)
-        other->OnPeerZeroHandlesLocked();
 }
 
 // This requires holding the shared channel lock. The thread analysis
 // can reason about repeated calls to get_lock() on the shared object,
 // but cannot reason about the aliasing between left->get_lock() and
 // right->get_lock(), which occurs above in on_zero_handles.
-void ChannelDispatcher::OnPeerZeroHandlesLocked() TA_NO_THREAD_SAFETY_ANALYSIS {
+void ChannelDispatcher::OnPeerZeroHandlesLocked() {
     canary_.Assert();
 
-    peer_.reset();
     UpdateStateLocked(ZX_CHANNEL_WRITABLE, ZX_CHANNEL_PEER_CLOSED);
     // (3B) Abort any waiting Call operations
     // because we've been canceled by reason
@@ -175,7 +163,7 @@ zx_status_t ChannelDispatcher::Read(uint32_t* msg_size,
     auto max_size = *msg_size;
     auto max_handle_count = *msg_handle_count;
 
-    AutoLock lock(get_lock());
+    Guard<fbl::Mutex> guard{get_lock()};
 
     if (messages_.is_empty())
         return peer_ ? ZX_ERR_SHOULD_WAIT : ZX_ERR_PEER_CLOSED;
@@ -201,28 +189,24 @@ zx_status_t ChannelDispatcher::Read(uint32_t* msg_size,
 zx_status_t ChannelDispatcher::Write(fbl::unique_ptr<MessagePacket> msg) {
     canary_.Assert();
 
-    AutoLock lock(get_lock());
-    if (!peer_) {
-        // |msg| will be destroyed but we want to keep the handles alive since
-        // the caller should put them back into the process table.
-        msg->set_owns_handles(false);
-        return ZX_ERR_PEER_CLOSED;
-    }
+    AutoReschedDisable resched_disable; // Must come before the lock guard.
+    resched_disable.Disable();
+    Guard<fbl::Mutex> guard{get_lock()};
 
-    if (peer_->WriteSelf(fbl::move(msg)) > 0)
-        thread_reschedule();
+    if (!peer_)
+        return ZX_ERR_PEER_CLOSED;
+    peer_->WriteSelf(fbl::move(msg));
 
     return ZX_OK;
 }
 
 zx_status_t ChannelDispatcher::Call(fbl::unique_ptr<MessagePacket> msg,
-                                    zx_time_t deadline, bool* return_handles,
-                                    fbl::unique_ptr<MessagePacket>* reply) {
+                                    zx_time_t deadline, fbl::unique_ptr<MessagePacket>* reply) {
 
     canary_.Assert();
 
     auto waiter = ThreadDispatcher::GetCurrent()->GetMessageWaiter();
-    if (unlikely(waiter->BeginWait(fbl::WrapRefPtr(this), msg->get_txid()) != ZX_OK)) {
+    if (unlikely(waiter->BeginWait(fbl::WrapRefPtr(this)) != ZX_OK)) {
         // If a thread tries BeginWait'ing twice, the VDSO contract around retrying
         // channel calls has been violated.  Shoot the misbehaving process.
         ProcessDispatcher::GetCurrent()->Kill();
@@ -230,16 +214,33 @@ zx_status_t ChannelDispatcher::Call(fbl::unique_ptr<MessagePacket> msg,
     }
 
     {
-        AutoLock lock(get_lock());
+        AutoReschedDisable resched_disable; // Must come before the lock guard.
+        resched_disable.Disable();
+        Guard<fbl::Mutex> guard{get_lock()};
 
         if (!peer_) {
-            // |msg| will be destroyed but we want to keep the handles alive since
-            // the caller should put them back into the process table.
-            msg->set_owns_handles(false);
-            *return_handles = true;
             waiter->EndWait(reply);
             return ZX_ERR_PEER_CLOSED;
         }
+
+        // Obtain a txid.  txid 0 is not allowed, and 1..0x7FFFFFFF are reserved
+        // for userspace.  So, bump our counter and OR in the high bit.
+alloc_txid:
+        zx_txid_t txid = (++txid_) | 0x80000000;
+
+        // If there are waiting messages, ensure we have not allocated a txid
+        // that's already in use.  This is unlikely.  It's atypical for multiple
+        // threads to be invoking channel_call() on the same channel at once, so
+        // the waiter list is most commonly empty.
+        for (auto& waiter: waiters_) {
+            if (waiter.get_txid() == txid) {
+                goto alloc_txid;
+            }
+        }
+
+        // Install our txid in the waiter and the outbound message
+        waiter->set_txid(txid);
+        msg->set_txid(txid);
 
         // (0) Before writing the outbound message and waiting, add our
         // waiter to the list.
@@ -261,11 +262,15 @@ zx_status_t ChannelDispatcher::ResumeInterruptedCall(MessageWaiter* waiter,
 
     // (2) Wait for notification via waiter's event or for the
     // deadline to hit.
-    zx_status_t status = waiter->Wait(deadline);
-    if (status == ZX_ERR_INTERNAL_INTR_RETRY) {
-        // If we got interrupted, return out to usermode, but
-        // do not clear the waiter.
-        return status;
+    {
+        ThreadDispatcher::AutoBlocked by(ThreadDispatcher::Blocked::CHANNEL);
+
+        zx_status_t status = waiter->Wait(deadline);
+        if (status == ZX_ERR_INTERNAL_INTR_RETRY) {
+            // If we got interrupted, return out to usermode, but
+            // do not clear the waiter.
+            return status;
+        }
     }
 
     // (3) see (3A), (3B) above or (3C) below for paths where
@@ -275,21 +280,25 @@ zx_status_t ChannelDispatcher::ResumeInterruptedCall(MessageWaiter* waiter,
     // from the list *but* another thread could still
     // cause (3A), (3B), or (3C) before the lock below.
     {
-        AutoLock lock(get_lock());
+        Guard<fbl::Mutex> guard{get_lock()};
 
         // (4) If any of (3A), (3B), or (3C) have occurred,
         // we were removed from the waiters list already
         // and EndWait() returns a non-ZX_ERR_TIMED_OUT status.
         // Otherwise, the status is ZX_ERR_TIMED_OUT and it
         // is our job to remove the waiter from the list.
-        if ((status = waiter->EndWait(reply)) == ZX_ERR_TIMED_OUT)
+        zx_status_t status = waiter->EndWait(reply);
+        if (status == ZX_ERR_TIMED_OUT)
             waiters_.erase(*waiter);
+        return status;
     }
-
-    return status;
 }
 
-int ChannelDispatcher::WriteSelf(fbl::unique_ptr<MessagePacket> msg) {
+size_t ChannelDispatcher::TxMessageMax() const {
+    return SIZE_MAX;
+}
+
+void ChannelDispatcher::WriteSelf(fbl::unique_ptr<MessagePacket> msg) {
     canary_.Assert();
 
     if (!waiters_.is_empty()) {
@@ -302,8 +311,8 @@ int ChannelDispatcher::WriteSelf(fbl::unique_ptr<MessagePacket> msg) {
             // Remove waiter from list.
             if (waiter.get_txid() == txid) {
                 waiters_.erase(waiter);
-                // we return how many threads have been woken up, or zero.
-                return waiter.Deliver(fbl::move(msg));
+                waiter.Deliver(fbl::move(msg));
+                return;
             }
         }
     }
@@ -314,7 +323,6 @@ int ChannelDispatcher::WriteSelf(fbl::unique_ptr<MessagePacket> msg) {
     }
 
     UpdateStateLocked(0u, ZX_CHANNEL_READABLE);
-    return 0;
 }
 
 zx_status_t ChannelDispatcher::UserSignalSelf(uint32_t clear_mask, uint32_t set_mask) {
@@ -330,33 +338,31 @@ ChannelDispatcher::MessageWaiter::~MessageWaiter() {
     DEBUG_ASSERT(!InContainer());
 }
 
-zx_status_t ChannelDispatcher::MessageWaiter::BeginWait(fbl::RefPtr<ChannelDispatcher> channel,
-                                                        zx_txid_t txid) {
+zx_status_t ChannelDispatcher::MessageWaiter::BeginWait(fbl::RefPtr<ChannelDispatcher> channel) {
     if (unlikely(channel_)) {
         return ZX_ERR_BAD_STATE;
     }
     DEBUG_ASSERT(!InContainer());
 
-    txid_ = txid;
     status_ = ZX_ERR_TIMED_OUT;
     channel_ = fbl::move(channel);
     event_.Unsignal();
     return ZX_OK;
 }
 
-int ChannelDispatcher::MessageWaiter::Deliver(fbl::unique_ptr<MessagePacket> msg) {
+void ChannelDispatcher::MessageWaiter::Deliver(fbl::unique_ptr<MessagePacket> msg) {
     DEBUG_ASSERT(channel_);
 
     msg_ = fbl::move(msg);
     status_ = ZX_OK;
-    return event_.Signal(ZX_OK);
+    event_.Signal(ZX_OK);
 }
 
-int ChannelDispatcher::MessageWaiter::Cancel(zx_status_t status) {
+void ChannelDispatcher::MessageWaiter::Cancel(zx_status_t status) {
     DEBUG_ASSERT(!InContainer());
     DEBUG_ASSERT(channel_);
     status_ = status;
-    return event_.Signal(status);
+    event_.Signal(status);
 }
 
 zx_status_t ChannelDispatcher::MessageWaiter::Wait(zx_time_t deadline) {

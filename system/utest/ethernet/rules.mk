@@ -18,11 +18,14 @@ MODULE_STATIC_LIBS := \
     system/ulib/zxcpp \
     system/ulib/fbl \
     system/ulib/ddk \
+    system/ulib/fzl \
 
 MODULE_LIBS := \
     system/ulib/fdio \
     system/ulib/zircon \
     system/ulib/unittest \
     system/ulib/c \
+
+MODULE_FIDL_LIBS := system/fidl/zircon-ethernet
 
 include make/module.mk

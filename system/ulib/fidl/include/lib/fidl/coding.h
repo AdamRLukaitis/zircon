@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef LIB_FIDL_CODING_H_
+#define LIB_FIDL_CODING_H_
 
 #include <zircon/compiler.h>
 #include <zircon/fidl.h>
@@ -15,27 +16,27 @@ __BEGIN_CDECLS
 // vectors) counts as one step in the recursion depth.
 #define FIDL_RECURSION_DEPTH 32
 
-// An opaque struct representing the encoding of a particular fidl
-// type.
-typedef struct fidl_type fidl_type_t;
-
-// See
-// https://fuchsia.googlesource.com/zircon/+/HEAD/docs/fidl/c-language-bindings.md#fidl_encode
+// See https://fuchsia.googlesource.com/docs/+/master/development/languages/fidl/c.md#fidl_encode-fidl_encode_msg
 zx_status_t fidl_encode(const fidl_type_t* type, void* bytes, uint32_t num_bytes,
-                        zx_handle_t* handles, uint32_t max_handles, uint32_t* actual_handles_out,
-                        const char** error_msg_out);
+                        zx_handle_t* handles, uint32_t max_handles,
+                        uint32_t* out_actual_handles, const char** out_error_msg);
+zx_status_t fidl_encode_msg(const fidl_type_t* type, fidl_msg_t* msg,
+                            uint32_t* out_actual_handles, const char** out_error_msg);
 
-// See
-// https://fuchsia.googlesource.com/zircon/+/HEAD/docs/fidl/c-language-bindings.md#fidl_decode
+// See https://fuchsia.googlesource.com/docs/+/master/development/languages/fidl/c.md#fidl_decode-fidl_decode_msg
 zx_status_t fidl_decode(const fidl_type_t* type, void* bytes, uint32_t num_bytes,
                         const zx_handle_t* handles, uint32_t num_handles,
                         const char** error_msg_out);
+zx_status_t fidl_decode_msg(const fidl_type_t* type, fidl_msg_t* msg,
+                            const char** out_error_msg);
 
 // Validates an encoded message against the given |type|.
 //
 // The |bytes| are not modified.
 zx_status_t fidl_validate(const fidl_type_t* type, const void* bytes, uint32_t num_bytes,
                           uint32_t num_handles, const char** error_msg_out);
+zx_status_t fidl_validate_msg(const fidl_type_t* type, const fidl_msg_t* msg,
+                              const char** out_error_msg);
 
 // Stores the name of a fidl type into the provided buffer.
 // Truncates the name if it is too long to fit into the buffer.
@@ -46,3 +47,5 @@ size_t fidl_format_type_name(const fidl_type_t* type,
                              char* buffer, size_t capacity);
 
 __END_CDECLS
+
+#endif // LIB_FIDL_CODING_H_

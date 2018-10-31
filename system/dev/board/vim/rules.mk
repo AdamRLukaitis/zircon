@@ -15,10 +15,21 @@ MODULE_SRCS += \
     $(LOCAL_DIR)/vim-mali.c \
     $(LOCAL_DIR)/vim-uart.c \
     $(LOCAL_DIR)/vim-usb.c \
+    $(LOCAL_DIR)/vim-sd-emmc.c \
+    $(LOCAL_DIR)/vim-sdio.c \
+    $(LOCAL_DIR)/vim-eth.c \
+    $(LOCAL_DIR)/vim-thermal.c \
+    $(LOCAL_DIR)/vim-display.c \
+    $(LOCAL_DIR)/vim-video.c \
+    $(LOCAL_DIR)/vim-led2472g.c \
+    $(LOCAL_DIR)/vim-rtc.c \
+    $(LOCAL_DIR)/vim-canvas.c \
+    $(LOCAL_DIR)/vim-clk.c \
 
 MODULE_STATIC_LIBS := \
     system/ulib/ddk \
-    system/ulib/sync
+    system/ulib/sync \
+    system/dev/lib/broadcom \
 
 MODULE_LIBS := \
     system/ulib/driver \
@@ -26,6 +37,6 @@ MODULE_LIBS := \
     system/ulib/zircon
 
 MODULE_HEADER_DEPS := \
-    system/dev/soc/amlogic
+    system/dev/lib/amlogic \
 
 include make/module.mk

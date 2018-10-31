@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <limits.h>
 #include <stddef.h>
 
 #include <fbl/type_support.h>
@@ -60,12 +61,14 @@ constexpr zx_handle_t dummy_handle_29 = static_cast<zx_handle_t>(52);
 
 // All sizes in fidl encoding tables are 32 bits. The fidl compiler
 // normally enforces this. Check manually in manual tests.
-template <typename T, size_t N> uint32_t ArrayCount(T const (&array)[N]) {
+template <typename T, size_t N>
+uint32_t ArrayCount(T const (&array)[N]) {
     static_assert(N < UINT32_MAX, "Array is too large!");
     return N;
 }
 
-template <typename T, size_t N> uint32_t ArraySize(T const (&array)[N]) {
+template <typename T, size_t N>
+uint32_t ArraySize(T const (&array)[N]) {
     static_assert(sizeof(array) < UINT32_MAX, "Array is too large!");
     return sizeof(array);
 }
@@ -346,11 +349,11 @@ bool encode_array_of_present_handles_error_closes_handles() {
     for (uint32_t i = 0; i < ArrayCount(handle_pairs); ++i) {
         zx_signals_t observed_signals;
         EXPECT_EQ(zx_object_wait_one(handle_pairs[i][1],
-                                     ZX_EPAIR_PEER_CLOSED,
+                                     ZX_EVENTPAIR_PEER_CLOSED,
                                      1, // deadline shouldn't matter, should return immediately.
                                      &observed_signals),
-                   ZX_OK);
-        EXPECT_EQ(observed_signals & ZX_EPAIR_PEER_CLOSED, ZX_EPAIR_PEER_CLOSED);
+                  ZX_OK);
+        EXPECT_EQ(observed_signals & ZX_EVENTPAIR_PEER_CLOSED, ZX_EVENTPAIR_PEER_CLOSED);
         EXPECT_EQ(zx_handle_close(handle_pairs[i][1]), ZX_OK); // [i][0] was closed by fidl_encode.
     }
 
@@ -610,7 +613,7 @@ bool encode_absent_nonnullable_string_error() {
                               nullptr, 0, &actual_handles, &error);
 
     EXPECT_EQ(status, ZX_ERR_INVALID_ARGS);
-    EXPECT_NONNULL(error, error);
+    EXPECT_NONNULL(error);
 
     END_TEST;
 }
@@ -700,7 +703,7 @@ bool encode_absent_nonnullable_bounded_string_error() {
                               sizeof(message), nullptr, 0, &actual_handles, &error);
 
     EXPECT_EQ(status, ZX_ERR_INVALID_ARGS);
-    EXPECT_NONNULL(error, error);
+    EXPECT_NONNULL(error);
     EXPECT_EQ(reinterpret_cast<uint64_t>(message.inline_struct.string.data), FIDL_ALLOC_ABSENT);
 
     END_TEST;
@@ -717,9 +720,8 @@ bool encode_absent_nullable_bounded_string() {
     auto status = fidl_encode(&bounded_32_nullable_string_message_type, &message,
                               sizeof(message.inline_struct), nullptr, 0, &actual_handles, &error);
 
-    EXPECT_EQ(status, ZX_OK);
-    EXPECT_NULL(error, error);
-    EXPECT_EQ(reinterpret_cast<uint64_t>(message.inline_struct.string.data), FIDL_ALLOC_ABSENT);
+    EXPECT_EQ(status, ZX_ERR_INVALID_ARGS);
+    EXPECT_NONNULL(error);
 
     END_TEST;
 }
@@ -760,6 +762,32 @@ bool encode_present_nullable_bounded_string_short_error() {
 
     EXPECT_EQ(status, ZX_ERR_INVALID_ARGS);
     EXPECT_NONNULL(error);
+
+    END_TEST;
+}
+
+bool encode_vector_with_huge_count() {
+    BEGIN_TEST;
+
+    unbounded_nonnullable_vector_of_uint32_message_layout message = {};
+    // (2^30 + 4) * 4 (4 == sizeof(uint32_t)) overflows to 16 when stored as uint32_t.
+    // We want 16 because it happens to be the actual size of the vector data in the message,
+    // so we can trigger the overflow without triggering the "tried to claim too many bytes" or
+    // "didn't use all the bytes in the message" errors.
+    message.inline_struct.vector =
+        fidl_vector_t{(1ull << 30) + 4, &message.uint32[0]};
+
+    const char* error = nullptr;
+    uint32_t actual_handles = 0u;
+    auto status =
+        fidl_encode(&unbounded_nonnullable_vector_of_uint32_message_type, &message,
+                    sizeof(message), nullptr, 0, &actual_handles, &error);
+
+    EXPECT_EQ(status, ZX_ERR_INVALID_ARGS);
+    EXPECT_NONNULL(error);
+    const char expected_error_msg[] = "integer overflow calculating vector size";
+    EXPECT_STR_EQ(expected_error_msg, error, "wrong error msg");
+    EXPECT_EQ(actual_handles, 0u);
 
     END_TEST;
 }
@@ -851,7 +879,7 @@ bool encode_absent_nonnullable_vector_of_handles_error() {
                     sizeof(message), handles, ArrayCount(handles), &actual_handles, &error);
 
     EXPECT_EQ(status, ZX_ERR_INVALID_ARGS);
-    EXPECT_NONNULL(error, error);
+    EXPECT_NONNULL(error);
 
     END_TEST;
 }
@@ -867,12 +895,8 @@ bool encode_absent_nullable_vector_of_handles() {
     auto status = fidl_encode(&unbounded_nullable_vector_of_handles_message_type, &message,
                               sizeof(message.inline_struct), nullptr, 0u, &actual_handles, &error);
 
-    EXPECT_EQ(status, ZX_OK);
-    EXPECT_NULL(error, error);
-    EXPECT_EQ(actual_handles, 0u);
-
-    auto message_handles = reinterpret_cast<uint64_t>(message.inline_struct.vector.data);
-    EXPECT_EQ(message_handles, FIDL_ALLOC_ABSENT);
+    EXPECT_EQ(status, ZX_ERR_INVALID_ARGS);
+    EXPECT_NONNULL(error);
 
     END_TEST;
 }
@@ -977,12 +1001,8 @@ bool encode_absent_nullable_bounded_vector_of_handles() {
     auto status = fidl_encode(&bounded_32_nullable_vector_of_handles_message_type, &message,
                               sizeof(message.inline_struct), nullptr, 0u, &actual_handles, &error);
 
-    EXPECT_EQ(status, ZX_OK);
-    EXPECT_NULL(error, error);
-    EXPECT_EQ(actual_handles, 0u);
-
-    auto message_handles = reinterpret_cast<uint64_t>(message.inline_struct.vector.data);
-    EXPECT_EQ(message_handles, FIDL_ALLOC_ABSENT);
+    EXPECT_EQ(status, ZX_ERR_INVALID_ARGS);
+    EXPECT_NONNULL(error);
 
     END_TEST;
 }
@@ -1102,7 +1122,7 @@ bool encode_absent_nonnullable_vector_of_uint32_error() {
                     sizeof(message), nullptr, 0, &actual_handles, &error);
 
     EXPECT_EQ(status, ZX_ERR_INVALID_ARGS);
-    EXPECT_NONNULL(error, error);
+    EXPECT_NONNULL(error);
 
     END_TEST;
 }
@@ -1118,12 +1138,8 @@ bool encode_absent_nullable_vector_of_uint32() {
     auto status = fidl_encode(&unbounded_nullable_vector_of_uint32_message_type, &message,
                               sizeof(message.inline_struct), nullptr, 0u, &actual_handles, &error);
 
-    EXPECT_EQ(status, ZX_OK);
-    EXPECT_NULL(error, error);
-    EXPECT_EQ(actual_handles, 0u);
-
-    auto message_uint32 = reinterpret_cast<uint64_t>(message.inline_struct.vector.data);
-    EXPECT_EQ(message_uint32, FIDL_ALLOC_ABSENT);
+    EXPECT_EQ(status, ZX_ERR_INVALID_ARGS);
+    EXPECT_NONNULL(error);
 
     END_TEST;
 }
@@ -1200,12 +1216,8 @@ bool encode_absent_nullable_bounded_vector_of_uint32() {
     auto status = fidl_encode(&bounded_32_nullable_vector_of_uint32_message_type, &message,
                               sizeof(message.inline_struct), nullptr, 0u, &actual_handles, &error);
 
-    EXPECT_EQ(status, ZX_OK);
-    EXPECT_NULL(error, error);
-    EXPECT_EQ(actual_handles, 0u);
-
-    auto message_uint32 = reinterpret_cast<uint64_t>(message.inline_struct.vector.data);
-    EXPECT_EQ(message_uint32, FIDL_ALLOC_ABSENT);
+    EXPECT_EQ(status, ZX_ERR_INVALID_ARGS);
+    EXPECT_NONNULL(error);
 
     END_TEST;
 }
@@ -1721,7 +1733,7 @@ bool encode_nested_struct_recursion_too_deep_error() {
                          ArrayCount(handles), &actual_handles, &error);
     EXPECT_EQ(status, ZX_ERR_INVALID_ARGS);
     EXPECT_NONNULL(error);
-    const char expected_error_msg[] = "recursion depth exceeded encoding struct";
+    const char expected_error_msg[] = "recursion depth exceeded processing struct";
     EXPECT_STR_EQ(expected_error_msg, error, "wrong error msg");
 
     END_TEST;
@@ -1763,6 +1775,7 @@ RUN_TEST(encode_present_nullable_bounded_string_short_error)
 END_TEST_CASE(strings)
 
 BEGIN_TEST_CASE(vectors)
+RUN_TEST(encode_vector_with_huge_count)
 RUN_TEST(encode_present_nonnullable_vector_of_handles)
 RUN_TEST(encode_present_nullable_vector_of_handles)
 RUN_TEST(encode_absent_nonnullable_vector_of_handles_error)

@@ -6,7 +6,7 @@
 #include <fbl/auto_call.h>
 #include <fbl/algorithm.h>
 #include <fbl/limits.h>
-#include <fdio/io.h>
+#include <lib/fdio/io.h>
 #include <stdio.h>
 
 #include "wav-sink.h"
@@ -55,7 +55,7 @@ zx_status_t WAVSink::SetFormat(const AudioStream::Format& format) {
 
     case AUDIO_SAMPLE_FORMAT_32BIT_FLOAT:
         wav_hdr.format = FORMAT_IEEE_FLOAT;
-        // deliberate fall-thru
+        __FALLTHROUGH;
     case AUDIO_SAMPLE_FORMAT_20BIT_IN32:
     case AUDIO_SAMPLE_FORMAT_24BIT_IN32:
     case AUDIO_SAMPLE_FORMAT_32BIT:        wav_hdr.bits_per_sample = 32; break;

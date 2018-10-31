@@ -13,14 +13,16 @@
 #include <ddk/debug.h>
 #include <ddk/device.h>
 #include <ddk/driver.h>
+#include <ddk/io-buffer.h>
+#include <ddk/mmio-buffer.h>
 #include <ddk/protocol/block.h>
 #include <ddk/protocol/pci.h>
-#include <ddk/io-buffer.h>
+#include <ddk/protocol/pci-lib.h>
 
 #include <hw/reg.h>
 #include <hw/pci.h>
 
-#include <sync/completion.h>
+#include <lib/sync/completion.h>
 
 #include <zircon/device/block.h>
 #include <zircon/syscalls.h>
@@ -28,11 +30,6 @@
 #include <zircon/listnode.h>
 
 #include "nvme-hw.h"
-
-// If enabled, gather stats on concurrent io ops,
-// pending txns, etc.  Stats are retrieved by
-// IOCTL_BLOCK_GET_STATS
-#define WITH_STATS 1
 
 #define TXN_FLAG_FAILED 1
 
@@ -79,8 +76,7 @@ static_assert(PAGE_SIZE == (1ULL << PAGE_SHIFT), "");
 #define FLAG_HAS_VWC             0x0100
 
 typedef struct {
-    void* io;
-    zx_handle_t ioh;
+    mmio_buffer_t mmio;
     zx_handle_t irqh;
     zx_handle_t bti;
     uint32_t flags;
@@ -114,7 +110,7 @@ typedef struct {
     // The io signal completion is signaled from nvme_queue()
     // or from the irq thread, notifying the io thread that
     // it has work to do.
-    completion_t io_signal;
+    sync_completion_t io_signal;
 
     uint32_t max_xfer;
     block_info_t info;
@@ -134,7 +130,7 @@ typedef struct {
     // context for admin transactions
     // presently we serialize these under the admin_lock
     mtx_t admin_lock;
-    completion_t admin_signal;
+    sync_completion_t admin_signal;
     nvme_cpl_t admin_result;
 
     pci_protocol_t pci;
@@ -148,35 +144,9 @@ typedef struct {
     thrd_t irqthread;
     thrd_t iothread;
 
-#if WITH_STATS
-    size_t stat_concur;
-    size_t stat_pending;
-    size_t stat_max_concur;
-    size_t stat_max_pending;
-    size_t stat_total_ops;
-    size_t stat_total_blocks;
-#endif
-
     // pool of utxns
     nvme_utxn_t utxn[UTXN_COUNT];
 } nvme_device_t;
-
-#if WITH_STATS
-#define STAT_INC(name) do { nvme->stat_##name++; } while (0)
-#define STAT_DEC(name) do { nvme->stat_##name--; } while (0)
-#define STAT_DEC_IF(name, c) do { if (c) nvme->stat_##name--; } while (0)
-#define STAT_ADD(name, num) do { nvme->stat_##name += num; } while (0)
-#define STAT_INC_MAX(name) do { \
-    if (++nvme->stat_##name > nvme->stat_max_##name) { \
-        nvme->stat_max_##name = nvme->stat_##name; \
-    }} while (0)
-#else
-#define STAT_INC(name) do { } while (0)
-#define STAT_DEC(name) do { } while (0)
-#define STAT_DEC_IF(name, c) do { } while (0)
-#define STAT_ADD(name, num) do { } while (0)
-#define STAT_INC_MAX(name) do { } while (0)
-#endif
 
 
 // We break IO transactions down into one or more "micro transactions" (utxn)
@@ -199,13 +169,11 @@ static nvme_utxn_t* utxn_get(nvme_device_t* nvme) {
     }
     n--;
     nvme->utxn_avail &= ~(1ULL << n);
-    STAT_INC_MAX(concur);
     return nvme->utxn + n;
 }
 
 static void utxn_put(nvme_device_t* nvme, nvme_utxn_t* utxn) {
     uint64_t n = utxn->id;
-    STAT_DEC(concur);
     nvme->utxn_avail |= (1ULL << n);
 }
 
@@ -287,8 +255,7 @@ static int irq_thread(void* arg) {
     nvme_device_t* nvme = arg;
     for (;;) {
         zx_status_t r;
-        uint64_t slots;
-        if ((r = zx_interrupt_wait(nvme->irqh, &slots)) != ZX_OK) {
+        if ((r = zx_interrupt_wait(nvme->irqh, NULL)) != ZX_OK) {
             zxlogf(ERROR, "nvme: irq wait failed: %d\n", r);
             break;
         }
@@ -296,10 +263,10 @@ static int irq_thread(void* arg) {
         nvme_cpl_t cpl;
         if (nvme_admin_cq_get(nvme, &cpl) == ZX_OK) {
             nvme->admin_result = cpl;
-            completion_signal(&nvme->admin_signal);
+            sync_completion_signal(&nvme->admin_signal);
         }
 
-        completion_signal(&nvme->io_signal);
+        sync_completion_signal(&nvme->io_signal);
     }
     return 0;
 }
@@ -307,11 +274,11 @@ static int irq_thread(void* arg) {
 static zx_status_t nvme_admin_txn(nvme_device_t* nvme, nvme_cmd_t* cmd, nvme_cpl_t* cpl) {
     zx_status_t r;
     mtx_lock(&nvme->admin_lock);
-    completion_reset(&nvme->admin_signal);
+    sync_completion_reset(&nvme->admin_signal);
     if ((r = nvme_admin_sq_put(nvme, cmd)) != ZX_OK) {
         goto done;
     }
-    if ((r = completion_wait(&nvme->admin_signal, zx_deadline_after(ZX_SEC(1)))) != ZX_OK) {
+    if ((r = sync_completion_wait(&nvme->admin_signal, ZX_SEC(1))) != ZX_OK) {
         zxlogf(ERROR, "nvme: admin txn: timed out\n");
         goto done;
     }
@@ -372,8 +339,8 @@ static bool io_process_txn(nvme_device_t* nvme, nvme_txn_t* txn) {
 
         pages = utxn->virt;
 
-        if ((r = zx_bti_pin_new(nvme->bti, opt, vmo, pageoffset, pagecount << PAGE_SHIFT,
-                                pages, pagecount, &utxn->pmt)) != ZX_OK) {
+        if ((r = zx_bti_pin(nvme->bti, opt, vmo, pageoffset, pagecount << PAGE_SHIFT,
+                            pages, pagecount, &utxn->pmt)) != ZX_OK) {
             zxlogf(ERROR, "nvme: could not pin pages: %d\n", r);
             break;
         }
@@ -455,7 +422,6 @@ static void io_process_txns(nvme_device_t* nvme) {
     for (;;) {
         mtx_lock(&nvme->lock);
         txn = list_remove_head_type(&nvme->pending_txns, nvme_txn_t, node);
-        STAT_DEC_IF(pending, txn != NULL);
         mtx_unlock(&nvme->lock);
 
         if (txn == NULL) {
@@ -466,7 +432,6 @@ static void io_process_txns(nvme_device_t* nvme) {
             // put txn back at front of queue for further processing later
             mtx_lock(&nvme->lock);
             list_add_head(&nvme->pending_txns, &txn->node);
-            STAT_INC_MAX(pending);
             mtx_unlock(&nvme->lock);
             return;
         }
@@ -532,7 +497,7 @@ static void io_process_cpls(nvme_device_t* nvme) {
 static int io_thread(void* arg) {
     nvme_device_t* nvme = arg;
     for (;;) {
-        if (completion_wait(&nvme->io_signal, ZX_TIME_INFINITE)) {
+        if (sync_completion_wait(&nvme->io_signal, ZX_TIME_INFINITE)) {
             break;
         }
         if (nvme->flags & FLAG_SHUTDOWN) {
@@ -541,7 +506,7 @@ static int io_thread(void* arg) {
             break;
         }
 
-        completion_reset(&nvme->io_signal);
+        sync_completion_reset(&nvme->io_signal);
 
         // process completion messages
         io_process_cpls(nvme);
@@ -594,15 +559,11 @@ static void nvme_queue(void* ctx, block_op_t* op) {
            txn->opcode == NVME_OP_WRITE ? "wr" : "rd",
            txn->op.rw.length + 1U, txn->op.rw.offset_dev);
 
-    STAT_INC(total_ops);
-    STAT_ADD(total_blocks, txn->op.rw.length);
-
     mtx_lock(&nvme->lock);
     list_add_tail(&nvme->pending_txns, &txn->node);
-    STAT_INC_MAX(pending);
     mtx_unlock(&nvme->lock);
 
-    completion_signal(&nvme->io_signal);
+    sync_completion_signal(&nvme->io_signal);
 }
 
 static void nvme_query(void* ctx, block_info_t* info_out, size_t* block_op_size_out) {
@@ -623,34 +584,6 @@ static zx_status_t nvme_ioctl(void* ctx, uint32_t op, const void* cmd, size_t cm
         nvme_query(nvme, reply, &sz);
         *out_actual = sizeof(block_info_t);
         return ZX_OK;
-    }
-    case IOCTL_BLOCK_GET_STATS: {
-#if WITH_STATS
-        if (cmdlen != sizeof(bool)) {
-            return ZX_ERR_INVALID_ARGS;
-        }
-        block_stats_t* out = reply;
-        if (max < sizeof(*out)) {
-            return ZX_ERR_BUFFER_TOO_SMALL;
-        }
-        mtx_lock(&nvme->lock);
-        out->max_concur = nvme->stat_max_concur;
-        out->max_pending = nvme->stat_max_pending;
-        out->total_ops = nvme->stat_total_ops;
-        out->total_blocks = nvme->stat_total_blocks;
-        bool clear = *(bool *)cmd;
-        if (clear) {
-            nvme->stat_max_concur = 0;
-            nvme->stat_max_pending = 0;
-            nvme->stat_total_ops = 0;
-            nvme->stat_total_blocks = 0;
-        }
-        mtx_unlock(&nvme->lock);
-        *out_actual = sizeof(*out);
-        return ZX_OK;
-#else
-        return ZX_ERR_NOT_SUPPORTED;
-#endif
     }
     case IOCTL_DEVICE_SYNC: {
         return ZX_OK;
@@ -679,10 +612,10 @@ static void nvme_release(void* ctx) {
 
     zxlogf(INFO, "nvme: release\n");
     nvme->flags |= FLAG_SHUTDOWN;
-    if (nvme->ioh != ZX_HANDLE_INVALID) {
+    if (nvme->mmio.vmo != ZX_HANDLE_INVALID) {
         pci_enable_bus_master(&nvme->pci, false);
         zx_handle_close(nvme->bti);
-        zx_handle_close(nvme->ioh);
+        mmio_buffer_release(&nvme->mmio);
         // TODO: risks a handle use-after-close, will be resolved by IRQ api
         // changes coming soon
         zx_handle_close(nvme->irqh);
@@ -691,7 +624,7 @@ static void nvme_release(void* ctx) {
         thrd_join(nvme->irqthread, &r);
     }
     if (nvme->flags & FLAG_IO_THREAD_STARTED) {
-        completion_signal(&nvme->io_signal);
+        sync_completion_signal(&nvme->io_signal);
         thrd_join(nvme->iothread, &r);
     }
 
@@ -747,10 +680,10 @@ static void infostring(const char* prefix, uint8_t* str, size_t len) {
 }
 
 // Convenience accessors for BAR0 registers
-#define rd32(r) readl(nvme->io + NVME_REG_##r)
-#define rd64(r) readll(nvme->io + NVME_REG_##r)
-#define wr32(v,r) writel(v, nvme->io + NVME_REG_##r)
-#define wr64(v,r) writell(v, nvme->io + NVME_REG_##r)
+#define rd32(r) readl(nvme->mmio.vaddr + NVME_REG_##r)
+#define rd64(r) readll(nvme->mmio.vaddr + NVME_REG_##r)
+#define wr32(v,r) writel(v, nvme->mmio.vaddr + NVME_REG_##r)
+#define wr64(v,r) writell(v, nvme->mmio.vaddr + NVME_REG_##r)
 
 // dedicated pages from the page pool
 #define IDX_ADMIN_SQ   0
@@ -850,8 +783,8 @@ static zx_status_t nvme_init(nvme_device_t* nvme) {
     zxlogf(INFO, "nvme: controller ready. (after %u ms)\n", WAIT_MS - ms_remain);
 
     // registers and buffers for admin queues
-    nvme->io_admin_sq_tail_db = nvme->io + NVME_REG_SQnTDBL(0, cap);
-    nvme->io_admin_cq_head_db = nvme->io + NVME_REG_CQnHDBL(0, cap);
+    nvme->io_admin_sq_tail_db = nvme->mmio.vaddr + NVME_REG_SQnTDBL(0, cap);
+    nvme->io_admin_cq_head_db = nvme->mmio.vaddr + NVME_REG_CQnHDBL(0, cap);
 
     nvme->admin_sq = nvme->iob.virt + PAGE_SIZE * IDX_ADMIN_SQ;
     nvme->admin_sq_head = 0;
@@ -862,8 +795,8 @@ static zx_status_t nvme_init(nvme_device_t* nvme) {
     nvme->admin_cq_toggle = 1;
 
     // registers and buffers for IO queues
-    nvme->io_sq_tail_db = nvme->io + NVME_REG_SQnTDBL(1, cap);
-    nvme->io_cq_head_db = nvme->io + NVME_REG_CQnHDBL(1, cap);
+    nvme->io_sq_tail_db = nvme->mmio.vaddr + NVME_REG_SQnTDBL(1, cap);
+    nvme->io_cq_head_db = nvme->mmio.vaddr + NVME_REG_CQnHDBL(1, cap);
 
     nvme->io_sq = nvme->iob.virt + PAGE_SIZE * IDX_IO_SQ;
     nvme->io_sq_head = 0;
@@ -1039,7 +972,7 @@ static zx_status_t nvme_init(nvme_device_t* nvme) {
 
     nvme->info.block_count = ni->NSSZ;
     nvme->info.block_size = 1 << NVME_LBAFMT_LBADS(fmt);
-    nvme->info.max_transfer_size = 0xFFFFFFFF;
+    nvme->info.max_transfer_size = BLOCK_MAX_TRANSFER_UNBOUNDED;
 
     if (NVME_LBAFMT_MS(fmt)) {
         zxlogf(ERROR, "nvme: cannot handle LBA format with metadata\n");
@@ -1091,8 +1024,7 @@ static zx_status_t nvme_bind(void* ctx, zx_device_t* dev) {
         goto fail;
     }
 
-    if (pci_map_bar(&nvme->pci, 0u, ZX_CACHE_POLICY_UNCACHED_DEVICE,
-                    &nvme->io, &nvme->iosz, &nvme->ioh)) {
+    if (pci_map_bar_buffer(&nvme->pci, 0u, ZX_CACHE_POLICY_UNCACHED_DEVICE, &nvme->mmio)) {
         zxlogf(ERROR, "nvme: cannot map registers\n");
         goto fail;
     }

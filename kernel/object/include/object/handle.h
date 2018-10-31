@@ -12,6 +12,7 @@
 #include <fbl/macros.h>
 #include <fbl/mutex.h>
 #include <fbl/ref_ptr.h>
+#include <kernel/lockdep.h>
 #include <stdint.h>
 #include <zircon/types.h>
 
@@ -150,7 +151,7 @@ private:
     // Handle should never be destroyed by anything other than Delete,
     // which uses TearDown to do the actual destruction.
     ~Handle() = default;
-    void TearDown() TA_EXCL(mutex_);
+    void TearDown() TA_EXCL(ArenaLock::Get());
     void Delete();
 
     // Only HandleOwner is allowed to call Delete.
@@ -165,13 +166,13 @@ private:
     const uint32_t base_value_;
 
     // The handle arena and its mutex; also guards Dispatcher::handle_count_.
-    static fbl::Mutex mutex_;
-    static fbl::Arena TA_GUARDED(mutex_) arena_;
+    DECLARE_SINGLETON_MUTEX(ArenaLock);
+    static fbl::Arena TA_GUARDED(ArenaLock::Get()) arena_;
 
-    // NOTE! This can return an invalid pointer.
-    // It must be checked against the arena bounds before being used.
-    static Handle* IndexToHandle(uint32_t index) TA_NO_THREAD_SAFETY_ANALYSIS {
-        return reinterpret_cast<Handle*>(arena_.start()) + index;
+    // NOTE! This can return an invalid address.  It must be checked
+    // against the arena bounds before being cast to a Handle*.
+    static uintptr_t IndexToHandle(uint32_t index) TA_NO_THREAD_SAFETY_ANALYSIS {
+        return reinterpret_cast<uintptr_t>(arena_.start()) + index * sizeof(Handle);
     }
 
     static uint32_t HandleToIndex(Handle* handle) TA_NO_THREAD_SAFETY_ANALYSIS {

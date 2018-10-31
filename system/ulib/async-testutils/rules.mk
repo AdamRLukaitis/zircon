@@ -10,17 +10,20 @@ MODULE_NAME := async-testutils
 
 MODULE_TYPE := userlib
 
+MODULE_COMPILEFLAGS += -fvisibility=hidden
+
 MODULE_SRCS += \
-        $(LOCAL_DIR)/async_stub.cpp \
+        $(LOCAL_DIR)/dispatcher_stub.cpp \
         $(LOCAL_DIR)/test_loop.cpp \
         $(LOCAL_DIR)/test_loop_dispatcher.cpp
 
 MODULE_STATIC_LIBS := \
         system/ulib/async.cpp \
         system/ulib/async \
+        system/ulib/fbl \
         system/ulib/zx \
+        system/ulib/zircon-internal \
         system/ulib/zxcpp \
-        system/ulib/fbl
 
 MODULE_LIBS := \
         system/ulib/async.default \

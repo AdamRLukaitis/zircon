@@ -46,10 +46,7 @@ extern "C" {
 #define __NEED_useconds_t
 
 #if defined(_GNU_SOURCE) || defined(_BSD_SOURCE)
-#define __NEED_int8_t
-#define __NEED_int16_t
-#define __NEED_int32_t
-#define __NEED_int64_t
+#include <stdint.h>
 #define __NEED_u_int64_t
 #define __NEED_register_t
 #endif
@@ -69,14 +66,6 @@ typedef long long quad_t;
 typedef unsigned long long u_quad_t;
 #include <endian.h>
 #include <sys/select.h>
-#endif
-
-#if defined(_LARGEFILE64_SOURCE) || defined(_GNU_SOURCE)
-#define blkcnt64_t blkcnt_t
-#define fsblkcnt64_t fsblkcnt_t
-#define fsfilcnt64_t fsfilcnt_t
-#define ino64_t ino_t
-#define off64_t off_t
 #endif
 
 #ifdef __cplusplus

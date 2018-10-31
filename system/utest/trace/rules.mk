@@ -17,12 +17,17 @@ MODULE_SRCS += \
     $(LOCAL_DIR)/fields_tests.cpp \
     $(LOCAL_DIR)/fixture.cpp \
     $(LOCAL_DIR)/main.c \
+    $(LOCAL_DIR)/no_optimization.c \
     $(LOCAL_DIR)/record_tests.cpp
 
 MODULE_NAME := trace-test
 
+MODULE_HEADER_DEPS := \
+    system/ulib/trace-provider
+
 MODULE_STATIC_LIBS := \
     system/ulib/trace \
+    system/ulib/trace-provider.handler \
     system/ulib/trace-reader \
     system/ulib/async.cpp \
     system/ulib/async \

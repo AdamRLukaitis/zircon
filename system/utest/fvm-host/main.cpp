@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <blobfs/lz4.h>
 #include <fbl/string.h>
 #include <fbl/unique_fd.h>
 #include <fvm/container.h>
@@ -10,11 +11,11 @@
 
 #include <fvm/fvm-lz4.h>
 
-#define SLICE_SIZE     (64lu * (1 << 20)) // 64 mb
-#define PARTITION_SIZE (1lu * (1 << 29))  // 512 mb
-#define CONTAINER_SIZE (4lu * (1 << 30))  // 4 gb
+#define DEFAULT_SLICE_SIZE (64lu * (1 << 20)) // 64 mb
+#define PARTITION_SIZE     (1lu * (1 << 29))  // 512 mb
+#define CONTAINER_SIZE     (5lu * (1 << 30))  // 5 gb
 
-#define MAX_PARTITIONS 5
+#define MAX_PARTITIONS 6
 
 static char test_dir[PATH_MAX];
 static char sparse_path[PATH_MAX];
@@ -30,17 +31,19 @@ typedef enum {
 
 typedef enum {
     DATA,
+    DATA_UNSAFE,
     SYSTEM,
     BLOBSTORE,
     DEFAULT,
 } guid_type_t;
 
 typedef enum {
-    SPARSE,     // Sparse container
-    SPARSE_LZ4, // Sparse container compressed with LZ4
-    FVM,        // Explicitly created FVM container
-    FVM_NEW,    // FVM container created on FvmContainer::Create
-    FVM_OFFSET, // FVM container created at an offset within a file
+    SPARSE,         // Sparse container
+    SPARSE_LZ4,     // Sparse container compressed with LZ4
+    SPARSE_ZXCRYPT, // Sparse,container to be stored on a zxcrypt volume
+    FVM,            // Explicitly created FVM container
+    FVM_NEW,        // FVM container created on FvmContainer::Create
+    FVM_OFFSET,     // FVM container created at an offset within a file
 } container_t;
 
 typedef struct {
@@ -64,6 +67,8 @@ typedef struct {
         switch (guid_type) {
         case DATA:
             return kDataTypeName;
+        case DATA_UNSAFE:
+            return kDataUnsafeTypeName;
         case SYSTEM:
             return kSystemTypeName;
         case BLOBSTORE:
@@ -108,9 +113,9 @@ bool CreateBlobfs(const char* path) {
     ASSERT_GE(r, 0, "Unable to create path");
     ASSERT_EQ(ftruncate(r, PARTITION_SIZE), 0, "Unable to truncate disk");
     uint64_t block_count;
-    ASSERT_EQ(blobfs::blobfs_get_blockcount(r, &block_count), ZX_OK,
+    ASSERT_EQ(blobfs::GetBlockCount(r, &block_count), ZX_OK,
               "Cannot find end of underlying device");
-    ASSERT_EQ(blobfs::blobfs_mkfs(r, block_count), ZX_OK,
+    ASSERT_EQ(blobfs::Mkfs(r, block_count), ZX_OK,
               "Failed to make blobfs partition");
     ASSERT_EQ(close(r), 0, "Unable to close disk\n");
     END_HELPER;
@@ -151,12 +156,12 @@ bool AddPartitions(Container* container) {
     END_HELPER;
 }
 
-bool CreateSparse(compress_type_t compress) {
+bool CreateSparse(uint32_t flags, size_t slice_size) {
     BEGIN_HELPER;
-    const char* path = compress ? sparse_lz4_path : sparse_path;
+    const char* path = ((flags & fvm::kSparseFlagLz4) != 0) ? sparse_lz4_path : sparse_path;
     unittest_printf("Creating sparse container: %s\n", path);
     fbl::unique_ptr<SparseContainer> sparseContainer;
-    ASSERT_EQ(SparseContainer::Create(path, SLICE_SIZE, compress, &sparseContainer), ZX_OK,
+    ASSERT_EQ(SparseContainer::Create(path, slice_size, flags, &sparseContainer), ZX_OK,
               "Failed to initialize sparse container");
     ASSERT_TRUE(AddPartitions(sparseContainer.get()));
     ASSERT_EQ(sparseContainer->Commit(), ZX_OK, "Failed to write to sparse file");
@@ -177,14 +182,14 @@ bool ReportContainer(const char* path, off_t offset) {
     fbl::unique_ptr<Container> container;
     off_t length;
     ASSERT_TRUE(StatFile(path, &length));
-    ASSERT_EQ(Container::Create(path, offset, length - offset, &container), ZX_OK,
+    ASSERT_EQ(Container::Create(path, offset, length - offset, 0, &container), ZX_OK,
               "Failed to initialize container");
     ASSERT_EQ(container->Verify(), ZX_OK, "File check failed\n");
     return true;
 }
 
-bool ReportSparse(bool compress) {
-    if (compress) {
+bool ReportSparse(uint32_t flags) {
+    if ((flags & fvm::kSparseFlagLz4) != 0) {
         unittest_printf("Decompressing sparse file\n");
         if (fvm::decompress_sparse(sparse_lz4_path, sparse_path) != ZX_OK) {
             return false;
@@ -193,7 +198,7 @@ bool ReportSparse(bool compress) {
     return ReportContainer(sparse_path, 0);
 }
 
-bool CreateFvm(bool create_before, off_t offset) {
+bool CreateFvm(bool create_before, off_t offset, size_t slice_size) {
     BEGIN_HELPER;
     unittest_printf("Creating fvm container: %s\n", fvm_path);
 
@@ -204,7 +209,7 @@ bool CreateFvm(bool create_before, off_t offset) {
     }
 
     fbl::unique_ptr<FvmContainer> fvmContainer;
-    ASSERT_EQ(FvmContainer::Create(fvm_path, SLICE_SIZE, offset, length - offset, &fvmContainer),
+    ASSERT_EQ(FvmContainer::Create(fvm_path, slice_size, offset, length - offset, &fvmContainer),
               ZX_OK, "Failed to initialize fvm container");
     ASSERT_TRUE(AddPartitions(fvmContainer.get()));
     ASSERT_EQ(fvmContainer->Commit(), ZX_OK, "Failed to write to fvm file");
@@ -217,7 +222,7 @@ bool ExtendFvm(off_t length) {
     off_t current_length;
     ASSERT_TRUE(StatFile(fvm_path, &current_length));
     fbl::unique_ptr<FvmContainer> fvmContainer;
-    ASSERT_EQ(FvmContainer::Create(fvm_path, SLICE_SIZE, 0, current_length, &fvmContainer),
+    ASSERT_EQ(FvmContainer::Create(fvm_path, DEFAULT_SLICE_SIZE, 0, current_length, &fvmContainer),
               ZX_OK, "Failed to initialize fvm container");
     ASSERT_EQ(fvmContainer->Extend(length), ZX_OK, "Failed to write to fvm file");
     ASSERT_TRUE(StatFile(fvm_path, &current_length));
@@ -320,7 +325,7 @@ bool PopulateBlobfs(const char* path, size_t nfiles, size_t max_size) {
     BEGIN_HELPER;
     fbl::unique_fd blobfd(open(path, O_RDWR, 0755));
     ASSERT_TRUE(blobfd, "Unable to open blobfs path");
-    fbl::RefPtr<blobfs::Blobfs> bs;
+    fbl::unique_ptr<blobfs::Blobfs> bs;
     ASSERT_EQ(blobfs::blobfs_create(&bs, fbl::move(blobfd)), ZX_OK,
               "Failed to create blobfs");
     for (unsigned i = 0; i < nfiles; i++) {
@@ -357,14 +362,12 @@ bool PopulatePartitions(size_t ndirs, size_t nfiles, size_t max_size) {
     END_HELPER;
 }
 
-bool DestroySparse(compress_type_t compress) {
+bool DestroySparse(uint32_t flags) {
     BEGIN_HELPER;
-    switch (compress) {
-    case LZ4:
+    if ((flags & fvm::kSparseFlagLz4) != 0) {
         unittest_printf("Destroying compressed sparse container: %s\n", sparse_lz4_path);
         ASSERT_EQ(unlink(sparse_lz4_path), 0, "Failed to unlink path");
-    case NONE:
-    default:
+    } else {
         unittest_printf("Destroying sparse container: %s\n", sparse_path);
         ASSERT_EQ(unlink(sparse_path), 0, "Failed to unlink path");
     }
@@ -418,23 +421,29 @@ bool CreatePartitions() {
     END_HELPER;
 }
 
-bool CreateReportDestroy(container_t type) {
+bool CreateReportDestroy(container_t type, size_t slice_size) {
     BEGIN_HELPER;
     switch (type) {
     case SPARSE: {
-        ASSERT_TRUE(CreateSparse(NONE));
-        ASSERT_TRUE(ReportSparse(NONE));
-        ASSERT_TRUE(DestroySparse(NONE));
+        ASSERT_TRUE(CreateSparse(0, slice_size));
+        ASSERT_TRUE(ReportSparse(0));
+        ASSERT_TRUE(DestroySparse(0));
         break;
     }
     case SPARSE_LZ4: {
-        ASSERT_TRUE(CreateSparse(LZ4));
-        ASSERT_TRUE(ReportSparse(LZ4));
-        ASSERT_TRUE(DestroySparse(LZ4));
+        ASSERT_TRUE(CreateSparse(fvm::kSparseFlagLz4, slice_size));
+        ASSERT_TRUE(ReportSparse(fvm::kSparseFlagLz4));
+        ASSERT_TRUE(DestroySparse(fvm::kSparseFlagLz4));
+        break;
+    }
+    case SPARSE_ZXCRYPT: {
+        ASSERT_TRUE(CreateSparse(fvm::kSparseFlagZxcrypt, slice_size));
+        ASSERT_TRUE(ReportSparse(fvm::kSparseFlagZxcrypt));
+        ASSERT_TRUE(DestroySparse(fvm::kSparseFlagZxcrypt));
         break;
     }
     case FVM: {
-        ASSERT_TRUE(CreateFvm(true, 0));
+        ASSERT_TRUE(CreateFvm(true, 0, slice_size));
         ASSERT_TRUE(ReportFvm(0));
         ASSERT_TRUE(ExtendFvm(CONTAINER_SIZE * 2));
         ASSERT_TRUE(ReportFvm(0));
@@ -442,7 +451,7 @@ bool CreateReportDestroy(container_t type) {
         break;
     }
     case FVM_NEW: {
-        ASSERT_TRUE(CreateFvm(false, 0));
+        ASSERT_TRUE(CreateFvm(false, 0, slice_size));
         ASSERT_TRUE(ReportFvm(0));
         ASSERT_TRUE(ExtendFvm(CONTAINER_SIZE * 2));
         ASSERT_TRUE(ReportFvm(0));
@@ -450,8 +459,8 @@ bool CreateReportDestroy(container_t type) {
         break;
     }
     case FVM_OFFSET: {
-        ASSERT_TRUE(CreateFvm(true, SLICE_SIZE));
-        ASSERT_TRUE(ReportFvm(SLICE_SIZE));
+        ASSERT_TRUE(CreateFvm(true, DEFAULT_SLICE_SIZE, slice_size));
+        ASSERT_TRUE(ReportFvm(DEFAULT_SLICE_SIZE));
         ASSERT_TRUE(DestroyFvm());
         break;
     }
@@ -462,27 +471,81 @@ bool CreateReportDestroy(container_t type) {
     END_HELPER;
 }
 
-template <container_t ContainerType>
+template <container_t ContainerType, size_t SliceSize>
 bool TestEmptyPartitions() {
     BEGIN_TEST;
     ASSERT_TRUE(CreatePartitions());
-    ASSERT_TRUE(CreateReportDestroy(ContainerType));
+    ASSERT_TRUE(CreateReportDestroy(ContainerType, SliceSize));
     ASSERT_TRUE(DestroyPartitions());
     END_TEST;
 }
 
-template <container_t ContainerType, size_t NumDirs, size_t NumFiles, size_t MaxSize>
+template <container_t ContainerType, size_t NumDirs, size_t NumFiles, size_t MaxSize,
+          size_t SliceSize>
 bool TestPartitions() {
     BEGIN_TEST;
     ASSERT_TRUE(CreatePartitions());
     ASSERT_TRUE(PopulatePartitions(NumDirs, NumFiles, MaxSize));
-    ASSERT_TRUE(CreateReportDestroy(ContainerType));
+    ASSERT_TRUE(CreateReportDestroy(ContainerType, SliceSize));
     ASSERT_TRUE(DestroyPartitions());
+    END_TEST;
+}
+
+// Test to ensure that compression will fail if the buffer is too small.
+bool TestCompressorBufferTooSmall() {
+    BEGIN_TEST;
+
+    CompressionContext compression;
+    ASSERT_EQ(compression.Setup(1), ZX_OK);
+
+    unsigned int seed = 0;
+    zx_status_t status = ZX_OK;
+    for (;;) {
+        char data = static_cast<char>(rand_r(&seed));
+        if ((status = compression.Compress(&data, 1)) != ZX_OK) {
+            break;
+        }
+    }
+
+    ASSERT_EQ(status, ZX_ERR_INTERNAL);
+    ASSERT_EQ(compression.Finish(), ZX_OK);
+
+    END_TEST;
+}
+
+bool TestBlobfsCompressor() {
+    BEGIN_TEST;
+    blobfs::Compressor compressor;
+
+    // Pretend we're going to compress only one byte of data.
+    const size_t buf_size = compressor.BufferMax(1);
+    fbl::unique_ptr<char[]> buf(new char[buf_size]);
+    ASSERT_EQ(compressor.Initialize(buf.get(), buf_size), ZX_OK);
+
+    // Create data as large as possible that will fit still within this buffer.
+    size_t data_size = 0;
+    while (compressor.BufferMax(data_size + 1) <= buf_size) {
+        ++data_size;
+    }
+
+    ASSERT_GT(data_size, 0);
+    ASSERT_EQ(compressor.BufferMax(data_size), buf_size);
+    ASSERT_GT(compressor.BufferMax(data_size+1), buf_size);
+
+    unsigned int seed = 0;
+    for (size_t i = 0; i < data_size; i++) {
+        char data = static_cast<char>(rand_r(&seed));
+        ASSERT_EQ(compressor.Update(&data, 1), ZX_OK);
+    }
+
+    ASSERT_EQ(compressor.End(), ZX_OK);
     END_TEST;
 }
 
 bool GeneratePartitionPath(fs_type_t fs_type, guid_type_t guid_type) {
     BEGIN_HELPER;
+    ASSERT_LT(partition_count, MAX_PARTITIONS);
+
     // Make sure we have not already created a partition with the same fs/guid type combo.
     for (unsigned i = 0; i < partition_count; i++) {
         partition_t* part = &partitions[i];
@@ -511,10 +574,12 @@ bool Setup() {
     // Generate partition paths
     partition_count = 0;
     ASSERT_TRUE(GeneratePartitionPath(MINFS, DATA));
+    ASSERT_TRUE(GeneratePartitionPath(MINFS, DATA_UNSAFE));
     ASSERT_TRUE(GeneratePartitionPath(MINFS, SYSTEM));
     ASSERT_TRUE(GeneratePartitionPath(MINFS, DEFAULT));
     ASSERT_TRUE(GeneratePartitionPath(BLOBFS, BLOBSTORE));
     ASSERT_TRUE(GeneratePartitionPath(BLOBFS, DEFAULT));
+    ASSERT_EQ(partition_count, MAX_PARTITIONS);
 
     // Generate container paths
     sprintf(sparse_path, "%ssparse.bin", test_dir);
@@ -547,18 +612,32 @@ bool Cleanup() {
     END_HELPER;
 }
 
+#define RUN_FOR_ALL_TYPES_EMPTY(slice_size) \
+    RUN_TEST_MEDIUM((TestEmptyPartitions<SPARSE, slice_size>)) \
+    RUN_TEST_MEDIUM((TestEmptyPartitions<SPARSE_LZ4, slice_size>)) \
+    RUN_TEST_MEDIUM((TestEmptyPartitions<SPARSE_ZXCRYPT, slice_size>)) \
+    RUN_TEST_MEDIUM((TestEmptyPartitions<FVM, slice_size>)) \
+    RUN_TEST_MEDIUM((TestEmptyPartitions<FVM_NEW, slice_size>)) \
+    RUN_TEST_MEDIUM((TestEmptyPartitions<FVM_OFFSET, slice_size>))
+
+#define RUN_FOR_ALL_TYPES(num_dirs, num_files, max_size, slice_size) \
+    RUN_TEST_MEDIUM((TestPartitions<SPARSE, num_dirs, num_files, max_size, slice_size>)) \
+    RUN_TEST_MEDIUM((TestPartitions<SPARSE_LZ4, num_dirs, num_files, max_size, slice_size>)) \
+    RUN_TEST_MEDIUM((TestPartitions<SPARSE_ZXCRYPT, num_dirs, num_files, max_size, slice_size>)) \
+    RUN_TEST_MEDIUM((TestPartitions<FVM, num_dirs, num_files, max_size, slice_size>)) \
+    RUN_TEST_MEDIUM((TestPartitions<FVM_NEW, num_dirs, num_files, max_size, slice_size>)) \
+    RUN_TEST_MEDIUM((TestPartitions<FVM_OFFSET, num_dirs, num_files, max_size, slice_size>))
+
 //TODO(planders): add tests for FVM on GPT (with offset)
 BEGIN_TEST_CASE(fvm_host_tests)
-RUN_TEST_MEDIUM(TestEmptyPartitions<SPARSE>)
-RUN_TEST_MEDIUM(TestEmptyPartitions<SPARSE_LZ4>)
-RUN_TEST_MEDIUM(TestEmptyPartitions<FVM>)
-RUN_TEST_MEDIUM(TestEmptyPartitions<FVM_NEW>)
-RUN_TEST_MEDIUM(TestEmptyPartitions<FVM_OFFSET>)
-RUN_TEST_MEDIUM((TestPartitions<SPARSE, 10, 100, (1 << 20)>))
-RUN_TEST_MEDIUM((TestPartitions<SPARSE_LZ4, 10, 100, (1 << 20)>))
-RUN_TEST_MEDIUM((TestPartitions<FVM, 10, 100, (1 << 20)>))
-RUN_TEST_MEDIUM((TestPartitions<FVM_NEW, 10, 100, (1 << 20)>))
-RUN_TEST_MEDIUM((TestPartitions<FVM_OFFSET, 10, 100, (1 << 20)>))
+RUN_FOR_ALL_TYPES_EMPTY(8192)
+RUN_FOR_ALL_TYPES_EMPTY(32768)
+RUN_FOR_ALL_TYPES_EMPTY(DEFAULT_SLICE_SIZE)
+RUN_FOR_ALL_TYPES(10, 100, (1 << 20), 8192)
+RUN_FOR_ALL_TYPES(10, 100, (1 << 20), 32768)
+RUN_FOR_ALL_TYPES(10, 100, (1 << 20), DEFAULT_SLICE_SIZE)
+RUN_TEST_MEDIUM(TestCompressorBufferTooSmall)
+RUN_TEST_MEDIUM(TestBlobfsCompressor)
 END_TEST_CASE(fvm_host_tests)
 
 int main(int argc, char** argv) {

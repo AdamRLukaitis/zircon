@@ -7,19 +7,21 @@
 #include <vm/vm_aspace.h>
 
 #include "vm_priv.h"
+
 #include <assert.h>
 #include <err.h>
 #include <fbl/alloc_checker.h>
 #include <fbl/auto_call.h>
-#include <fbl/auto_lock.h>
 #include <fbl/intrusive_double_list.h>
 #include <fbl/mutex.h>
 #include <fbl/type_support.h>
 #include <inttypes.h>
 #include <kernel/cmdline.h>
 #include <kernel/thread.h>
+#include <kernel/thread_lock.h>
 #include <lib/crypto/global_prng.h>
 #include <lib/crypto/prng.h>
+#include <lib/vdso.h>
 #include <stdlib.h>
 #include <string.h>
 #include <trace.h>
@@ -30,12 +32,6 @@
 #include <vm/vm_object_paged.h>
 #include <vm/vm_object_physical.h>
 #include <zircon/types.h>
-
-#if WITH_LIB_VDSO
-#include <lib/vdso.h>
-#endif
-
-using fbl::AutoLock;
 
 #define LOCAL_TRACE MAX(VM_GLOBAL_TRACE, 0)
 
@@ -49,7 +45,8 @@ VmAspace* VmAspace::kernel_aspace_ = nullptr;
 static VmAddressRegion* dummy_root_vmar = nullptr;
 
 // list of all address spaces
-static fbl::Mutex aspace_list_lock;
+struct VmAspaceListGlobal {};
+static DECLARE_MUTEX(VmAspaceListGlobal) aspace_list_lock;
 static fbl::DoublyLinkedList<VmAspace*> aspaces TA_GUARDED(aspace_list_lock);
 
 // Called once at boot to initialize the singleton kernel address
@@ -88,19 +85,23 @@ static inline bool is_inside(VmAspace& aspace, vaddr_t vaddr) {
 
 static inline bool is_inside(VmAspace& aspace, VmAddressRegion& r) {
     // is the starting address within the address space
-    if (!is_inside(aspace, r.base()))
+    if (!is_inside(aspace, r.base())) {
         return false;
+    }
 
-    if (r.size() == 0)
+    if (r.size() == 0) {
         return true;
+    }
 
     // see if the size is enough to wrap the integer
-    if (r.base() + r.size() - 1 < r.base())
+    if (r.base() + r.size() - 1 < r.base()) {
         return false;
+    }
 
     // test to see if the end address is within the address space's
-    if (r.base() + r.size() - 1 > aspace.base() + aspace.size() - 1)
+    if (r.base() + r.size() - 1 > aspace.base() + aspace.size() - 1) {
         return false;
+    }
 
     return true;
 }
@@ -108,21 +109,24 @@ static inline bool is_inside(VmAspace& aspace, VmAddressRegion& r) {
 static inline size_t trim_to_aspace(VmAspace& aspace, vaddr_t vaddr, size_t size) {
     DEBUG_ASSERT(is_inside(aspace, vaddr));
 
-    if (size == 0)
+    if (size == 0) {
         return size;
+    }
 
     size_t offset = vaddr - aspace.base();
 
     // LTRACEF("vaddr 0x%lx size 0x%zx offset 0x%zx aspace base 0x%lx aspace size 0x%zx\n",
     //        vaddr, size, offset, aspace.base(), aspace.size());
 
-    if (offset + size < offset)
+    if (offset + size < offset) {
         size = ULONG_MAX - offset - 1;
+    }
 
     // LTRACEF("size now 0x%zx\n", size);
 
-    if (offset + size >= aspace.size() - 1)
+    if (offset + size >= aspace.size() - 1) {
         size = aspace.size() - offset;
+    }
 
     // LTRACEF("size now 0x%zx\n", size);
 
@@ -192,8 +196,9 @@ fbl::RefPtr<VmAspace> VmAspace::Create(uint32_t flags, const char* name) {
 
     fbl::AllocChecker ac;
     auto aspace = fbl::AdoptRef(new (&ac) VmAspace(base, size, flags, name));
-    if (!ac.check())
+    if (!ac.check()) {
         return nullptr;
+    }
 
     // initialize the arch specific component to our address space
     auto err = aspace->Init();
@@ -204,7 +209,7 @@ fbl::RefPtr<VmAspace> VmAspace::Create(uint32_t flags, const char* name) {
 
     // add it to the global list
     {
-        AutoLock a(&aspace_list_lock);
+        Guard<fbl::Mutex> guard{&aspace_list_lock};
         aspaces.push_back(aspace.get());
     }
 
@@ -226,7 +231,7 @@ VmAspace::~VmAspace() {
 
     // pop it out of the global aspace list
     {
-        AutoLock a(&aspace_list_lock);
+        Guard<fbl::Mutex> guard{&aspace_list_lock};
         if (this->InContainer()) {
             aspaces.erase(*this);
         }
@@ -240,7 +245,7 @@ VmAspace::~VmAspace() {
 }
 
 fbl::RefPtr<VmAddressRegion> VmAspace::RootVmar() {
-    AutoLock guard(&lock_);
+    Guard<fbl::Mutex> guard{&lock_};
     fbl::RefPtr<VmAddressRegion> ref(root_vmar_);
     return fbl::move(ref);
 }
@@ -249,13 +254,11 @@ zx_status_t VmAspace::Destroy() {
     canary_.Assert();
     LTRACEF("%p '%s'\n", this, name_);
 
-    AutoLock guard(&lock_);
+    Guard<fbl::Mutex> guard{&lock_};
 
-#if WITH_LIB_VDSO
     // Don't let a vDSO mapping prevent destroying a VMAR
     // when the whole process is being destroyed.
     vdso_code_mapping_.reset();
-#endif
 
     // tear down and free all of the regions in our address space
     if (root_vmar_) {
@@ -273,7 +276,7 @@ zx_status_t VmAspace::Destroy() {
 }
 
 bool VmAspace::is_destroyed() const {
-    AutoLock guard(&lock_);
+    Guard<fbl::Mutex> guard{&lock_};
     return aspace_destroyed_;
 }
 
@@ -289,12 +292,15 @@ zx_status_t VmAspace::MapObjectInternal(fbl::RefPtr<VmObject> vmo, const char* n
     DEBUG_ASSERT(!is_user() || !(arch_mmu_flags & ARCH_MMU_FLAG_PERM_USER));
 
     size = ROUNDUP(size, PAGE_SIZE);
-    if (size == 0)
+    if (size == 0) {
         return ZX_ERR_INVALID_ARGS;
-    if (!vmo)
+    }
+    if (!vmo) {
         return ZX_ERR_INVALID_ARGS;
-    if (!IS_PAGE_ALIGNED(offset))
+    }
+    if (!IS_PAGE_ALIGNED(offset)) {
         return ZX_ERR_INVALID_ARGS;
+    }
 
     vaddr_t vmar_offset = 0;
     // if they're asking for a specific spot or starting address, copy the address
@@ -306,8 +312,9 @@ zx_status_t VmAspace::MapObjectInternal(fbl::RefPtr<VmObject> vmo, const char* n
         vmar_offset = reinterpret_cast<vaddr_t>(*ptr);
 
         // check that it's page aligned
-        if (!IS_PAGE_ALIGNED(vmar_offset) || vmar_offset < base_)
+        if (!IS_PAGE_ALIGNED(vmar_offset) || vmar_offset < base_) {
             return ZX_ERR_INVALID_ARGS;
+        }
 
         vmar_offset -= base_;
     }
@@ -334,13 +341,15 @@ zx_status_t VmAspace::MapObjectInternal(fbl::RefPtr<VmObject> vmo, const char* n
     // if we're committing it, map the region now
     if (vmm_flags & VMM_FLAG_COMMIT) {
         auto err = r->MapRange(0, size, true);
-        if (err < 0)
+        if (err < 0) {
             return err;
+        }
     }
 
     // return the vaddr if requested
-    if (ptr)
+    if (ptr) {
         *ptr = (void*)r->base();
+    }
 
     return ZX_OK;
 }
@@ -353,12 +362,15 @@ zx_status_t VmAspace::ReserveSpace(const char* name, size_t size, vaddr_t vaddr)
     DEBUG_ASSERT(IS_PAGE_ALIGNED(size));
 
     size = ROUNDUP_PAGE_SIZE(size);
-    if (size == 0)
+    if (size == 0) {
         return ZX_OK;
-    if (!IS_PAGE_ALIGNED(vaddr))
+    }
+    if (!IS_PAGE_ALIGNED(vaddr)) {
         return ZX_ERR_INVALID_ARGS;
-    if (!is_inside(*this, vaddr))
+    }
+    if (!is_inside(*this, vaddr)) {
         return ZX_ERR_OUT_OF_RANGE;
+    }
 
     // trim the size
     size = trim_to_aspace(*this, vaddr, size);
@@ -366,9 +378,10 @@ zx_status_t VmAspace::ReserveSpace(const char* name, size_t size, vaddr_t vaddr)
     // allocate a zero length vm object to back it
     // TODO: decide if a null vmo object is worth it
     fbl::RefPtr<VmObject> vmo;
-    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, 0, &vmo);
-    if (status != ZX_OK)
+    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, 0u, 0, &vmo);
+    if (status != ZX_OK) {
         return status;
+    }
     vmo->set_name(name, strlen(name));
 
     // lookup how it's already mapped
@@ -393,18 +406,21 @@ zx_status_t VmAspace::AllocPhysical(const char* name, size_t size, void** ptr, u
 
     DEBUG_ASSERT(IS_PAGE_ALIGNED(paddr));
 
-    if (size == 0)
+    if (size == 0) {
         return ZX_OK;
-    if (!IS_PAGE_ALIGNED(paddr))
+    }
+    if (!IS_PAGE_ALIGNED(paddr)) {
         return ZX_ERR_INVALID_ARGS;
+    }
 
     size = ROUNDUP_PAGE_SIZE(size);
 
     // create a vm object to back it
     fbl::RefPtr<VmObject> vmo;
     zx_status_t status = VmObjectPhysical::Create(paddr, size, &vmo);
-    if (status != ZX_OK)
+    if (status != ZX_OK) {
         return status;
+    }
     vmo->set_name(name, strlen(name));
 
     // force it to be mapped up front
@@ -412,8 +428,9 @@ zx_status_t VmAspace::AllocPhysical(const char* name, size_t size, void** ptr, u
     vmm_flags |= VMM_FLAG_COMMIT;
 
     // Apply the cache policy
-    if (vmo->SetMappingCachePolicy(arch_mmu_flags & ARCH_MMU_FLAG_CACHE_MASK) != ZX_OK)
+    if (vmo->SetMappingCachePolicy(arch_mmu_flags & ARCH_MMU_FLAG_CACHE_MASK) != ZX_OK) {
         return ZX_ERR_INVALID_ARGS;
+    }
 
     arch_mmu_flags &= ~ARCH_MMU_FLAG_CACHE_MASK;
     return MapObjectInternal(fbl::move(vmo), name, 0, size, ptr, align_pow2, vmm_flags,
@@ -427,30 +444,22 @@ zx_status_t VmAspace::AllocContiguous(const char* name, size_t size, void** ptr,
             name, size, ptr ? *ptr : 0, align_pow2, vmm_flags, arch_mmu_flags);
 
     size = ROUNDUP(size, PAGE_SIZE);
-    if (size == 0)
+    if (size == 0) {
         return ZX_ERR_INVALID_ARGS;
+    }
 
     // test for invalid flags
-    if (!(vmm_flags & VMM_FLAG_COMMIT))
+    if (!(vmm_flags & VMM_FLAG_COMMIT)) {
         return ZX_ERR_INVALID_ARGS;
+    }
 
     // create a vm object to back it
     fbl::RefPtr<VmObject> vmo;
-    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, size, &vmo);
-    if (status != ZX_OK)
+    zx_status_t status = VmObjectPaged::CreateContiguous(PMM_ALLOC_FLAG_ANY, size, align_pow2, &vmo);
+    if (status != ZX_OK) {
         return status;
-    vmo->set_name(name, strlen(name));
-
-    // always immediately commit memory to the object
-    uint64_t committed;
-    status = vmo->CommitRangeContiguous(0, size, &committed, align_pow2);
-    if (status < 0)
-        return status;
-    if (static_cast<size_t>(committed) < size) {
-        LTRACEF("failed to allocate enough pages (asked for %zu, got %zu)\n", size / PAGE_SIZE,
-                static_cast<size_t>(committed) / PAGE_SIZE);
-        return ZX_ERR_NO_MEMORY;
     }
+    vmo->set_name(name, strlen(name));
 
     return MapObjectInternal(fbl::move(vmo), name, 0, size, ptr, align_pow2, vmm_flags,
                              arch_mmu_flags);
@@ -463,14 +472,16 @@ zx_status_t VmAspace::Alloc(const char* name, size_t size, void** ptr, uint8_t a
             name, size, ptr ? *ptr : 0, align_pow2, vmm_flags, arch_mmu_flags);
 
     size = ROUNDUP(size, PAGE_SIZE);
-    if (size == 0)
+    if (size == 0) {
         return ZX_ERR_INVALID_ARGS;
+    }
 
     // allocate a vm object to back it
     fbl::RefPtr<VmObject> vmo;
-    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, size, &vmo);
-    if (status != ZX_OK)
+    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, 0u, size, &vmo);
+    if (status != ZX_OK) {
         return status;
+    }
     vmo->set_name(name, strlen(name));
 
     // commit memory up front if requested
@@ -478,8 +489,9 @@ zx_status_t VmAspace::Alloc(const char* name, size_t size, void** ptr, uint8_t a
         // commit memory to the object
         uint64_t committed;
         status = vmo->CommitRange(0, size, &committed);
-        if (status < 0)
+        if (status != ZX_OK) {
             return status;
+        }
         if (static_cast<size_t>(committed) < size) {
             LTRACEF("failed to allocate enough pages (asked for %zu, got %zu)\n", size / PAGE_SIZE,
                     static_cast<size_t>(committed) / PAGE_SIZE);
@@ -524,7 +536,7 @@ void VmAspace::AttachToThread(thread_t* t) {
     DEBUG_ASSERT(t);
 
     // point the lk thread at our object via the dummy C vmm_aspace_t struct
-    AutoThreadLock lock;
+    Guard<spin_lock_t, IrqSave> thread_lock_guard{ThreadLock::Get()};
 
     // not prepared to handle setting a new address space or one on a running thread
     DEBUG_ASSERT(!t->aspace);
@@ -546,7 +558,7 @@ zx_status_t VmAspace::PageFault(vaddr_t va, uint flags) {
     // for now, hold the aspace lock across the page fault operation,
     // which stops any other operations on the address space from moving
     // the region out from underneath it
-    AutoLock a(&lock_);
+    Guard<fbl::Mutex> guard{&lock_};
 
     return root_vmar_->PageFault(va, flags);
 }
@@ -556,16 +568,17 @@ void VmAspace::Dump(bool verbose) const {
     printf("as %p [%#" PRIxPTR " %#" PRIxPTR "] sz %#zx fl %#x ref %d '%s'\n", this,
            base_, base_ + size_ - 1, size_, flags_, ref_count_debug(), name_);
 
-    AutoLock a(&lock_);
+    Guard<fbl::Mutex> guard{&lock_};
 
-    if (verbose)
+    if (verbose) {
         root_vmar_->Dump(1, verbose);
+    }
 }
 
 bool VmAspace::EnumerateChildren(VmEnumerator* ve) {
     canary_.Assert();
     DEBUG_ASSERT(ve != nullptr);
-    AutoLock a(&lock_);
+    Guard<fbl::Mutex> guard{&lock_};
     if (root_vmar_ == nullptr || aspace_destroyed_) {
         // Aspace hasn't been initialized or has already been destroyed.
         return true;
@@ -578,10 +591,11 @@ bool VmAspace::EnumerateChildren(VmEnumerator* ve) {
 }
 
 void DumpAllAspaces(bool verbose) {
-    AutoLock a(&aspace_list_lock);
+    Guard<fbl::Mutex> guard{&aspace_list_lock};
 
-    for (const auto& a : aspaces)
+    for (const auto& a : aspaces) {
         a.Dump(verbose);
+    }
 }
 
 VmAspace* VmAspace::vaddr_to_aspace(uintptr_t address) {
@@ -598,7 +612,7 @@ VmAspace* VmAspace::vaddr_to_aspace(uintptr_t address) {
 size_t VmAspace::AllocatedPages() const {
     canary_.Assert();
 
-    AutoLock a(&lock_);
+    Guard<fbl::Mutex> guard{&lock_};
     return root_vmar_->AllocatedPagesLocked();
 }
 
@@ -609,14 +623,12 @@ void VmAspace::InitializeAslr() {
     aslr_prng_.AddEntropy(aslr_seed_, sizeof(aslr_seed_));
 }
 
-#if WITH_LIB_VDSO
 uintptr_t VmAspace::vdso_base_address() const {
-    AutoLock a(&lock_);
+    Guard<fbl::Mutex> guard{&lock_};
     return VDso::base_address(vdso_code_mapping_);
 }
 
 uintptr_t VmAspace::vdso_code_address() const {
-    AutoLock a(&lock_);
+    Guard<fbl::Mutex> guard{&lock_};
     return vdso_code_mapping_ ? vdso_code_mapping_->base() : 0;
 }
-#endif

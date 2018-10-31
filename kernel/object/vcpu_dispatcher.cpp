@@ -28,7 +28,7 @@ zx_status_t VcpuDispatcher::Create(fbl::RefPtr<GuestDispatcher> guest_dispatcher
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    *rights = ZX_DEFAULT_VCPU_RIGHTS;
+    *rights = default_rights();
     *dispatcher = fbl::AdoptRef<Dispatcher>(disp);
     return ZX_OK;
 }
@@ -48,12 +48,12 @@ zx_status_t VcpuDispatcher::Interrupt(uint32_t vector) {
     return vcpu_->Interrupt(vector);
 }
 
-zx_status_t VcpuDispatcher::ReadState(uint32_t kind, void* buffer, uint32_t len) const {
+zx_status_t VcpuDispatcher::ReadState(uint32_t kind, void* buffer, size_t len) const {
     canary_.Assert();
     return vcpu_->ReadState(kind, buffer, len);
 }
 
-zx_status_t VcpuDispatcher::WriteState(uint32_t kind, const void* buffer, uint32_t len) {
+zx_status_t VcpuDispatcher::WriteState(uint32_t kind, const void* buffer, size_t len) {
     canary_.Assert();
     return vcpu_->WriteState(kind, buffer, len);
 }

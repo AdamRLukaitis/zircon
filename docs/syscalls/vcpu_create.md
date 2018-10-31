@@ -44,6 +44,10 @@ The following rights will be set on the handle *out* by default:
 
 **ZX_RIGHT_WRITE** — *out* may have its state written
 
+## RIGHTS
+
+TODO(ZX-2399)
+
 ## RETURN VALUE
 
 **vcpu_create**() returns ZX_OK on success. On failure, an error value is
@@ -51,15 +55,17 @@ returned.
 
 ## ERRORS
 
-**ZX_ERR_ACCESS_DENIED** *guest* does not have the *ZX_RIGHT_WRITE* right, or
-*apic_vmo* does not have the *ZX_RIGHT_READ* and *ZX_RIGHT_WRITE* rights.
+**ZX_ERR_ACCESS_DENIED** *guest* does not have the *ZX_RIGHT_MANAGE_PROCESS*
+right.
 
 **ZX_ERR_BAD_HANDLE** *guest* is an invalid handle.
 
 **ZX_ERR_INVALID_ARGS** *args* contains an invalid argument, or *out* is an
 invalid pointer, or *options* is nonzero.
 
-**ZX_ERR_NO_MEMORY** Temporary failure due to lack of memory.
+**ZX_ERR_NO_MEMORY**  Failure due to lack of memory.
+There is no good way for userspace to handle this (unlikely) error.
+In a future build this error will no longer occur.
 
 **ZX_ERR_WRONG_TYPE** *guest* is not a handle to a guest.
 

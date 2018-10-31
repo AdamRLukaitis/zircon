@@ -28,11 +28,7 @@
 // This string needs 2 bytes to print each byte in hex, plus a NUL terminator.
 static char elf_build_id_string[65];
 
-// The attribute shouldn't be needed here, but without it LTO optimizes away
-// this symbol as unused becuase it doesn't know it's referenced from a linker
-// script.
-// TODO(phosek): https://bugs.llvm.org/show_bug.cgi?id=34238
-__USED const lk_version_t version = {
+const lk_version_t version = {
     .struct_version = VERSION_STRUCT_VERSION,
     .arch = ARCH,
     .platform = PLATFORM,
@@ -89,8 +85,6 @@ static void init_build_id(uint level) {
 // This must happen before print_version, below.
 LK_INIT_HOOK(elf_build_id, &init_build_id, LK_INIT_LEVEL_HEAP - 2);
 
-#if WITH_LIB_CONSOLE
-
 #include <debug.h>
 #include <lib/console.h>
 
@@ -102,8 +96,6 @@ static int cmd_version(int argc, const cmd_args* argv, uint32_t flags) {
 STATIC_COMMAND_START
 STATIC_COMMAND("version", "print version", &cmd_version)
 STATIC_COMMAND_END(version);
-
-#endif // WITH_LIB_CONSOLE
 
 #if LK_DEBUGLEVEL > 0
 static void print_version_init(uint) {

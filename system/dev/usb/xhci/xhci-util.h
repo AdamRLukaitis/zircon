@@ -4,14 +4,14 @@
 
 #pragma once
 
-#include <sync/completion.h>
+#include <lib/sync/completion.h>
 
 #include "xhci.h"
 #include "xhci-transfer.h"
 
 typedef struct {
     xhci_command_context_t context;
-    completion_t completion;
+    sync_completion_t completion;
     // from command completion event TRB
     uint32_t status;
     uint32_t control;
@@ -28,3 +28,11 @@ static inline int xhci_sync_command_slot_id(xhci_sync_command_t* command) {
 
 // executes a command with a 1 second timeout
 zx_status_t xhci_send_command(xhci_t* xhci, uint32_t command, uint64_t ptr, uint32_t control_bits);
+
+// Returns the next extended capability, optionally starting from a
+// specific capability and/or only matching a particular id.
+//
+// prev_cap: if non-null, searching begins at the following capability, otherwise
+//           searching begins at mmio base.
+// match_cap_id: if non-null, only capabilities with this id will be returned.
+uint32_t* xhci_get_next_ext_cap(void* mmio, uint32_t* prev_cap, uint32_t* match_cap_id);

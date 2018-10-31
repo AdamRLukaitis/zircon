@@ -16,19 +16,18 @@
 #include <zircon/syscalls/resource.h>
 #include <zircon/types.h>
 
-#include <object/resources.h>
+#include <object/resource.h>
 
-#include <fbl/auto_lock.h>
 #include <fbl/ref_ptr.h>
+#include <fbl/type_support.h>
 
 #include "priv.h"
-
-using fbl::AutoLock;
 
 KCOUNTER(profile_create, "kernel.profile.create");
 KCOUNTER(profile_set,    "kernel.profile.set");
 
 
+// zx_status_t zx_profile_create
 zx_status_t sys_profile_create(zx_handle_t resource,
                                user_in_ptr<const zx_profile_info_t> user_profile_info,
                                user_out_handle* out) {
@@ -52,6 +51,7 @@ zx_status_t sys_profile_create(zx_handle_t resource,
     return out->make(fbl::move(dispatcher), rights);
 }
 
+// zx_status_t zx_object_set_profile
 zx_status_t sys_object_set_profile(zx_handle_t handle,
                                    zx_handle_t profile_handle,
                                    uint32_t options) {
@@ -59,8 +59,8 @@ zx_status_t sys_object_set_profile(zx_handle_t handle,
 
     // TODO(cpu): support more than thread objects, and actually do something.
 
-    fbl::RefPtr<ThreadDispatcher> dispatcher;
-    auto status = up->GetDispatcherWithRights(handle, ZX_RIGHT_MANAGE_THREAD, &dispatcher);
+    fbl::RefPtr<ThreadDispatcher> thread;
+    auto status = up->GetDispatcherWithRights(handle, ZX_RIGHT_MANAGE_THREAD, &thread);
     if (status != ZX_OK)
         return status;
 
@@ -70,6 +70,6 @@ zx_status_t sys_object_set_profile(zx_handle_t handle,
     if (result != ZX_OK)
         return result;
 
-    return ZX_OK;
+    return profile->ApplyProfile(fbl::move(thread));
 }
 

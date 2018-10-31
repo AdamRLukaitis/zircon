@@ -8,10 +8,10 @@
 
 #include <dev/iommu.h>
 #include <err.h>
+#include <vm/pinned_vm_object.h>
 #include <vm/vm_object.h>
 #include <zircon/rights.h>
 #include <zxcpp/new.h>
-#include <fbl/auto_lock.h>
 
 zx_status_t BusTransactionInitiatorDispatcher::Create(fbl::RefPtr<Iommu> iommu, uint64_t bti_id,
                                                       fbl::RefPtr<Dispatcher>* dispatcher,
@@ -27,7 +27,7 @@ zx_status_t BusTransactionInitiatorDispatcher::Create(fbl::RefPtr<Iommu> iommu, 
         return ZX_ERR_NO_MEMORY;
     }
 
-    *rights = ZX_DEFAULT_BTI_RIGHTS;
+    *rights = default_rights();
     *dispatcher = fbl::AdoptRef<Dispatcher>(disp);
     return ZX_OK;
 }
@@ -52,51 +52,47 @@ zx_status_t BusTransactionInitiatorDispatcher::Pin(fbl::RefPtr<VmObject> vmo, ui
         return ZX_ERR_INVALID_ARGS;
     }
 
-    fbl::AutoLock guard(&lock_);
+    PinnedVmObject pinned_vmo;
+    zx_status_t status = PinnedVmObject::Create(vmo, offset, size, &pinned_vmo);
+    if (status != ZX_OK) {
+        return status;
+    }
 
+    Guard<fbl::Mutex> guard{get_lock()};
     if (zero_handles_) {
         return ZX_ERR_BAD_STATE;
     }
 
-    return PinnedMemoryTokenDispatcher::Create(fbl::WrapRefPtr(this), fbl::move(vmo),
-                                               offset, size, perms, pmt, pmt_rights);
+    return PinnedMemoryTokenDispatcher::Create(fbl::WrapRefPtr(this), fbl::move(pinned_vmo),
+                                               perms, pmt, pmt_rights);
 }
 
-zx_status_t BusTransactionInitiatorDispatcher::Unpin(const dev_vaddr_t base_addr) {
-    fbl::AutoLock guard(&lock_);
+void BusTransactionInitiatorDispatcher::ReleaseQuarantine() {
+    QuarantineList tmp;
 
-    if (zero_handles_) {
-        return ZX_ERR_BAD_STATE;
+    // The PMT dtor will call RemovePmo, which will reacquire this BTI's lock.
+    // To avoid deadlock, drop the lock before letting the quarantined PMTs go.
+    {
+        Guard<fbl::Mutex> guard{get_lock()};
+        quarantine_.swap(tmp);
     }
-
-    for (auto& pmt : legacy_pinned_memory_) {
-        const fbl::Array<dev_vaddr_t>& pmt_addrs = pmt.mapped_addrs();
-        if (pmt_addrs[0] == base_addr) {
-            // The PMT dtor will take care of the actual unpinning.
-            auto ptr = legacy_pinned_memory_.erase(pmt);
-            // When |ptr| goes out of scope, its dtor will be run.  Drop the
-            // lock since the dtor will call RemovePmo, which takes the lock.
-            guard.release();
-            return ZX_OK;
-        }
-    }
-
-    return ZX_ERR_INVALID_ARGS;
 }
 
 void BusTransactionInitiatorDispatcher::on_zero_handles() {
-    // We need to drop the lock before letting PMT dtors run, since the
-    // PMT dtor calls RemovePmo, which takes the lock again.
-    LegacyPmoList tmp;
-    {
-        fbl::AutoLock guard(&lock_);
-        // Prevent new pinning from happening.  The Dispatcher will stick around
-        // until all of the PMTs are closed.
-        zero_handles_ = true;
+    Guard<fbl::Mutex> guard{get_lock()};
+    // Prevent new pinning from happening.  The Dispatcher will stick around
+    // until all of the PMTs are closed.
+    zero_handles_ = true;
 
-        legacy_pinned_memory_.swap(tmp);
+    // Do not clear out the quarantine list.  PMTs hold a reference to the BTI
+    // and the BTI holds a reference to each quarantined PMT.  We intentionally
+    // leak the BTI, all quarantined PMTs, and their underlying VMOs.  We could
+    // get away with freeing the BTI and the PMTs, but for safety we must leak
+    // at least the pinned parts of the VMOs, since we have no assurance that
+    // hardware is not still reading/writing to it.
+    if (!quarantine_.is_empty()) {
+        PrintQuarantineWarningLocked();
     }
-
 }
 
 void BusTransactionInitiatorDispatcher::AddPmoLocked(PinnedMemoryTokenDispatcher* pmt) {
@@ -105,14 +101,31 @@ void BusTransactionInitiatorDispatcher::AddPmoLocked(PinnedMemoryTokenDispatcher
 }
 
 void BusTransactionInitiatorDispatcher::RemovePmo(PinnedMemoryTokenDispatcher* pmt) {
-    fbl::AutoLock guard(&lock_);
+    Guard<fbl::Mutex> guard{get_lock()};
     DEBUG_ASSERT(pmt->dll_pmt_.InContainer());
     pinned_memory_.erase(*pmt);
 }
 
-void BusTransactionInitiatorDispatcher::ConvertToLegacy(
-        fbl::RefPtr<PinnedMemoryTokenDispatcher> pmt) {
-    fbl::AutoLock guard(&lock_);
+void BusTransactionInitiatorDispatcher::Quarantine(fbl::RefPtr<PinnedMemoryTokenDispatcher> pmt) {
+    Guard<fbl::Mutex> guard{get_lock()};
 
-    legacy_pinned_memory_.push_back(fbl::move(pmt));
+    DEBUG_ASSERT(pmt->dll_pmt_.InContainer());
+    quarantine_.push_back(fbl::move(pmt));
+
+    if (zero_handles_) {
+        // If we quarantine when at zero handles, this PMT will be leaked.  See
+        // the comment in on_zero_handles().
+        PrintQuarantineWarningLocked();
+    }
+}
+
+void BusTransactionInitiatorDispatcher::PrintQuarantineWarningLocked() {
+    uint64_t leaked_pages = 0;
+    size_t num_entries = 0;
+    for (const auto& pmt : quarantine_) {
+        leaked_pages += pmt.size() / PAGE_SIZE;
+        num_entries++;
+    }
+    printf("Bus Transaction Initiator 0x%lx has leaked %" PRIu64 " pages in %zu VMOs\n",
+           bti_id_, leaked_pages, num_entries);
 }

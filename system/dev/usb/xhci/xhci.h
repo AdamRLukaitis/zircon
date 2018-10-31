@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include <sync/completion.h>
+#include <lib/sync/completion.h>
 #include <zircon/hw/usb.h>
 #include <zircon/hw/usb-hub.h>
 #include <zircon/types.h>
@@ -14,13 +14,18 @@
 #include <threads.h>
 
 #include <ddk/device.h>
+#include <ddk/mmio-buffer.h>
 #include <ddk/protocol/pci.h>
 #include <ddk/protocol/platform-device.h>
+#include <ddk/protocol/platform-device-lib.h>
 #include <ddk/protocol/usb-bus.h>
-#include <ddk/usb-request.h>
+#include <ddk/protocol/usb.h>
+#include <fbl/atomic.h>
+#include <usb/usb-request.h>
 
 #include "xhci-hw.h"
 #include "xhci-root-hub.h"
+#include "xhci-transfer-common.h"
 #include "xhci-trb.h"
 
 // choose ring sizes to allow each ring to fit in a single page
@@ -41,18 +46,6 @@
 #else
 #define XHCI_IO_BUFFER_UNCACHED IO_BUFFER_UNCACHED
 #endif
-
-// cache is coherent on x86
-// state for endpoint's current transfer
-typedef struct {
-    phys_iter_t         phys_iter;
-    uint32_t            packet_count;       // remaining packets to send
-    uint8_t             direction;
-    bool                needs_data_event;   // true if we still need to queue data event TRB
-    bool                needs_status;       // true if we still need to queue status TRB
-    bool                needs_transfer_trb; // true if we still need to queue transfer TRB
-    bool                needs_zlp;          // true if we still need to queue a zero length packet
-} xhci_transfer_state_t;
 
 typedef enum {
     EP_STATE_DEAD = 0, // device does not exist or has been removed
@@ -89,6 +82,15 @@ typedef struct xhci_slot {
     usb_speed_t speed;
 } xhci_slot_t;
 
+typedef struct xhci_usb_request_internal {
+     // callback to the upper layer
+     usb_request_complete_cb complete_cb;
+     // context for the callback
+     void* cookie;
+     // for queueing request at xhci level
+     list_node_t node;
+} xhci_usb_request_internal_t;
+
 typedef struct xhci xhci_t;
 
 typedef void (*xhci_command_complete_cb)(void* data, uint32_t cc, xhci_trb_t* command_trb,
@@ -113,7 +115,7 @@ struct xhci {
     usb_bus_interface_t bus;
 
     xhci_mode_t mode;
-    atomic_bool suspended;
+    fbl::atomic<bool> suspended;
 
     // Desired number of interrupters. This may be greater than what is
     // supported by hardware. The actual number of interrupts configured
@@ -124,16 +126,14 @@ struct xhci {
     // actual number of interrupts we are using
     uint32_t num_interrupts;
 
-    zx_handle_t mmio_handle;
-    void* mmio;
-    size_t mmio_size;
+    mmio_buffer_t mmio;
 
     // PCI support
     pci_protocol_t pci;
     zx_handle_t cfg_handle;
 
     // platform device support
-    platform_device_protocol_t* pdev;
+    pdev_protocol_t* pdev;
 
     // MMIO data structures
     xhci_cap_regs_t* cap_regs;
@@ -156,13 +156,13 @@ struct xhci {
     zx_paddr_t erst_arrays_phys[INTERRUPTER_COUNT];
 
     size_t page_size;
-    size_t max_slots;
+    uint32_t max_slots;
     size_t context_size;
     // true if controller supports large ESIT payloads
     bool large_esit;
 
     // total number of ports for the root hub
-    uint32_t rh_num_ports;
+    uint8_t rh_num_ports;
 
     // state for virtual root hub devices
     // one for USB 2.0 and the other for USB 3.0
@@ -184,7 +184,7 @@ struct xhci {
     // for command processing in xhci-device-manager.c
     list_node_t command_queue;
     mtx_t command_queue_mutex;
-    completion_t command_queue_completion;
+    sync_completion_t command_queue_completion;
 
     // DMA buffers used by xhci_device_thread in xhci-device-manager.c
     uint8_t* input_context;
@@ -247,3 +247,7 @@ zx_status_t xhci_add_device(xhci_t* xhci, int slot_id, int hub_address, int spee
 void xhci_remove_device(xhci_t* xhci, int slot_id);
 
 void xhci_request_queue(xhci_t* xhci, usb_request_t* req);
+
+__BEGIN_CDECLS
+zx_status_t usb_xhci_bind(void* ctx, zx_device_t* parent);
+__END_CDECLS

@@ -48,24 +48,28 @@ void MarkPagesInUsePhys(paddr_t pa, size_t len) {
 
     list_node list = LIST_INITIAL_VALUE(list);
 
-    auto allocated = pmm_alloc_range(pa, len / PAGE_SIZE, &list);
-    ASSERT_MSG(allocated == len / PAGE_SIZE,
-            "failed to reserve memory range [%#" PRIxPTR ", %#" PRIxPTR "]\n",
-            pa, pa + len - 1);
+    zx_status_t status = pmm_alloc_range(pa, len / PAGE_SIZE, &list);
+    ASSERT_MSG(status == ZX_OK,
+               "failed to reserve memory range [%#" PRIxPTR ", %#" PRIxPTR "]\n",
+               pa, pa + len - 1);
 
     // mark all of the pages we allocated as WIRED
     vm_page_t* p;
-    list_for_every_entry (&list, p, vm_page_t, free.node) { p->state = VM_PAGE_STATE_WIRED; }
+    list_for_every_entry (&list, p, vm_page_t, queue_node) {
+        p->state = VM_PAGE_STATE_WIRED;
+    }
 }
 
 zx_status_t ProtectRegion(VmAspace* aspace, vaddr_t va, uint arch_mmu_flags) {
     auto r = aspace->FindRegion(va);
-    if (!r)
+    if (!r) {
         return ZX_ERR_NOT_FOUND;
+    }
 
     auto vm_mapping = r->as_vm_mapping();
-    if (!vm_mapping)
+    if (!vm_mapping) {
         return ZX_ERR_NOT_FOUND;
+    }
 
     return vm_mapping->Protect(vm_mapping->base(), vm_mapping->size(), arch_mmu_flags);
 }
@@ -86,19 +90,23 @@ void vm_init_preheap() {
         MarkPagesInUsePhys(boot_alloc_start, boot_alloc_end - boot_alloc_start);
     }
 
+    zx_status_t status;
+
+#if !DISABLE_KASLR // Disable random memory padding for KASLR
     // Reserve up to 15 pages as a random padding in the kernel physical mapping
     uchar entropy;
     crypto::GlobalPRNG::GetInstance()->Draw(&entropy, sizeof(entropy));
     struct list_node list;
     list_initialize(&list);
     size_t page_count = entropy % 16;
-    size_t allocated = pmm_alloc_pages(page_count, 0, &list);
-    DEBUG_ASSERT(page_count == allocated);
+    status = pmm_alloc_pages(page_count, 0, &list);
+    DEBUG_ASSERT(status == ZX_OK);
     LTRACEF("physical mapping padding page count %#" PRIxPTR "\n", page_count);
+#endif
 
     // grab a page and mark it as the zero page
-    zero_page = pmm_alloc_page(0, &zero_page_paddr);
-    DEBUG_ASSERT(zero_page);
+    status = pmm_alloc_page(0, &zero_page, &zero_page_paddr);
+    DEBUG_ASSERT(status == ZX_OK);
 
     void* ptr = paddr_to_physmap(zero_page_paddr);
     DEBUG_ASSERT(ptr);
@@ -161,6 +169,7 @@ void vm_init() {
     // reserve the kernel aspace where the physmap is
     aspace->ReserveSpace("physmap", PHYSMAP_SIZE, PHYSMAP_BASE);
 
+#if !DISABLE_KASLR // Disable random memory padding for KASLR
     // Reserve random padding of up to 64GB after first mapping. It will make
     // the adjacent memory mappings (kstack_vmar, arena:handles and others) at
     // non-static virtual addresses.
@@ -171,20 +180,24 @@ void vm_init() {
     zx_status_t status = aspace->ReserveSpace("random_padding", random_size, PHYSMAP_BASE + PHYSMAP_SIZE);
     ASSERT(status == ZX_OK);
     LTRACEF("VM: aspace random padding size: %#" PRIxPTR "\n", random_size);
+#endif
 }
 
 paddr_t vaddr_to_paddr(const void* ptr) {
-    if (is_physmap_addr(ptr))
+    if (is_physmap_addr(ptr)) {
         return physmap_to_paddr(ptr);
+    }
 
     auto aspace = VmAspace::vaddr_to_aspace(reinterpret_cast<uintptr_t>(ptr));
-    if (!aspace)
+    if (!aspace) {
         return (paddr_t) nullptr;
+    }
 
     paddr_t pa;
     zx_status_t rc = aspace->arch_aspace().Query((vaddr_t)ptr, &pa, nullptr);
-    if (rc)
+    if (rc) {
         return (paddr_t) nullptr;
+    }
 
     return pa;
 }
@@ -203,8 +216,9 @@ static int cmd_vm(int argc, const cmd_args* argv, uint32_t flags) {
     }
 
     if (!strcmp(argv[1].str, "phys2virt")) {
-        if (argc < 3)
+        if (argc < 3) {
             goto notenoughargs;
+        }
 
         if (!is_physmap_phys_addr(argv[2].u)) {
             printf("address isn't in physmap\n");
@@ -214,8 +228,9 @@ static int cmd_vm(int argc, const cmd_args* argv, uint32_t flags) {
         void* ptr = paddr_to_physmap((paddr_t)argv[2].u);
         printf("paddr_to_physmap returns %p\n", ptr);
     } else if (!strcmp(argv[1].str, "virt2phys")) {
-        if (argc < 3)
+        if (argc < 3) {
             goto notenoughargs;
+        }
 
         VmAspace* aspace = VmAspace::vaddr_to_aspace(argv[2].u);
         if (!aspace) {
@@ -231,8 +246,9 @@ static int cmd_vm(int argc, const cmd_args* argv, uint32_t flags) {
             printf("\tpa %#" PRIxPTR ", flags %#x\n", pa, flags);
         }
     } else if (!strcmp(argv[1].str, "map")) {
-        if (argc < 6)
+        if (argc < 6) {
             goto notenoughargs;
+        }
 
         VmAspace* aspace = VmAspace::vaddr_to_aspace(argv[2].u);
         if (!aspace) {
@@ -246,8 +262,9 @@ static int cmd_vm(int argc, const cmd_args* argv, uint32_t flags) {
                                                 (uint)argv[5].u, &mapped);
         printf("arch_mmu_map returns %d, mapped %zu\n", err, mapped);
     } else if (!strcmp(argv[1].str, "unmap")) {
-        if (argc < 4)
+        if (argc < 4) {
             goto notenoughargs;
+        }
 
         VmAspace* aspace = VmAspace::vaddr_to_aspace(argv[2].u);
         if (!aspace) {

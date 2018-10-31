@@ -4,82 +4,155 @@
 
 #pragma once
 
+#include <ddk/device.h>
+#include <ddktl/device.h>
+#include <ddktl/protocol/clk.h>
+#include <ddktl/protocol/gpio-impl.h>
+#include <ddktl/protocol/i2c-impl.h>
+#include <ddktl/protocol/iommu.h>
+#include <ddktl/protocol/platform-bus.h>
+#include <fbl/array.h>
+#include <fbl/intrusive_wavl_tree.h>
+#include <fbl/mutex.h>
+#include <fbl/unique_ptr.h>
+#include <fbl/vector.h>
+#include <lib/sync/completion.h>
+#include <lib/zx/handle.h>
+#include <lib/zx/vmo.h>
 #include <stdint.h>
 #include <threads.h>
-#include <ddk/device.h>
-#include <ddk/protocol/clk.h>
-#include <ddk/protocol/gpio.h>
-#include <ddk/protocol/i2c.h>
-#include <ddk/protocol/iommu.h>
-#include <ddk/protocol/platform-bus.h>
-#include <ddk/protocol/platform-device.h>
-#include <ddk/protocol/usb-mode-switch.h>
-#include <sync/completion.h>
-#include <zircon/boot/bootdata.h>
 #include <zircon/types.h>
 
-typedef struct pdev_req pdev_req_t;
+#include "platform-device.h"
+#include "platform-protocol-device.h"
+#include "platform-i2c.h"
+#include "proxy-protocol.h"
 
-// this struct is local to platform-i2c.c
-typedef struct platform_i2c_bus platform_i2c_bus_t;
+namespace platform_bus {
 
-// context structure for the platform bus
-typedef struct {
-    zx_device_t* zxdev;
-    usb_mode_switch_protocol_t ums;
-    gpio_protocol_t gpio;
-    i2c_impl_protocol_t i2c;
-    clk_protocol_t clk;
-    iommu_protocol_t iommu;
-    zx_handle_t resource;   // root resource for platform bus
-    bootdata_platform_id_t platform_id;
+class PlatformBus;
+using PlatformBusType = ddk::Device<PlatformBus, ddk::GetProtocolable>;
 
-    list_node_t devices;    // list of platform_dev_t
+// This is the main class for the platform bus driver.
+class PlatformBus : public PlatformBusType, public ddk::PBusProtocol<PlatformBus>,
+                    public ddk::IommuProtocol<PlatformBus> {
+public:
+    static zx_status_t Create(zx_device_t* parent, const char* name, zx::vmo zbi);
 
-    platform_i2c_bus_t* i2c_buses;
-    uint32_t i2c_bus_count;
+    zx_status_t Proxy(
+         const void* req_buffer, size_t req_size, const zx_handle_t* req_handle_list,
+         size_t req_handle_count, void* out_resp_buffer, size_t resp_size, size_t* out_resp_actual,
+         zx_handle_t* out_resp_handle_list, size_t resp_handle_count,
+         size_t* out_resp_handle_actual);
 
-    zx_handle_t dummy_iommu_handle;
+    // Device protocol implementation.
+    zx_status_t DdkGetProtocol(uint32_t proto_id, void* out);
+    void DdkRelease();
 
-    completion_t proto_completion;
-} platform_bus_t;
+    // Platform bus protocol implementation.
+    zx_status_t PBusDeviceAdd(const pbus_dev_t* dev);
+    zx_status_t PBusProtocolDeviceAdd(uint32_t proto_id, const pbus_dev_t* dev);
+    zx_status_t PBusRegisterProtocol(uint32_t proto_id, const void* protocol, size_t protocol_size,
+                                     const platform_proxy_cb_t* proxy_cb);
+    const char* PBusGetBoardName();
+    zx_status_t PBusSetBoardInfo(const pbus_board_info_t* info);
 
-// context structure for a platform device
-typedef struct {
-    zx_device_t* zxdev;
-    platform_bus_t* bus;
-    list_node_t node;
-    char name[ZX_DEVICE_NAME_MAX + 1];
-    uint32_t flags;
-    uint32_t vid;
-    uint32_t pid;
-    uint32_t did;
-    serial_port_info_t serial_port_info;
-    bool enabled;
+    // IOMMU protocol implementation.
+    zx_status_t IommuGetBti(uint32_t iommu_index, uint32_t bti_id, zx_handle_t* out_handle);
 
-    pbus_mmio_t* mmios;
-    pbus_irq_t* irqs;
-    pbus_gpio_t* gpios;
-    pbus_i2c_channel_t* i2c_channels;
-    pbus_clk_t* clks;
-    pbus_bti_t* btis;
-    uint32_t mmio_count;
-    uint32_t irq_count;
-    uint32_t gpio_count;
-    uint32_t i2c_channel_count;
-    uint32_t clk_count;
-    uint32_t bti_count;
-} platform_dev_t;
+    // Returns the resource handle to be used for creating MMIO regions, IRQs, and SMC ranges.
+    // Currently this just returns the root resource, but we may change this to a more
+    // limited resource in the future.
+    zx_handle_t GetResource() const { return get_root_resource(); }
 
-// platform-bus.c
-zx_status_t platform_bus_get_protocol(void* ctx, uint32_t proto_id, void* protocol);
+    // Used by PlatformDevice to queue I2C transactions on an I2C bus.
+    zx_status_t I2cTransact(uint32_t txid, rpc_i2c_req_t* req, const pbus_i2c_channel_t* channel,
+                            zx_handle_t channel_handle);
 
-// platform-device.c
-void platform_dev_free(platform_dev_t* dev);
-zx_status_t platform_device_add(platform_bus_t* bus, const pbus_dev_t* dev, uint32_t flags);
-zx_status_t platform_device_enable(platform_dev_t* dev, bool enable);
+    // Helper for PlatformDevice.
+    zx_status_t GetBoardInfo(pdev_board_info_t* out_info);
 
-// platform-i2c.c
-zx_status_t platform_i2c_init(platform_bus_t* bus, i2c_impl_protocol_t* i2c);
-zx_status_t platform_i2c_transact(platform_bus_t* bus, pdev_req_t* req, pbus_i2c_channel_t* channel,
-                                  const void* write_buf, zx_handle_t channel_handle);
+    zx_status_t GetZbiMetadata(uint32_t type, uint32_t extra, const void** out_metadata,
+                               uint32_t* out_size);
+
+    // Protocol accessors for PlatformDevice.
+    inline ddk::ClkProtocolProxy* clk() const { return clk_.get(); }
+    inline ddk::GpioImplProtocolProxy* gpio() const { return gpio_.get(); }
+    inline ddk::I2cImplProtocolProxy* i2c() const { return i2c_.get(); }
+
+private:
+    // This class is a wrapper for a platform_proxy_cb_t added via pbus_register_protocol().
+    // It also is the element type for the proto_proxys_ WAVL tree.
+    class ProtoProxy : public fbl::WAVLTreeContainable<fbl::unique_ptr<ProtoProxy>> {
+    public:
+        ProtoProxy(uint32_t proto_id, const ddk::AnyProtocol* protocol,
+                   const platform_proxy_cb_t& proxy_cb)
+            : proto_id_(proto_id), protocol_(*protocol), proxy_cb_(proxy_cb) {}
+
+        inline uint32_t GetKey() const { return proto_id_; }
+        inline void GetProtocol(void* out) const { memcpy(out, &protocol_, sizeof(protocol_)); }
+
+        inline void Proxy(const void* req_buffer, size_t req_size,
+                          const zx_handle_t* req_handle_list, size_t req_handle_count,
+                          void* out_resp_buffer, size_t resp_size, size_t* out_resp_actual,
+                          zx_handle_t* out_resp_handle_list, size_t resp_handle_count,
+                          size_t* out_resp_handle_actual) {
+            proxy_cb_.callback(proxy_cb_.ctx, req_buffer, req_size,
+                               req_handle_list, req_handle_count,
+                               out_resp_buffer, resp_size, out_resp_actual,
+                               out_resp_handle_list, resp_handle_count,
+                               out_resp_handle_actual);
+        }
+
+    private:
+        const uint32_t proto_id_;
+        const ddk::AnyProtocol protocol_;
+        platform_proxy_cb_t proxy_cb_;
+    };
+
+
+    explicit PlatformBus(zx_device_t* parent);
+
+    DISALLOW_COPY_ASSIGN_AND_MOVE(PlatformBus);
+
+    zx_status_t Init(zx::vmo zbi);
+
+    // Reads the platform ID and driver metadata records from the boot image.
+    zx_status_t ReadZbi(zx::vmo zbi);
+
+    zx_status_t I2cInit(const i2c_impl_protocol_t* i2c);
+
+    pdev_board_info_t board_info_;
+
+    // Protocols that are optionally provided by the board driver.
+    fbl::unique_ptr<ddk::ClkProtocolProxy> clk_;
+    fbl::unique_ptr<ddk::GpioImplProtocolProxy> gpio_;
+    fbl::unique_ptr<ddk::IommuProtocolProxy> iommu_;
+    fbl::unique_ptr<ddk::I2cImplProtocolProxy> i2c_;
+
+    // Completion used by WaitProtocol().
+    sync_completion_t proto_completion_ __TA_GUARDED(proto_completion_mutex_);
+    // Protects proto_completion_.
+    fbl::Mutex proto_completion_mutex_;
+
+    // Metadata extracted from ZBI.
+    fbl::Array<uint8_t> metadata_;
+
+    // List of I2C buses.
+    fbl::Vector<fbl::unique_ptr<PlatformI2cBus>> i2c_buses_;
+
+    // Dummy IOMMU.
+    zx::handle iommu_handle_;
+
+    fbl::WAVLTree<uint32_t, fbl::unique_ptr<ProtoProxy>> proto_proxys_
+                                                __TA_GUARDED(proto_proxys_mutex_);
+    // Protects proto_proxys_.
+    fbl::Mutex proto_proxys_mutex_;
+};
+
+} // namespace platform_bus
+
+__BEGIN_CDECLS
+zx_status_t platform_bus_create(void* ctx, zx_device_t* parent, const char* name,
+                                const char* args, zx_handle_t rpc_channel);
+__END_CDECLS

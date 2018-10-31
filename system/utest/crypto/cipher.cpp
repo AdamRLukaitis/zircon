@@ -20,7 +20,6 @@ namespace {
 
 // See utils.h; the following macros allow reusing tests for each of the supported Ciphers.
 #define EACH_PARAM(OP, Test)                                                                       \
-    OP(Test, Cipher, AES128_CTR)                                                                   \
     OP(Test, Cipher, AES256_XTS)
 
 bool TestGetLengths_Uninitialized(void) {
@@ -31,26 +30,6 @@ bool TestGetLengths_Uninitialized(void) {
     EXPECT_ZX(Cipher::GetIVLen(Cipher::kUninitialized, &len), ZX_ERR_INVALID_ARGS);
     END_TEST;
 }
-
-bool TestGetLengths_AES128_CTR(void) {
-    BEGIN_TEST;
-    size_t key_len;
-    EXPECT_ZX(Cipher::GetKeyLen(Cipher::kAES128_CTR, nullptr), ZX_ERR_INVALID_ARGS);
-    EXPECT_OK(Cipher::GetKeyLen(Cipher::kAES128_CTR, &key_len));
-    EXPECT_EQ(key_len, 16U);
-
-    size_t iv_len;
-    EXPECT_ZX(Cipher::GetIVLen(Cipher::kAES128_CTR, nullptr), ZX_ERR_INVALID_ARGS);
-    EXPECT_OK(Cipher::GetIVLen(Cipher::kAES128_CTR, &iv_len));
-    EXPECT_EQ(iv_len, 16U);
-
-    size_t block_size;
-    EXPECT_ZX(Cipher::GetIVLen(Cipher::kAES128_CTR, nullptr), ZX_ERR_INVALID_ARGS);
-    EXPECT_OK(Cipher::GetIVLen(Cipher::kAES128_CTR, &block_size));
-    EXPECT_EQ(block_size, 16U);
-    END_TEST;
-}
-
 
 bool TestGetLengths_AES256_XTS(void) {
     BEGIN_TEST;
@@ -74,7 +53,8 @@ bool TestGetLengths_AES256_XTS(void) {
 bool TestInitEncrypt_Uninitialized(void) {
     BEGIN_TEST;
     Cipher cipher;
-    Bytes key, iv;
+    Secret key;
+    Bytes iv;
     EXPECT_ZX(cipher.InitEncrypt(Cipher::kUninitialized, key, iv), ZX_ERR_INVALID_ARGS);
     END_TEST;
 }
@@ -82,12 +62,13 @@ bool TestInitEncrypt_Uninitialized(void) {
 bool TestInitEncrypt(Cipher::Algorithm cipher) {
     BEGIN_TEST;
     Cipher encrypt;
-    Bytes key, iv;
+    Secret key;
+    Bytes iv;
     ASSERT_OK(GenerateKeyMaterial(cipher, &key, &iv));
 
     // Bad key
-    Bytes bad_key;
-    ASSERT_OK(bad_key.Copy(key.get(), key.len() - 1));
+    Secret bad_key;
+    ASSERT_OK(bad_key.Generate(key.len() - 1));
     EXPECT_ZX(encrypt.InitEncrypt(cipher, bad_key, iv), ZX_ERR_INVALID_ARGS);
 
     // Bad IV
@@ -109,7 +90,8 @@ DEFINE_EACH(TestInitEncrypt)
 bool TestInitDecrypt_Uninitialized(void) {
     BEGIN_TEST;
     Cipher decrypt;
-    Bytes key, iv;
+    Secret key;
+    Bytes iv;
     EXPECT_ZX(decrypt.InitDecrypt(Cipher::kUninitialized, key, iv), ZX_ERR_INVALID_ARGS);
     END_TEST;
 }
@@ -117,12 +99,13 @@ bool TestInitDecrypt_Uninitialized(void) {
 bool TestInitDecrypt(Cipher::Algorithm cipher) {
     BEGIN_TEST;
     Cipher decrypt;
-    Bytes key, iv;
+    Secret key;
+    Bytes iv;
     ASSERT_OK(GenerateKeyMaterial(cipher, &key, &iv));
 
     // Bad key
-    Bytes bad_key;
-    ASSERT_OK(bad_key.Copy(key.get(), key.len() - 1));
+    Secret bad_key;
+    ASSERT_OK(bad_key.Generate(key.len() - 1));
     EXPECT_ZX(decrypt.InitDecrypt(cipher, bad_key, iv), ZX_ERR_INVALID_ARGS);
 
     // Bad IV
@@ -144,9 +127,10 @@ DEFINE_EACH(TestInitDecrypt)
 bool TestEncryptStream(Cipher::Algorithm cipher) {
     BEGIN_TEST;
     size_t len = PAGE_SIZE;
-    Bytes key, iv, ptext;
+    Secret key;
+    Bytes iv, ptext;
     ASSERT_OK(GenerateKeyMaterial(cipher, &key, &iv));
-    ASSERT_OK(ptext.InitRandom(len));
+    ASSERT_OK(ptext.Randomize(len));
     uint8_t ctext[len];
 
     // Not initialized
@@ -178,9 +162,10 @@ DEFINE_EACH(TestEncryptStream)
 bool TestEncryptRandomAccess(Cipher::Algorithm cipher) {
     BEGIN_TEST;
     size_t len = PAGE_SIZE;
-    Bytes key, iv, ptext;
+    Secret key;
+    Bytes iv, ptext;
     ASSERT_OK(GenerateKeyMaterial(cipher, &key, &iv));
-    ASSERT_OK(ptext.InitRandom(len));
+    ASSERT_OK(ptext.Randomize(len));
     uint8_t ctext[len];
 
     // Not initialized
@@ -215,9 +200,10 @@ DEFINE_EACH(TestEncryptRandomAccess)
 bool TestDecryptStream(Cipher::Algorithm cipher) {
     BEGIN_TEST;
     size_t len = PAGE_SIZE;
-    Bytes key, iv, ptext;
+    Secret key;
+    Bytes iv, ptext;
     ASSERT_OK(GenerateKeyMaterial(cipher, &key, &iv));
-    ASSERT_OK(ptext.InitRandom(len));
+    ASSERT_OK(ptext.Randomize(len));
     uint8_t ctext[len];
     uint8_t result[len];
     Cipher encrypt;
@@ -244,7 +230,8 @@ bool TestDecryptStream(Cipher::Algorithm cipher) {
     EXPECT_EQ(memcmp(ptext.get(), result, len), 0);
 
     // Mismatched key, iv
-    Bytes bad_key, bad_iv;
+    Secret bad_key;
+    Bytes bad_iv;
     ASSERT_OK(GenerateKeyMaterial(cipher, &bad_key, &bad_iv));
 
     ASSERT_OK(decrypt.InitDecrypt(cipher, bad_key, iv));
@@ -278,9 +265,10 @@ DEFINE_EACH(TestDecryptStream)
 bool TestDecryptRandomAccess(Cipher::Algorithm cipher) {
     BEGIN_TEST;
     size_t len = PAGE_SIZE;
-    Bytes key, iv, ptext;
+    Secret key;
+    Bytes iv, ptext;
     ASSERT_OK(GenerateKeyMaterial(cipher, &key, &iv));
-    ASSERT_OK(ptext.InitRandom(len));
+    ASSERT_OK(ptext.Randomize(len));
     uint8_t ctext[len];
     uint8_t result[len];
     Cipher encrypt;
@@ -310,7 +298,8 @@ bool TestDecryptRandomAccess(Cipher::Algorithm cipher) {
     EXPECT_EQ(memcmp(ptext.get(), result, len), 0);
 
     // Mismatched key, iv and offset
-    Bytes bad_key, bad_iv;
+    Secret bad_key;
+    Bytes bad_iv;
     ASSERT_OK(GenerateKeyMaterial(cipher, &bad_key, &bad_iv));
 
     ASSERT_OK(decrypt.InitDecrypt(cipher, bad_key, iv, len / 4));
@@ -344,8 +333,9 @@ DEFINE_EACH(TestDecryptRandomAccess)
 bool TestSP800_TC(Cipher::Algorithm cipher, const char* xkey, const char* xiv, const char* xptext,
                   const char* xctext) {
     BEGIN_TEST;
-    Bytes key, iv, ctext, ptext;
-    ASSERT_OK(HexToBytes(xkey, &key));
+    Secret key;
+    Bytes iv, ctext, ptext;
+    ASSERT_OK(HexToSecret(xkey, &key));
     ASSERT_OK(HexToBytes(xiv, &iv));
     ASSERT_OK(HexToBytes(xptext, &ptext));
     ASSERT_OK(HexToBytes(xctext, &ctext));
@@ -365,19 +355,6 @@ bool TestSP800_TC(Cipher::Algorithm cipher, const char* xkey, const char* xiv, c
 }
 
 // clang-format off
-
-// See https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38a.pdf
-bool TestSP800_38A_F5(void) {
-    return TestSP800_TC(Cipher::kAES128_CTR,
-        // key
-        "2b7e151628aed2a6abf7158809cf4f3c",
-        // iv
-        "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
-        // ptext
-        "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710",
-        // ctext
-        "874d6191b620e3261bef6864990db6ce9806f66b7970fdff8617187bb9fffdff5ae4df3edbd5d35e5b4f09020db03eab1e031dda2fbe03d1792170a0f3009cee");
-}
 
 // See https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/aes/XTSTestVectors.zip
 bool TestSP800_38E_TC010(void) {
@@ -632,7 +609,6 @@ RUN_EACH(TestEncryptStream)
 RUN_EACH(TestEncryptRandomAccess)
 RUN_EACH(TestDecryptStream)
 RUN_EACH(TestDecryptRandomAccess)
-RUN_TEST(TestSP800_38A_F5)
 RUN_TEST(TestSP800_38E_TC010)
 RUN_TEST(TestSP800_38E_TC020)
 RUN_TEST(TestSP800_38E_TC030)

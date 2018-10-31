@@ -8,6 +8,8 @@ MODULE := $(LOCAL_DIR)
 
 MODULE_TYPE := userlib
 
+MODULE_COMPILEFLAGS += -fvisibility=hidden
+
 MODULE_SRCS += \
     $(LOCAL_DIR)/backtrace.cpp \
     $(LOCAL_DIR)/dso-list.cpp \
@@ -23,6 +25,8 @@ MODULE_LIBS := \
     third_party/ulib/ngunwind \
     system/ulib/zircon \
     system/ulib/c \
+
+MODULE_PACKAGE := static
 
 # Compile this with frame pointers so that if we crash
 # the simplistic unwinder will work.

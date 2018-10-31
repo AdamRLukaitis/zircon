@@ -29,19 +29,19 @@ public:
 
     static zx_status_t create(uint32_t options, port* result);
 
-    zx_status_t queue(const zx_port_packet_t* packet, size_t size) const {
-        return zx_port_queue(get(), packet, size);
+    zx_status_t queue(const zx_port_packet_t* packet) const {
+        return zx_port_queue(get(), packet);
     }
 
-    zx_status_t wait(zx::time deadline, zx_port_packet_t* packet, size_t size) const {
-        return zx_port_wait(get(), deadline.get(), packet, size);
+    zx_status_t wait(zx::time deadline, zx_port_packet_t* packet) const {
+        return zx_port_wait(get(), deadline.get(), packet);
     }
 
-    zx_status_t cancel(zx_handle_t source, uint64_t key) const {
-        return zx_port_cancel(get(), source, key);
+    zx_status_t cancel(const object_base& source, uint64_t key) const {
+        return zx_port_cancel(get(), source.get(), key);
     }
 };
 
-using unowned_port = const unowned<port>;
+using unowned_port = unowned<port>;
 
 } // namespace zx

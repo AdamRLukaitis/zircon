@@ -40,8 +40,21 @@ endif
 
 # modules that declare a soname or install name desire to be shared libs as well
 ifneq ($(MODULE_SO_NAME)$(MODULE_SO_INSTALL_NAME),)
-MODULE_ALIBS := $(foreach lib,$(MODULE_STATIC_LIBS),$(call TOBUILDDIR,$(lib))/lib$(notdir $(lib)).a)
+MODULE_ALIBS := $(foreach lib,$(MODULE_STATIC_LIBS) $(MODULE_FIDL_LIBS),$(call TOBUILDDIR,$(lib))/lib$(notdir $(lib)).a)
+
+# Link profile runtime into everything compiled with profile instrumentation.
+# The static profile runtime library must come after all static libraries
+# whose instrumented code might call into it.  It depends on libzircon, so
+# make sure we're linking that in if we're not already.
+ifeq ($(strip $(call TOBOOL,$(USE_PROFILE)) \
+	      $(filter $(NO_PROFILE),$(MODULE_COMPILEFLAGS))),true)
+MODULE_ALIBS += $(PROFILE_LIB)
+MODULE_LIBS := $(filter-out system/ulib/zircon,$(MODULE_LIBS)) \
+	       system/ulib/zircon
+endif
+
 MODULE_SOLIBS := $(foreach lib,$(MODULE_LIBS),$(call TOBUILDDIR,$(lib))/lib$(notdir $(lib)).so.abi)
+MODULE_EXTRA_OBJS += $(foreach lib,$(MODULE_FIDL_LIBS),$(call TOBUILDDIR,$(lib))/gen/obj/tables.cpp.o)
 
 # Include this in every link.
 MODULE_EXTRA_OBJS += scripts/dso_handle.ld
@@ -60,8 +73,9 @@ $(MODULE_LIBNAME).so: _LDFLAGS := $(GLOBAL_LDFLAGS) $(USERLIB_SO_LDFLAGS) $(MODU
 $(MODULE_LIBNAME).so: $(MODULE_OBJS) $(MODULE_EXTRA_OBJS) $(MODULE_ALIBS) $(MODULE_SOLIBS)
 	@$(MKDIR)
 	$(call BUILDECHO,linking userlib $@)
-	$(call BUILDCMD,$(USER_LD),$(_LDFLAGS) -shared $(_SONAME_FLAGS) \
-                                   $(_OBJS) $(_LIBS) $(LIBGCC) -o $@)
+	$(call BUILDCMD,$(USER_LD),$(_LDFLAGS) -shared $(_SONAME_FLAGS) $(_OBJS) \
+				   --start-group $(_LIBS) --end-group \
+				   $(LIBGCC) -o $@)
 
 EXTRA_IDFILES += $(MODULE_LIBNAME).so.id
 
@@ -192,7 +206,7 @@ MODULE_PKG_TAG := "[lib]"
 ifneq ($(filter shared,$(MODULE_PACKAGE)),)
 ifneq ($(MODULE_SO_NAME),)
 MODULE_PKG_SRCS += lib/lib$(MODULE_SO_NAME).so=BUILD/$(patsubst $(BUILDDIR)/%,%,$(MODULE_LIBNAME)).so.abi
-MODULE_PKG_SRCS += dist/lib$(MODULE_SO_NAME).so=BUILD/$(patsubst $(BUILDDIR)/%,%,$(MODULE_LIBNAME)).so.strip
+MODULE_PKG_SRCS += dist/$(MODULE_SO_INSTALL_NAME)=BUILD/$(patsubst $(BUILDDIR)/%,%,$(MODULE_LIBNAME)).so.strip
 MODULE_PKG_SRCS += debug/lib$(MODULE_SO_NAME).so=BUILD/$(patsubst $(BUILDDIR)/%,%,$(MODULE_LIBNAME)).so
 endif
 endif
@@ -206,8 +220,10 @@ ifeq ($(filter shared,$(MODULE_PACKAGE)),)
 # source modules and static libraries need to include their static deps to be buildable
 # we apply the same . to - transform as in PKG_DEPS
 MODULE_PKG_SDEPS := $(subst .,-,$(foreach dep,$(MODULE_STATIC_LIBS),$(lastword $(subst /,$(SPACE),$(dep)))))
+MODULE_PKG_FDEPS := $(subst .,-,$(foreach dep,$(MODULE_FIDL_LIBS),$(lastword $(subst /,$(SPACE),$(dep)))))
 else
 MODULE_PKG_SDEPS :=
+MODULE_PKG_FDEPS :=
 endif
 
 # libc is the "sysroot" package
@@ -241,6 +257,7 @@ MODULE_PKG_INCS += $(foreach inc,$(ZIRCON_HEADERS),$(patsubst system/ulib/zircon
 # libc only depends on libzircon which is now included, so clear the deps list
 MODULE_PKG_DEPS :=
 MODULE_PKG_SDEPS :=
+MODULE_PKG_FDEPS :=
 endif
 
 $(MODULE_PKG_FILE): _NAME := $(MODULE_NAME)
@@ -249,6 +266,7 @@ $(MODULE_PKG_FILE): _INCS := $(if $(MODULE_PKG_INCS),"[includes]" $(sort $(MODUL
 $(MODULE_PKG_FILE): _SRCS := $(if $(MODULE_PKG_SRCS),$(MODULE_PKG_TAG) $(sort $(MODULE_PKG_SRCS)))
 $(MODULE_PKG_FILE): _DEPS := $(if $(MODULE_PKG_DEPS),"[deps]" $(sort $(MODULE_PKG_DEPS)))
 $(MODULE_PKG_FILE): _SDEPS := $(if $(MODULE_PKG_SDEPS),"[static-deps]" $(sort $(MODULE_PKG_SDEPS)))
+$(MODULE_PKG_FILE): _FDEPS := $(if $(MODULE_PKG_FDEPS),"[fidl-deps]" $(sort $(MODULE_PKG_FDEPS)))
 $(MODULE_PKG_FILE): $(MODULE_RULESMK) make/module-userlib.mk
 	@$(call BUILDECHO,creating package $@ ;)\
 	$(MKDIR) ;\
@@ -259,6 +277,7 @@ $(MODULE_PKG_FILE): $(MODULE_RULESMK) make/module-userlib.mk
 	for i in $(_INCS) ; do echo $$i >> $@ ; done ;\
 	for i in $(_SRCS) ; do echo $$i >> $@ ; done ;\
 	for i in $(_SDEPS) ; do echo $$i >> $@ ; done ;\
+	for i in $(_FDEPS) ; do echo $$i >> $@ ; done ;\
 	for i in $(_DEPS) ; do echo $$i >> $@ ; done
 
 $(MODULE_EXP_FILE): $(MODULE_PKG_FILE)

@@ -15,9 +15,8 @@
 #include <dev/interrupt.h>
 #include <dev/iommu.h>
 #include <dev/udisplay.h>
-#include <vm/vm.h>
-#include <vm/vm_object_paged.h>
-#include <vm/vm_object_physical.h>
+#include <fbl/auto_call.h>
+#include <fbl/inline_array.h>
 #include <lib/user_copy/user_ptr.h>
 #include <object/bus_transaction_initiator_dispatcher.h>
 #include <object/handle.h>
@@ -25,142 +24,27 @@
 #include <object/interrupt_event_dispatcher.h>
 #include <object/iommu_dispatcher.h>
 #include <object/process_dispatcher.h>
-#include <object/resources.h>
+#include <object/resource.h>
+#include <object/virtual_interrupt_dispatcher.h>
 #include <object/vm_object_dispatcher.h>
+#include <vm/vm.h>
+#include <vm/vm_object_paged.h>
+#include <vm/vm_object_physical.h>
+#include <zircon/syscalls/iommu.h>
+#include <zircon/syscalls/pci.h>
+#include <zircon/syscalls/smc.h>
 #include <zxcpp/new.h>
 
 #if ARCH_X86
 #include <platform/pc/bootloader.h>
 #endif
 
-#include <zircon/syscalls/iommu.h>
-#include <zircon/syscalls/pci.h>
-#include <fbl/auto_call.h>
-#include <fbl/inline_array.h>
-
+#include "ddk_priv.h"
 #include "priv.h"
 
 #define LOCAL_TRACE 0
 
-zx_status_t sys_interrupt_create(zx_handle_t hrsrc, uint32_t options,
-                                 user_out_handle* out_handle) {
-#if ENABLE_NEW_IRQ_API
-    return ZX_ERR_NOT_SUPPORTED;
-#else
-
-    LTRACEF("options 0x%x\n", options);
-
-    if (options != 0u)
-        return ZX_ERR_INVALID_ARGS;
-
-    // TODO(ZX-971): finer grained validation
-    zx_status_t status;
-    if ((status = validate_resource(hrsrc, ZX_RSRC_KIND_ROOT)) < 0) {
-        return status;
-    }
-
-    fbl::RefPtr<Dispatcher> dispatcher;
-    zx_rights_t rights;
-    zx_status_t result = InterruptEventDispatcher::Create(&dispatcher, &rights);
-    if (result != ZX_OK)
-        return result;
-
-    return out_handle->make(fbl::move(dispatcher), rights);
-
-#endif
-}
-
-zx_status_t sys_interrupt_bind(zx_handle_t handle, uint32_t slot, zx_handle_t hrsrc,
-                               uint32_t vector, uint32_t options) {
-#if ENABLE_NEW_IRQ_API
-    return ZX_ERR_NOT_SUPPORTED;
-#else
-
-    LTRACEF("handle %x\n", handle);
-
-    // resource not required for virtual interrupts
-    if (!(options & ZX_INTERRUPT_VIRTUAL)) {
-        // TODO(ZX-971): finer grained validation
-        zx_status_t status;
-        if ((status = validate_resource(hrsrc, ZX_RSRC_KIND_ROOT)) < 0) {
-            return status;
-        }
-    }
-
-    auto up = ProcessDispatcher::GetCurrent();
-    fbl::RefPtr<InterruptDispatcher> interrupt;
-    zx_status_t status = up->GetDispatcher(handle, &interrupt);
-    if (status != ZX_OK)
-        return status;
-
-    return interrupt->Bind(slot, vector, options);
-
-#endif
-}
-
-zx_status_t sys_interrupt_wait(zx_handle_t handle, user_out_ptr<uint64_t> out_slots) {
-#if ENABLE_NEW_IRQ_API
-    return ZX_ERR_NOT_SUPPORTED;
-#else
-
-    LTRACEF("handle %x\n", handle);
-
-    auto up = ProcessDispatcher::GetCurrent();
-    fbl::RefPtr<InterruptDispatcher> interrupt;
-    zx_status_t status = up->GetDispatcher(handle, &interrupt);
-    if (status != ZX_OK)
-        return status;
-
-    uint64_t slots = 0;
-    status = interrupt->WaitForInterrupt(&slots);
-    if (status == ZX_OK)
-        status = out_slots.copy_to_user(slots);
-    return status;
-
-#endif
-}
-
-zx_status_t sys_interrupt_get_timestamp(zx_handle_t handle, uint32_t slot,
-                                        user_out_ptr<zx_time_t> out_timestamp) {
-#if ENABLE_NEW_IRQ_API
-    return ZX_ERR_NOT_SUPPORTED;
-#else
-
-    LTRACEF("handle %x\n", handle);
-
-    auto up = ProcessDispatcher::GetCurrent();
-    fbl::RefPtr<InterruptDispatcher> interrupt;
-    zx_status_t status = up->GetDispatcher(handle, &interrupt);
-    if (status != ZX_OK)
-        return status;
-
-    zx_time_t timestamp;
-    status = interrupt->GetTimeStamp(slot, &timestamp);
-    if (status == ZX_OK)
-        status = out_timestamp.copy_to_user(timestamp);
-    return status;
-
-#endif
-}
-
-zx_status_t sys_interrupt_signal(zx_handle_t handle, uint32_t slot, zx_time_t timestamp) {
-#if ENABLE_NEW_IRQ_API
-    return ZX_ERR_NOT_SUPPORTED;
-#else
-
-    LTRACEF("handle %x\n", handle);
-
-    auto up = ProcessDispatcher::GetCurrent();
-    fbl::RefPtr<InterruptDispatcher> interrupt;
-    zx_status_t status = up->GetDispatcher(handle, &interrupt);
-    if (status != ZX_OK)
-        return status;
-
-    return interrupt->UserSignal(slot, timestamp);
-
-#endif
-}
-
+// zx_status_t zx_vmo_create_contiguous
 zx_status_t sys_vmo_create_contiguous(zx_handle_t bti, size_t size, uint32_t alignment_log2,
                                       user_out_handle* out) {
     LTRACEF("size 0x%zu\n", size);
@@ -184,43 +68,37 @@ zx_status_t sys_vmo_create_contiguous(zx_handle_t bti, size_t size, uint32_t ali
         return status;
     }
 
-    size = ROUNDUP_PAGE_SIZE(size);
+    auto align_log2_arg = static_cast<uint8_t>(alignment_log2);
+
     // create a vm object
     fbl::RefPtr<VmObject> vmo;
-    status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, size, &vmo);
-    if (status != ZX_OK)
+    status = VmObjectPaged::CreateContiguous(PMM_ALLOC_FLAG_ANY, size, align_log2_arg, &vmo);
+    if (status != ZX_OK) {
         return status;
-
-    // always immediately commit memory to the object
-    uint64_t committed;
-    // CommitRangeContiguous takes a uint8_t for the alignment
-    auto align_log2_arg = static_cast<uint8_t>(alignment_log2);
-    status = vmo->CommitRangeContiguous(0, size, &committed, align_log2_arg);
-    if (status < 0 || (size_t)committed < size) {
-        LTRACEF("failed to allocate enough pages (asked for %zu, got %zu)\n", size / PAGE_SIZE,
-                (size_t)committed / PAGE_SIZE);
-        return ZX_ERR_NO_MEMORY;
     }
 
     // create a Vm Object dispatcher
     fbl::RefPtr<Dispatcher> dispatcher;
     zx_rights_t rights;
     zx_status_t result = VmObjectDispatcher::Create(fbl::move(vmo), &dispatcher, &rights);
-    if (result != ZX_OK)
+    if (result != ZX_OK) {
         return result;
+    }
 
     // create a handle and attach the dispatcher to it
     return out->make(fbl::move(dispatcher), rights);
 }
 
+// zx_status_t zx_vmo_create_physical
 zx_status_t sys_vmo_create_physical(zx_handle_t hrsrc, uintptr_t paddr, size_t size,
                                     user_out_handle* out) {
     LTRACEF("size 0x%zu\n", size);
 
-    // TODO: attempting to create a physical VMO that points to memory should be an error
-
+    // Memory should be subtracted from the PhysicalAspace allocators, so it's
+    // safe to assume that if the caller has access to a resource for this specified
+    // region of MMIO space then it is safe to allow the vmo to be created.
     zx_status_t status;
-    if ((status = validate_resource_mmio(hrsrc, paddr, size)) < 0) {
+    if ((status = validate_resource_mmio(hrsrc, paddr, size)) != ZX_OK) {
         return status;
     }
 
@@ -237,19 +115,25 @@ zx_status_t sys_vmo_create_physical(zx_handle_t hrsrc, uintptr_t paddr, size_t s
     fbl::RefPtr<Dispatcher> dispatcher;
     zx_rights_t rights;
     result = VmObjectDispatcher::Create(fbl::move(vmo), &dispatcher, &rights);
-    if (result != ZX_OK)
+    if (result != ZX_OK) {
         return result;
+    }
 
     // create a handle and attach the dispatcher to it
     return out->make(fbl::move(dispatcher), rights);
 }
 
-zx_status_t sys_bootloader_fb_get_info(user_out_ptr<uint32_t> format, user_out_ptr<uint32_t> width,
-                                       user_out_ptr<uint32_t> height, user_out_ptr<uint32_t> stride) {
+// zx_status_t zx_framebuffer_get_info
+zx_status_t sys_framebuffer_get_info(zx_handle_t handle, user_out_ptr<uint32_t> format,
+                                     user_out_ptr<uint32_t> width, user_out_ptr<uint32_t> height,
+                                     user_out_ptr<uint32_t> stride) {
+    zx_status_t status;
+    if ((status = validate_resource(handle, ZX_RSRC_KIND_ROOT)) < 0)
+        return status;
 #if ARCH_X86
     if (!bootloader.fb.base)
         return ZX_ERR_INVALID_ARGS;
-    zx_status_t status = format.copy_to_user(bootloader.fb.format);
+    status = format.copy_to_user(bootloader.fb.format);
     if (status != ZX_OK)
         return status;
     status = width.copy_to_user(bootloader.fb.width);
@@ -267,29 +151,8 @@ zx_status_t sys_bootloader_fb_get_info(user_out_ptr<uint32_t> format, user_out_p
 #endif
 }
 
-zx_status_t sys_set_framebuffer(zx_handle_t hrsrc, user_inout_ptr<void> vaddr, uint32_t len, uint32_t format, uint32_t width, uint32_t height, uint32_t stride) {
-    // TODO(ZX-971): finer grained validation
-    zx_status_t status;
-    if ((status = validate_resource(hrsrc, ZX_RSRC_KIND_ROOT)) < 0) {
-        return status;
-    }
-
-    intptr_t paddr = vaddr_to_paddr(vaddr.get());
-    udisplay_set_framebuffer(paddr, len);
-
-    struct display_info di;
-    memset(&di, 0, sizeof(struct display_info));
-    di.format = format;
-    di.width = width;
-    di.height = height;
-    di.stride = stride;
-    di.flags = DISPLAY_FLAG_HW_FRAMEBUFFER;
-    udisplay_set_display_info(&di);
-
-    return ZX_OK;
-}
-
-zx_status_t sys_set_framebuffer_vmo(zx_handle_t hrsrc, zx_handle_t vmo_handle, uint32_t len, uint32_t format, uint32_t width, uint32_t height, uint32_t stride) {
+// zx_status_t zx_framebuffer_set_range
+zx_status_t sys_framebuffer_set_range(zx_handle_t hrsrc, zx_handle_t vmo_handle, uint32_t len, uint32_t format, uint32_t width, uint32_t height, uint32_t stride) {
     zx_status_t status;
     if ((status = validate_resource(hrsrc, ZX_RSRC_KIND_ROOT)) < 0)
         return status;
@@ -307,7 +170,7 @@ zx_status_t sys_set_framebuffer_vmo(zx_handle_t hrsrc, zx_handle_t vmo_handle, u
     if (status != ZX_OK)
         return status;
 
-    status = udisplay_set_framebuffer_vmo(vmo->vmo());
+    status = udisplay_set_framebuffer(vmo->vmo());
     if (status != ZX_OK)
         return status;
 
@@ -323,8 +186,9 @@ zx_status_t sys_set_framebuffer_vmo(zx_handle_t hrsrc, zx_handle_t vmo_handle, u
     return ZX_OK;
 }
 
+// zx_status_t zx_iommu_create
 zx_status_t sys_iommu_create(zx_handle_t rsrc_handle, uint32_t type,
-                             user_in_ptr<const void> desc, uint32_t desc_len,
+                             user_in_ptr<const void> desc, size_t desc_len,
                              user_out_handle* out) {
     // TODO: finer grained validation
     zx_status_t status;
@@ -365,10 +229,10 @@ zx_status_t sys_iommu_create(zx_handle_t rsrc_handle, uint32_t type,
 #include <arch/x86/descriptor.h>
 #include <arch/x86/ioport.h>
 
-zx_status_t sys_mmap_device_io(zx_handle_t hrsrc, uint32_t io_addr, uint32_t len) {
-    // TODO(ZX-971): finer grained validation
+// zx_status_t zx_ioports_request
+zx_status_t sys_ioports_request(zx_handle_t hrsrc, uint16_t io_addr, uint32_t len) {
     zx_status_t status;
-    if ((status = validate_resource(hrsrc, ZX_RSRC_KIND_ROOT)) < 0) {
+    if ((status = validate_resource_ioport(hrsrc, io_addr, len)) != ZX_OK) {
         return status;
     }
 
@@ -377,24 +241,35 @@ zx_status_t sys_mmap_device_io(zx_handle_t hrsrc, uint32_t io_addr, uint32_t len
     return IoBitmap::GetCurrent().SetIoBitmap(io_addr, len, 1);
 }
 #else
-zx_status_t sys_mmap_device_io(zx_handle_t hrsrc, uint32_t io_addr, uint32_t len) {
+// zx_status_t zx_ioports_request
+zx_status_t sys_ioports_request(zx_handle_t hrsrc, uint16_t io_addr, uint32_t len) {
     // doesn't make sense on non-x86
     return ZX_ERR_NOT_SUPPORTED;
 }
 #endif
 
-uint64_t sys_acpi_uefi_rsdp(zx_handle_t hrsrc) {
+// zx_status_t zx_pc_firmware_tables
+zx_status_t sys_pc_firmware_tables(zx_handle_t hrsrc, user_out_ptr<zx_paddr_t> acpi_rsdp,
+                                   user_out_ptr<zx_paddr_t> smbios) {
     // TODO(ZX-971): finer grained validation
     zx_status_t status;
     if ((status = validate_resource(hrsrc, ZX_RSRC_KIND_ROOT)) < 0) {
         return status;
     }
 #if ARCH_X86
-    return bootloader.acpi_rsdp;
+    if ((status = acpi_rsdp.copy_to_user(bootloader.acpi_rsdp)) != ZX_OK) {
+        return status;
+    }
+    if ((status = smbios.copy_to_user(bootloader.smbios)) != ZX_OK) {
+        return status;
+    }
+
+    return ZX_OK;
 #endif
-    return 0;
+    return ZX_ERR_NOT_SUPPORTED;
 }
 
+// zx_status_t zx_bti_create
 zx_status_t sys_bti_create(zx_handle_t iommu, uint32_t options, uint64_t bti_id,
                            user_out_handle* out) {
     auto up = ProcessDispatcher::GetCurrent();
@@ -423,11 +298,16 @@ zx_status_t sys_bti_create(zx_handle_t iommu, uint32_t options, uint64_t bti_id,
     return out->make(fbl::move(dispatcher), rights);
 }
 
-static zx_status_t bti_pin_impl(fbl::RefPtr<BusTransactionInitiatorDispatcher> bti_dispatcher,
-                                uint32_t options, zx_handle_t vmo, uint64_t offset,
-                                uint64_t size, user_out_ptr<zx_paddr_t> addrs, size_t addrs_count,
-                                fbl::RefPtr<Dispatcher>* pmt, zx_rights_t* pmt_rights) {
+// zx_status_t zx_bti_pin
+zx_status_t sys_bti_pin(zx_handle_t bti, uint32_t options, zx_handle_t vmo, uint64_t offset,
+                        uint64_t size, user_out_ptr<zx_paddr_t> addrs, size_t addrs_count,
+                        user_out_handle* pmt) {
     auto up = ProcessDispatcher::GetCurrent();
+    fbl::RefPtr<BusTransactionInitiatorDispatcher> bti_dispatcher;
+    zx_status_t status = up->GetDispatcherWithRights(bti, ZX_RIGHT_MAP, &bti_dispatcher);
+    if (status != ZX_OK) {
+        return status;
+    }
 
     if (!IS_PAGE_ALIGNED(offset) || !IS_PAGE_ALIGNED(size)) {
         return ZX_ERR_INVALID_ARGS;
@@ -435,7 +315,7 @@ static zx_status_t bti_pin_impl(fbl::RefPtr<BusTransactionInitiatorDispatcher> b
 
     fbl::RefPtr<VmObjectDispatcher> vmo_dispatcher;
     zx_rights_t vmo_rights;
-    zx_status_t status = up->GetDispatcherAndRights(vmo, &vmo_dispatcher, &vmo_rights);
+    status = up->GetDispatcherAndRights(vmo, &vmo_dispatcher, &vmo_rights);
     if (status != ZX_OK) {
         return status;
     }
@@ -446,6 +326,7 @@ static zx_status_t bti_pin_impl(fbl::RefPtr<BusTransactionInitiatorDispatcher> b
     // Convert requested permissions and check against VMO rights
     uint32_t iommu_perms = 0;
     bool compress_results = false;
+    bool contiguous = false;
     if (options & ZX_BTI_PERM_READ) {
         if (!(vmo_rights & ZX_RIGHT_READ)) {
             return ZX_ERR_ACCESS_DENIED;
@@ -461,15 +342,25 @@ static zx_status_t bti_pin_impl(fbl::RefPtr<BusTransactionInitiatorDispatcher> b
         options &= ~ZX_BTI_PERM_WRITE;
     }
     if (options & ZX_BTI_PERM_EXECUTE) {
-        if (!(vmo_rights & ZX_RIGHT_EXECUTE)) {
+        // Note: We check ZX_RIGHT_READ instead of ZX_RIGHT_EXECUTE
+        // here because the latter applies to execute permission of
+        // the host CPU, whereas ZX_BTI_PERM_EXECUTE applies to
+        // transactions initiated by the bus device.
+        if (!(vmo_rights & ZX_RIGHT_READ)) {
             return ZX_ERR_ACCESS_DENIED;
         }
         iommu_perms |= IOMMU_FLAG_PERM_EXECUTE;
         options &= ~ZX_BTI_PERM_EXECUTE;
     }
-    if (options & ZX_BTI_COMPRESS) {
-        compress_results = true;
-        options &= ~ZX_BTI_COMPRESS;
+    if (!((options & ZX_BTI_COMPRESS) && (options & ZX_BTI_CONTIGUOUS))) {
+        if (options & ZX_BTI_COMPRESS) {
+            compress_results = true;
+            options &= ~ZX_BTI_COMPRESS;
+        }
+        if (options & ZX_BTI_CONTIGUOUS && vmo_dispatcher->vmo()->is_contiguous()) {
+            contiguous = true;
+            options &= ~ZX_BTI_CONTIGUOUS;
+        }
     }
     if (options) {
         return ZX_ERR_INVALID_ARGS;
@@ -491,7 +382,7 @@ static zx_status_t bti_pin_impl(fbl::RefPtr<BusTransactionInitiatorDispatcher> b
     }
 
     status = static_cast<PinnedMemoryTokenDispatcher*>(new_pmt.get())
-            ->EncodeAddrs(compress_results, mapped_addrs.get(), addrs_count);
+                 ->EncodeAddrs(compress_results, contiguous, mapped_addrs.get(), addrs_count);
     if (status != ZX_OK) {
         return status;
     }
@@ -501,62 +392,21 @@ static zx_status_t bti_pin_impl(fbl::RefPtr<BusTransactionInitiatorDispatcher> b
         return status;
     }
 
-    *pmt = fbl::move(new_pmt);
-    *pmt_rights = new_pmt_rights;
+    return pmt->make(fbl::move(new_pmt), new_pmt_rights);
+}
+
+// zx_status_t zx_bti_release_quarantine
+zx_status_t sys_bti_release_quarantine(zx_handle_t bti) {
+    auto up = ProcessDispatcher::GetCurrent();
+    fbl::RefPtr<BusTransactionInitiatorDispatcher> bti_dispatcher;
+
+    zx_status_t status = up->GetDispatcherWithRights(bti, ZX_RIGHT_WRITE, &bti_dispatcher);
+    if (status != ZX_OK) {
+        return status;
+    }
+
+    bti_dispatcher->ReleaseQuarantine();
     return ZX_OK;
-}
-
-zx_status_t sys_bti_pin(zx_handle_t bti, uint32_t options, zx_handle_t vmo, uint64_t offset,
-                        uint64_t size, user_out_ptr<zx_paddr_t> addrs, size_t addrs_count) {
-    auto up = ProcessDispatcher::GetCurrent();
-    fbl::RefPtr<BusTransactionInitiatorDispatcher> bti_dispatcher;
-    zx_status_t status = up->GetDispatcherWithRights(bti, ZX_RIGHT_MAP, &bti_dispatcher);
-    if (status != ZX_OK) {
-        return status;
-    }
-
-    fbl::RefPtr<Dispatcher> new_pmt;
-    zx_rights_t rights;
-    status = bti_pin_impl(bti_dispatcher, options, vmo, offset, size, addrs, addrs_count,
-                          &new_pmt, &rights);
-    if (status != ZX_OK) {
-        return status;
-    }
-    bti_dispatcher->ConvertToLegacy(DownCastDispatcher<PinnedMemoryTokenDispatcher>(&new_pmt));
-    return ZX_OK;
-}
-
-zx_status_t sys_bti_pin_new(zx_handle_t bti, uint32_t options, zx_handle_t vmo, uint64_t offset,
-                            uint64_t size, user_out_ptr<zx_paddr_t> addrs, size_t addrs_count,
-                            user_out_handle* pmt) {
-    auto up = ProcessDispatcher::GetCurrent();
-    fbl::RefPtr<BusTransactionInitiatorDispatcher> bti_dispatcher;
-    zx_status_t status = up->GetDispatcherWithRights(bti, ZX_RIGHT_MAP, &bti_dispatcher);
-    if (status != ZX_OK) {
-        return status;
-    }
-
-    fbl::RefPtr<Dispatcher> new_pmt;
-    zx_rights_t rights;
-    status = bti_pin_impl(fbl::move(bti_dispatcher), options, vmo, offset, size,
-                          addrs, addrs_count, &new_pmt, &rights);
-    if (status != ZX_OK) {
-        return status;
-    }
-
-    return pmt->make(fbl::move(new_pmt), rights);
-}
-
-zx_status_t sys_bti_unpin(zx_handle_t bti, zx_paddr_t base_addr) {
-    auto up = ProcessDispatcher::GetCurrent();
-
-    fbl::RefPtr<BusTransactionInitiatorDispatcher> bti_dispatcher;
-    zx_status_t status = up->GetDispatcherWithRights(bti, ZX_RIGHT_MAP, &bti_dispatcher);
-    if (status != ZX_OK) {
-        return status;
-    }
-
-    return bti_dispatcher->Unpin(base_addr);
 }
 
 // Having a single-purpose syscall like this is a bit of an anti-pattern in our
@@ -565,48 +415,163 @@ zx_status_t sys_bti_unpin(zx_handle_t bti, zx_paddr_t base_addr) {
 // particular, PMTs are the only objects in the system that track the lifetime
 // of something external to the process model (external hardware DMA
 // capabilities).
+// zx_status_t zx_pmt_unpin
 zx_status_t sys_pmt_unpin(zx_handle_t pmt) {
     auto up = ProcessDispatcher::GetCurrent();
 
-    fbl::RefPtr<PinnedMemoryTokenDispatcher> pmt_dispatcher;
-    zx_status_t status = up->GetDispatcher(pmt, &pmt_dispatcher);
+    HandleOwner handle = up->RemoveHandle(pmt);
+    if (!handle)
+        return ZX_ERR_BAD_HANDLE;
+    fbl::RefPtr<Dispatcher> dispatcher = handle->dispatcher();
+    auto pmt_dispatcher = DownCastDispatcher<PinnedMemoryTokenDispatcher>(&dispatcher);
+    if (!pmt_dispatcher)
+        return ZX_ERR_WRONG_TYPE;
+
+    pmt_dispatcher->MarkUnpinned();
+
+    return ZX_OK;
+}
+
+// zx_status_t zx_interrupt_create
+zx_status_t sys_interrupt_create(zx_handle_t src_obj, uint32_t src_num,
+                                 uint32_t options, user_out_handle* out_handle) {
+    LTRACEF("options 0x%x\n", options);
+
+    // resource not required for virtual interrupts
+    if (!(options & ZX_INTERRUPT_VIRTUAL)) {
+        zx_status_t status;
+        if ((status = validate_resource_irq(src_obj, src_num)) != ZX_OK) {
+            return status;
+        }
+    }
+
+    fbl::RefPtr<Dispatcher> dispatcher;
+    zx_rights_t rights;
+    zx_status_t result;
+    if (options & ZX_INTERRUPT_VIRTUAL) {
+        result = VirtualInterruptDispatcher::Create(&dispatcher, &rights, options);
+    } else {
+        result = InterruptEventDispatcher::Create(&dispatcher, &rights, src_num, options);
+    }
+    if (result != ZX_OK)
+        return result;
+
+    return out_handle->make(fbl::move(dispatcher), rights);
+}
+
+// zx_status_t zx_interrupt_bind
+zx_status_t sys_interrupt_bind(zx_handle_t inth, zx_handle_t porth,
+                               uint64_t key, uint32_t options) {
+    LTRACEF("handle %x\n", inth);
+    if (options) {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    zx_status_t status;
+    auto up = ProcessDispatcher::GetCurrent();
+    fbl::RefPtr<InterruptDispatcher> interrupt;
+    status = up->GetDispatcherWithRights(inth, ZX_RIGHT_READ, &interrupt);
+    if (status != ZX_OK)
+        return status;
+
+    fbl::RefPtr<PortDispatcher> port;
+    status = up->GetDispatcherWithRights(porth, ZX_RIGHT_WRITE, &port);
+    if (status != ZX_OK)
+        return status;
+
+    if (!port->can_bind_to_interrupt()) {
+        return ZX_ERR_WRONG_TYPE;
+    }
+
+    return interrupt->Bind(port, interrupt, key);
+}
+
+// zx_status_t zx_interrupt_ack
+zx_status_t sys_interrupt_ack(zx_handle_t inth) {
+    LTRACEF("handle %x\n", inth);
+
+    zx_status_t status;
+    auto up = ProcessDispatcher::GetCurrent();
+    fbl::RefPtr<InterruptDispatcher> interrupt;
+    status = up->GetDispatcherWithRights(inth, ZX_RIGHT_WRITE, &interrupt);
+    if (status != ZX_OK)
+        return status;
+    return interrupt->Ack();
+}
+
+// zx_status_t zx_interrupt_wait
+zx_status_t sys_interrupt_wait(zx_handle_t handle, user_out_ptr<zx_time_t> out_timestamp) {
+    LTRACEF("handle %x\n", handle);
+
+    zx_status_t status;
+    auto up = ProcessDispatcher::GetCurrent();
+    fbl::RefPtr<InterruptDispatcher> interrupt;
+    status = up->GetDispatcherWithRights(handle, ZX_RIGHT_WAIT, &interrupt);
+    if (status != ZX_OK)
+        return status;
+
+    zx_time_t timestamp;
+    status = interrupt->WaitForInterrupt(&timestamp);
+    if (status == ZX_OK && out_timestamp)
+        status = out_timestamp.copy_to_user(timestamp);
+    return status;
+}
+
+// zx_status_t zx_interrupt_destroy
+zx_status_t sys_interrupt_destroy(zx_handle_t handle) {
+    LTRACEF("handle %x\n", handle);
+
+    zx_status_t status;
+    auto up = ProcessDispatcher::GetCurrent();
+    fbl::RefPtr<InterruptDispatcher> interrupt;
+    status = up->GetDispatcher(handle, &interrupt);
+    if (status != ZX_OK)
+        return status;
+    return interrupt->Destroy();
+}
+
+// zx_status_t zx_interrupt_trigger
+zx_status_t sys_interrupt_trigger(zx_handle_t handle,
+                                  uint32_t options,
+                                  zx_time_t timestamp) {
+    LTRACEF("handle %x\n", handle);
+
+    if (options) {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    zx_status_t status;
+    auto up = ProcessDispatcher::GetCurrent();
+    fbl::RefPtr<InterruptDispatcher> interrupt;
+    status = up->GetDispatcherWithRights(handle, ZX_RIGHT_SIGNAL, &interrupt);
+    if (status != ZX_OK)
+        return status;
+
+    return interrupt->Trigger(timestamp);
+}
+
+// zx_status_t zx_smc_call
+zx_status_t sys_smc_call(zx_handle_t handle,
+                         user_in_ptr<const zx_smc_parameters_t> parameters,
+                         user_out_ptr<zx_smc_result_t> out_smc_result) {
+    if (!parameters || !out_smc_result) {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    zx_smc_parameters_t params;
+    zx_status_t status = parameters.copy_from_user(&params);
     if (status != ZX_OK) {
         return status;
     }
 
-    pmt_dispatcher->MarkUnpinned();
-
-    HandleOwner handle(up->RemoveHandle(pmt));
-    if (!handle) {
-        return ZX_ERR_BAD_HANDLE;
+    uint32_t service_call_num = ARM_SMC_GET_SERVICE_CALL_NUM_FROM_FUNC_ID(params.func_id);
+    if ((status = validate_resource_smc(handle, service_call_num)) != ZX_OK) {
+        return status;
     }
-    return ZX_OK;
-}
 
-zx_status_t sys_irq_create(zx_handle_t src_obj, uint32_t src_num,
-                           uint32_t options, user_out_handle* out_handle) {
-    return ZX_ERR_NOT_SUPPORTED;
-}
+    zx_smc_result_t result;
 
-zx_status_t sys_irq_bind(zx_handle_t inth, zx_handle_t porth,
-                         uint64_t key, uint32_t options) {
-    return ZX_ERR_NOT_SUPPORTED;
-}
+    arch_smc_call(&params, &result);
 
-zx_status_t sys_irq_wait(zx_handle_t handle, user_out_ptr<zx_time_t> out_timestamp) {
-    return ZX_ERR_NOT_SUPPORTED;
-}
-
-zx_status_t sys_irq_destroy(zx_handle_t handle) {
-    return ZX_ERR_NOT_SUPPORTED;
-}
-
-zx_status_t sys_irq_ack(zx_handle_t handle) {
-    return ZX_ERR_NOT_SUPPORTED;
-}
-
-zx_status_t sys_irq_trigger(zx_handle_t handle,
-                            uint32_t options,
-                            zx_time_t timestamp) {
-    return ZX_ERR_NOT_SUPPORTED;
+    return out_smc_result.copy_to_user(result);
 }

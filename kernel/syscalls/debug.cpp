@@ -20,7 +20,7 @@
 #include <lib/io.h>
 #include <object/handle.h>
 #include <object/process_dispatcher.h>
-#include <object/resources.h>
+#include <object/resource.h>
 
 #include <platform/debug.h>
 
@@ -32,7 +32,8 @@
 
 constexpr uint32_t kMaxDebugWriteSize = 256u;
 
-zx_status_t sys_debug_read(zx_handle_t handle, user_out_ptr<void> ptr, uint32_t len) {
+// zx_status_t zx_debug_read
+zx_status_t sys_debug_read(zx_handle_t handle, user_out_ptr<char> ptr, user_inout_ptr<size_t> len) {
     LTRACEF("ptr %p\n", ptr.get());
 
     // TODO(ZX-971): finer grained validation
@@ -41,28 +42,37 @@ zx_status_t sys_debug_read(zx_handle_t handle, user_out_ptr<void> ptr, uint32_t 
         return status;
     }
 
-    // TODO: remove this cast.
-    auto uptr = ptr.reinterpret<uint8_t>();
-
-    uint32_t idx = 0;
-    for (; idx < len; ++idx) {
-        int c = getchar();
-        if (c < 0)
-            break;
-
-        if (c == '\r')
-            c = '\n';
-
-        auto cur = uptr.byte_offset(idx);
-        if (cur.copy_to_user(static_cast<uint8_t>(c)) != ZX_OK)
-            break;
+    // get the number of bytes the user wants us to read
+    size_t readlen;
+    status = len.copy_from_user(&readlen);
+    if (status != ZX_OK) {
+        return status;
     }
-    // TODO: fix this cast, which can overflow.
-    return static_cast<zx_status_t>(idx);
+
+    size_t idx = 0;
+    for (; idx < readlen; ++idx) {
+        int intc = getchar();
+        if (intc < 0) {
+            return intc;
+        }
+
+        if (intc == '\r') {
+            intc = '\n';
+        }
+
+        char c = static_cast<char>(intc);
+
+        status = ptr.copy_array_to_user(&c, 1, idx);
+        if (status != ZX_OK) {
+            return status;
+        }
+    }
+    return len.copy_to_user(idx);
 }
 
-zx_status_t sys_debug_write(user_in_ptr<const void> ptr, uint32_t len) {
-    LTRACEF("ptr %p, len %u\n", ptr.get(), len);
+// zx_status_t zx_debug_write
+zx_status_t sys_debug_write(user_in_ptr<const char> ptr, size_t len) {
+    LTRACEF("ptr %p, len %zu\n", ptr.get(), len);
 
     if (len > kMaxDebugWriteSize)
         len = kMaxDebugWriteSize;
@@ -76,11 +86,12 @@ zx_status_t sys_debug_write(user_in_ptr<const void> ptr, uint32_t len) {
     // of serial output between various sources
     dlog_serial_write(buf, len);
 
-    return len;
+    return ZX_OK;
 }
 
-zx_status_t sys_debug_send_command(zx_handle_t handle, user_in_ptr<const void> ptr, uint32_t len) {
-    LTRACEF("ptr %p, len %u\n", ptr.get(), len);
+// zx_status_t zx_debug_send_command
+zx_status_t sys_debug_send_command(zx_handle_t handle, user_in_ptr<const char> ptr, size_t len) {
+    LTRACEF("ptr %p, len %zu\n", ptr.get(), len);
 
     // TODO(ZX-971): finer grained validation
     zx_status_t status;
@@ -100,22 +111,24 @@ zx_status_t sys_debug_send_command(zx_handle_t handle, user_in_ptr<const void> p
     return console_run_script(buf);
 }
 
+// zx_status_t zx_ktrace_read
 zx_status_t sys_ktrace_read(zx_handle_t handle, user_out_ptr<void> _data,
-                            uint32_t offset, uint32_t len,
-                            user_out_ptr<uint32_t> _actual) {
+                            uint32_t offset, size_t len,
+                            user_out_ptr<size_t> _actual) {
     // TODO(ZX-971): finer grained validation
     zx_status_t status;
     if ((status = validate_resource(handle, ZX_RSRC_KIND_ROOT)) < 0) {
         return status;
     }
 
-    int result = ktrace_read_user(_data.get(), offset, len);
+    ssize_t result = ktrace_read_user(_data.get(), offset, len);
     if (result < 0)
-        return result;
+        return static_cast<zx_status_t>(result);
 
-    return _actual.copy_to_user(static_cast<uint32_t>(result));
+    return _actual.copy_to_user(static_cast<size_t>(result));
 }
 
+// zx_status_t zx_ktrace_control
 zx_status_t sys_ktrace_control(
     zx_handle_t handle, uint32_t action, uint32_t options, user_inout_ptr<void> _ptr) {
     // TODO(ZX-971): finer grained validation
@@ -137,6 +150,7 @@ zx_status_t sys_ktrace_control(
     }
 }
 
+// zx_status_t zx_ktrace_write
 zx_status_t sys_ktrace_write(zx_handle_t handle, uint32_t event_id, uint32_t arg0, uint32_t arg1) {
     // TODO(ZX-971): finer grained validation
     zx_status_t status;
@@ -159,9 +173,10 @@ zx_status_t sys_ktrace_write(zx_handle_t handle, uint32_t event_id, uint32_t arg
     return ZX_OK;
 }
 
+// zx_status_t zx_mtrace_control
 zx_status_t sys_mtrace_control(zx_handle_t handle,
                                uint32_t kind, uint32_t action, uint32_t options,
-                               user_inout_ptr<void> ptr, uint32_t size) {
+                               user_inout_ptr<void> ptr, size_t size) {
     // TODO(ZX-971): finer grained validation
     zx_status_t status;
     if ((status = validate_resource(handle, ZX_RSRC_KIND_ROOT)) < 0) {

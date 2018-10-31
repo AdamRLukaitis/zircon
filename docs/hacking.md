@@ -60,6 +60,10 @@ To disable reboot-on-panic, pass the kernel commandline argument
 For kernel development it's not uncommon to need to monitor or break things
 before the gfxconsole comes up.
 
+To force-enable log output to the legacy serial console on an x64 machine, pass
+"kernel.serial=legacy".  For other serial configurations, see the kernel.serial
+docs in [kernel_cmdline.md](kernel_cmdline.md).
+
 To enable the early console before the graphical console comes up use the
 ``gfxconsole.early`` cmdline option. More information can be found in
 [kernel_cmdline.md](kernel_cmdline.md).
@@ -78,7 +82,15 @@ of kernel freezes) you can enable ``ENABLE_KERNEL_LL_DEBUG`` in your ``local.mk`
 
 ```
 EXTERNAL_KERNEL_DEFINES := ENABLE_KERNEL_LL_DEBUG=1
+
 ```
+
+There is also a kernel cmdline parameter kernel.bypass-debuglog, which can be set
+to true to force output to the console instead of buffering it. The reason we have
+both a compile switch and a cmdline parameter is to facilitate prints in the kernel
+before cmdline is parsed to be forced to go to the console. The compile switch setting
+overrides the cmdline parameter (if both are present). Note that both the compile switch
+and the cmdline parameter have the side effect of disabling irq driven uart Tx.
 
 More information on ``local.mk`` can be found via ``make help``
 
@@ -103,7 +115,7 @@ debugger, or as a general builtin debug mechanism, this can be useful.
 #include <zircon/crashlogger.h>
 
 void my_function() {
-  crashlogger_request_backtrace();
+  zx_crashlogger_request_backtrace();
 }
 ```
 
@@ -128,7 +140,7 @@ To support testing the system during early boot, there is a mechanism to export
 data files from the kernel to the /boot filesystem. To export a data file,
 create a VMO, give it a name, and pass it to userboot with handle\_info of type
 PA\_VMO\_DEBUG\_FILE (and argument 0). Then userboot will automatically pass it
-throough to devmgr, and devmgr will export the VMO as a file at the path
+through to devmgr, and devmgr will export the VMO as a file at the path
 
 ```
 /boot/kernel/<name-of-vmo>

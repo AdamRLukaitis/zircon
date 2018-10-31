@@ -41,6 +41,8 @@ __BEGIN_CDECLS
         _val;                                    \
     })
 
+#define ARM64_READ_SYSREG_32(reg) ((uint32_t)ARM64_READ_SYSREG(reg))
+
 #define ARM64_WRITE_SYSREG(reg, val)                               \
     ({                                                             \
         uint64_t _val = (val);                                     \
@@ -82,7 +84,7 @@ struct arm64_iframe_long {
     uint64_t elr;
     uint64_t spsr;
     uint64_t mdscr;
-    uint64_t pad2[1];  // Keep structure multiple of 16-bytes for stack alignment.
+    uint64_t pad2[1]; // Keep structure multiple of 16-bytes for stack alignment.
 };
 
 struct arm64_iframe_short {
@@ -110,6 +112,7 @@ void arm64_el3_to_el1(void);
 void arm64_sync_exception(struct arm64_iframe_long* iframe, uint exception_flags, uint32_t esr);
 void arm64_thread_process_pending_signals(struct arm64_iframe_long* iframe);
 
+typedef struct arm64_iframe_long iframe_t;
 typedef struct arm64_iframe_short iframe;
 
 void platform_irq(iframe* frame);
@@ -122,13 +125,16 @@ void arm64_fpu_context_switch(struct thread* oldthread, struct thread* newthread
 uint64_t arm64_get_boot_el(void);
 
 void arm_reset(void);
+
 /*
- * Sets the secondary stack pointer for the specified CPU.  |sp| and
- * |unsafe_sp| must point to the top (highest address, exclusive) of the
- * memory to use as the stacks.
+ * Creates a stack and sets the stack pointer for the specified secondary CPU.
  */
-zx_status_t arm64_set_secondary_sp(uint cluster, uint cpu,
-                                   void* sp, void* unsafe_sp);
+zx_status_t arm64_create_secondary_stack(uint cluster, uint cpu);
+
+/*
+ * Frees a stack created by |arm64_create_secondary_stack|.
+ */
+zx_status_t arm64_free_secondary_stack(uint cluster, uint cpu);
 
 __END_CDECLS
 

@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include <ddk/usb-request.h>
+#include <ddk/protocol/usb.h>
 #include <zircon/compiler.h>
 #include <zircon/types.h>
 #include <zircon/hw/usb.h>
@@ -67,12 +67,6 @@ static inline zx_status_t usb_function_set_interface(usb_function_interface_t* i
 }
 
 typedef struct {
-    zx_status_t (*req_alloc)(void* ctx, usb_request_t** out, uint64_t data_size,
-                             uint8_t ep_address);
-    zx_status_t (*req_alloc_vmo)(void* ctx, usb_request_t** out, zx_handle_t vmo_handle,
-                                 uint64_t vmo_offset, uint64_t length, uint8_t ep_address);
-    zx_status_t (*req_init)(void* ctx, usb_request_t* req, zx_handle_t vmo_handle,
-                            uint64_t vmo_offset, uint64_t length, uint8_t ep_address);
     zx_status_t (*register_func)(void* ctx, usb_function_interface_t* intf);
     zx_status_t (*alloc_interface)(void* ctx, uint8_t* out_intf_num);
     zx_status_t (*alloc_ep)(void* ctx, uint8_t direction, uint8_t* out_address);
@@ -83,30 +77,13 @@ typedef struct {
     void (*queue)(void* ctx, usb_request_t* req);
     zx_status_t (*ep_set_stall)(void* ctx, uint8_t ep_address);
     zx_status_t (*ep_clear_stall)(void* ctx, uint8_t ep_address);
+    size_t (*get_request_size)(void* ctx);
 } usb_function_protocol_ops_t;
 
 typedef struct {
     usb_function_protocol_ops_t* ops;
     void* ctx;
 } usb_function_protocol_t;
-
-static inline zx_status_t usb_function_req_alloc(usb_function_protocol_t* usb, usb_request_t** out,
-                                                 uint64_t data_size, uint8_t ep_address) {
-    return usb->ops->req_alloc(usb->ctx, out, data_size, ep_address);
-}
-
-static inline zx_status_t usb_function_req_alloc_vmo(usb_function_protocol_t* usb,
-                                                     usb_request_t** out, zx_handle_t vmo_handle,
-                                                     uint64_t vmo_offset, uint64_t length,
-                                                     uint8_t ep_address) {
-    return usb->ops->req_alloc_vmo(usb->ctx, out, vmo_handle, vmo_offset, length, ep_address);
-}
-
-static inline zx_status_t usb_function_req_init(usb_function_protocol_t* usb, usb_request_t* req,
-                                                zx_handle_t vmo_handle, uint64_t vmo_offset,
-                                                uint64_t length, uint8_t ep_address) {
-    return usb->ops->req_init(usb->ctx, req, vmo_handle, vmo_offset, length, ep_address);
-}
 
 // registers the function driver's callback interface
 static inline void usb_function_register(usb_function_protocol_t* func,
@@ -162,4 +139,9 @@ static zx_status_t usb_function_ep_clear_stall(usb_function_protocol_t* func, ui
     return func->ops->ep_clear_stall(func->ctx, ep_address);
 }
 
+// returns the total request size including any internal context size at this
+// layer per usb_request
+static size_t usb_function_get_request_size(usb_function_protocol_t* func) {
+    return func->ops->get_request_size(func->ctx);
+}
 __END_CDECLS;

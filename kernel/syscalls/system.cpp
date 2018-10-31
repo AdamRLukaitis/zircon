@@ -11,22 +11,24 @@
 #include <kernel/cmdline.h>
 #include <kernel/mp.h>
 #include <kernel/thread.h>
-#include <vm/vm.h>
-#include <vm/physmap.h>
-#include <vm/pmm.h>
-#include <vm/vm_aspace.h>
-#include <zircon/boot/bootdata.h>
-#include <zircon/compiler.h>
-#include <zircon/syscalls/resource.h>
-#include <zircon/syscalls/system.h>
-#include <zircon/types.h>
+#include <lib/debuglog.h>
+#include <libzbi/zbi-cpp.h>
 #include <mexec.h>
-#include <object/resources.h>
 #include <object/process_dispatcher.h>
+#include <object/resource.h>
 #include <object/vm_object_dispatcher.h>
 #include <platform.h>
 #include <string.h>
 #include <trace.h>
+#include <vm/physmap.h>
+#include <vm/pmm.h>
+#include <vm/vm.h>
+#include <vm/vm_aspace.h>
+#include <zircon/boot/image.h>
+#include <zircon/compiler.h>
+#include <zircon/syscalls/resource.h>
+#include <zircon/syscalls/system.h>
+#include <zircon/types.h>
 
 #include "system_priv.h"
 
@@ -43,13 +45,15 @@ __END_CDECLS
 
 /* Allocates a page of memory that has the same physical and virtual addresses.
  */
-static zx_status_t identity_page_allocate(void** result_addr) {
+static zx_status_t identity_page_allocate(fbl::RefPtr<VmAspace>* new_aspace,
+                                          void** result_addr) {
     zx_status_t result;
 
     // Start by obtaining an unused physical page. This address will eventually
     // be the physical/virtual address of our identity mapped page.
     paddr_t pa;
-    if (pmm_alloc_page(0, &pa) == nullptr) {
+    result = pmm_alloc_page(0, &pa);
+    if (result != ZX_OK) {
         return ZX_ERR_NO_MEMORY;
     }
 
@@ -75,8 +79,7 @@ static zx_status_t identity_page_allocate(void** result_addr) {
     if (result != ZX_OK)
         return result;
 
-    vmm_set_active_aspace(reinterpret_cast<vmm_aspace_t*>(identity_aspace.get()));
-
+    *new_aspace = fbl::move(identity_aspace);
     *result_addr = identity_address;
 
     return ZX_OK;
@@ -109,9 +112,9 @@ static zx_status_t vmo_coalesce_pages(zx_handle_t vmo_hdl, const size_t extra_by
     const size_t num_pages = ROUNDUP(vmo_size + extra_bytes, PAGE_SIZE) / PAGE_SIZE;
 
     paddr_t base_addr;
-    const size_t allocated = pmm_alloc_contiguous(num_pages, PMM_ALLOC_FLAG_ANY,
-                                                  0, &base_addr, nullptr);
-    if (allocated < num_pages) {
+    list_node list = LIST_INITIAL_VALUE(list);
+    st = pmm_alloc_contiguous(num_pages, PMM_ALLOC_FLAG_ANY, 0, &base_addr, &list);
+    if (st != ZX_OK) {
         // TODO(gkalsi): Free pages allocated by pmm_alloc_contiguous pages
         //               and return an error.
         panic("Failed to allocate contiguous memory");
@@ -158,16 +161,16 @@ static inline bool intervals_intersect(const void* start1, const size_t len1,
 static zx_status_t bootdata_append_section(uint8_t* bootdata_buf, size_t buflen,
                                            uint32_t section_length, uint32_t type,
                                            uint32_t extra, uint32_t flags, uint8_t** section) {
-    bootdata_t* hdr = (bootdata_t*)bootdata_buf;
+    zbi_header_t* hdr = (zbi_header_t*)bootdata_buf;
 
-    if ((hdr->type != BOOTDATA_CONTAINER) ||
-        (hdr->extra != BOOTDATA_MAGIC)) {
+    if ((hdr->type != ZBI_TYPE_CONTAINER) ||
+        (hdr->extra != ZBI_CONTAINER_MAGIC)) {
         // This buffer does not point to a bootimage.
         return ZX_ERR_WRONG_TYPE;
     }
 
-    size_t total_len = hdr->length + sizeof(bootdata_t);
-    size_t new_section_length = BOOTDATA_ALIGN(section_length) + sizeof(bootdata_t);
+    size_t total_len = hdr->length + sizeof(zbi_header_t);
+    size_t new_section_length = ZBI_ALIGN(section_length) + sizeof(zbi_header_t);
 
     // Make sure there's enough buffer space after the bootdata container to
     // append the new section.
@@ -178,17 +181,17 @@ static zx_status_t bootdata_append_section(uint8_t* bootdata_buf, size_t buflen,
     // Seek to the end of the bootimage.
     bootdata_buf += total_len;
 
-    bootdata_t* new_hdr = (bootdata_t*)bootdata_buf;
+    zbi_header_t* new_hdr = (zbi_header_t*)bootdata_buf;
     new_hdr->type = type;
     new_hdr->length = section_length;
     new_hdr->extra = extra;
-    new_hdr->flags = flags | BOOTDATA_FLAG_V2;
+    new_hdr->flags = flags | ZBI_FLAG_VERSION;
     new_hdr->reserved0 = 0;
     new_hdr->reserved1 = 0;
-    new_hdr->magic = BOOTITEM_MAGIC;
-    new_hdr->crc32 = BOOTITEM_NO_CRC32;
+    new_hdr->magic = ZBI_ITEM_MAGIC;
+    new_hdr->crc32 = ZBI_ITEM_NO_CRC32;
 
-    bootdata_buf += sizeof(bootdata_t);
+    bootdata_buf += sizeof(zbi_header_t);
     *section = bootdata_buf;
     hdr->length += (uint32_t)new_section_length;
     return ZX_OK;
@@ -216,8 +219,12 @@ void mexec_stash_crashlog(fbl::RefPtr<VmObject> vmo) {
     stashed_crashlog = fbl::move(vmo);
 }
 
-zx_status_t sys_system_mexec(zx_handle_t kernel_vmo, zx_handle_t bootimage_vmo) {
-    zx_status_t result;
+// zx_status_t zx_system_mexec
+zx_status_t sys_system_mexec(zx_handle_t resource, zx_handle_t kernel_vmo, zx_handle_t bootimage_vmo) {
+    // TODO(ZX-971): finer grained validation
+    zx_status_t result = validate_resource(resource, ZX_RSRC_KIND_ROOT);
+    if (result != ZX_OK)
+        return result;
 
     paddr_t new_kernel_addr;
     size_t new_kernel_len;
@@ -229,7 +236,10 @@ zx_status_t sys_system_mexec(zx_handle_t kernel_vmo, zx_handle_t bootimage_vmo) 
 
     // for kernels that are bootdata based (eg, x86-64), the location
     // to find the entrypoint depends on the bootdata format
-    uintptr_t entry64_addr = 0x100040;
+    paddr_t entry64_addr = (get_kernel_base_phys() +
+                            sizeof(zbi_header_t) + // ZBI_TYPE_CONTAINER header
+                            sizeof(zbi_header_t) + // ZBI_TYPE_KERNEL header
+                            offsetof(zbi_kernel_t, entry));
 
     paddr_t new_bootimage_addr;
     uint8_t* bootimage_buffer;
@@ -243,7 +253,7 @@ zx_status_t sys_system_mexec(zx_handle_t kernel_vmo, zx_handle_t bootimage_vmo) 
 
     // Allow the platform to patch the bootdata with any platform specific
     // sections before mexecing.
-    result = platform_mexec_patch_bootdata(bootimage_buffer, new_bootimage_len);
+    result = platform_mexec_patch_zbi(bootimage_buffer, new_bootimage_len);
     if (result != ZX_OK) {
         printf("mexec: could not patch bootdata\n");
         return result;
@@ -252,12 +262,15 @@ zx_status_t sys_system_mexec(zx_handle_t kernel_vmo, zx_handle_t bootimage_vmo) 
     if (stashed_crashlog && stashed_crashlog->size() <= UINT32_MAX) {
         size_t crashlog_len = stashed_crashlog->size();
         uint8_t* bootdata_section;
-        result = bootdata_append_section(bootimage_buffer, new_bootimage_len,
-                                         static_cast<uint32_t>(crashlog_len),
-                                         BOOTDATA_LAST_CRASHLOG, 0, 0, &bootdata_section);
-        if (result != ZX_OK) {
+        zbi::Zbi image(bootimage_buffer, new_bootimage_len);
+
+        zbi_result_t res = image.CreateSection(static_cast<uint32_t>(crashlog_len),
+                                               ZBI_TYPE_CRASHLOG, 0, 0,
+                                               reinterpret_cast<void**>(&bootdata_section));
+
+        if (res != ZBI_RESULT_OK) {
             printf("mexec: could not append crashlog\n");
-            return result;
+            return ZX_ERR_INTERNAL;
         }
 
         result = stashed_crashlog->Read(bootdata_section, 0, crashlog_len);
@@ -266,26 +279,33 @@ zx_status_t sys_system_mexec(zx_handle_t kernel_vmo, zx_handle_t bootimage_vmo) 
         }
     }
 
-    // WARNING
-    // It is unsafe to return from this function beyond this point.
-    // This is because we have swapped out the user address space and halted the
-    // secondary cores and there is no trivial way to bring both of these back.
-    thread_migrate_to_cpu(BOOT_CPU_ID);
-
     void* id_page_addr = 0x0;
-    result = identity_page_allocate(&id_page_addr);
+    fbl::RefPtr<VmAspace> aspace;
+    result = identity_page_allocate(&aspace, &id_page_addr);
     if (result != ZX_OK) {
-        panic("Unable to allocate identity page");
+        return result;
     }
 
     LTRACEF("zx_system_mexec allocated identity mapped page at %p\n",
             id_page_addr);
+
+    thread_migrate_to_cpu(BOOT_CPU_ID);
 
     // We assume that when the system starts, only one CPU is running. We denote
     // this as the boot CPU.
     // We want to make sure that this is the CPU that eventually branches into
     // the new kernel so we attempt to migrate this thread to that cpu.
     platform_halt_secondary_cpus();
+
+    platform_mexec_prep(new_bootimage_addr, new_bootimage_len);
+
+    arch_disable_ints();
+
+    // WARNING
+    // It is unsafe to return from this function beyond this point.
+    // This is because we have swapped out the user address space and halted the
+    // secondary cores and there is no trivial way to bring both of these back.
+    vmm_set_active_aspace(reinterpret_cast<vmm_aspace_t*>(aspace.get()));
 
     // We're going to copy this into our identity page, make sure it's not
     // longer than a single page.
@@ -294,8 +314,6 @@ zx_status_t sys_system_mexec(zx_handle_t kernel_vmo, zx_handle_t bootimage_vmo) 
 
     memcpy(id_page_addr, (const void*)mexec_asm, mexec_asm_length);
     arch_sync_cache_range((addr_t)id_page_addr, mexec_asm_length);
-
-    arch_disable_ints();
 
     // We must pass in an arg that represents a list of memory regions to
     // shuffle around. We put this args list immediately after the mexec
@@ -330,9 +348,6 @@ zx_status_t sys_system_mexec(zx_handle_t kernel_vmo, zx_handle_t bootimage_vmo) 
 
     shutdown_interrupts();
 
-    mp_set_curr_cpu_active(false);
-    mp_set_curr_cpu_online(false);
-
     // Ask the platform to mexec into the next kernel.
     mexec_asm_func mexec_assembly = (mexec_asm_func)id_page_addr;
     platform_mexec(mexec_assembly, ops, new_bootimage_addr, new_bootimage_len, entry64_addr);
@@ -341,6 +356,19 @@ zx_status_t sys_system_mexec(zx_handle_t kernel_vmo, zx_handle_t bootimage_vmo) 
     return ZX_OK;
 }
 
+// Gracefully halt and perform |action|.
+static void platform_graceful_halt(platform_halt_action action) {
+    thread_migrate_to_cpu(BOOT_CPU_ID);
+    platform_halt_secondary_cpus();
+
+    // Delay shutdown of debuglog to ensure log messages emitted by above calls will be written.
+    dlog_shutdown();
+
+    platform_halt(action, HALT_REASON_SW_RESET);
+    panic("ERROR: failed to halt the platform\n");
+}
+
+// zx_status_t zx_system_powerctl
 zx_status_t sys_system_powerctl(zx_handle_t root_rsrc, uint32_t cmd,
                                 user_in_ptr<const zx_system_powerctl_arg_t> raw_arg) {
 
@@ -368,6 +396,19 @@ zx_status_t sys_system_powerctl(zx_handle_t root_rsrc, uint32_t cmd,
 
             return arch_system_powerctl(cmd, &arg);
         }
+        case ZX_SYSTEM_POWERCTL_REBOOT:
+            platform_graceful_halt(HALT_ACTION_REBOOT);
+            break;
+        case ZX_SYSTEM_POWERCTL_REBOOT_BOOTLOADER:
+            platform_graceful_halt(HALT_ACTION_REBOOT_BOOTLOADER);
+            break;
+        case ZX_SYSTEM_POWERCTL_REBOOT_RECOVERY:
+            platform_graceful_halt(HALT_ACTION_REBOOT_RECOVERY);
+            break;
+        case ZX_SYSTEM_POWERCTL_SHUTDOWN:
+            platform_graceful_halt(HALT_ACTION_SHUTDOWN);
+            break;
         default: return ZX_ERR_INVALID_ARGS;
     }
+    return ZX_OK;
 }

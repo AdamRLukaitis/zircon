@@ -11,7 +11,6 @@
 #include <err.h>
 #include <fbl/alloc_checker.h>
 #include <fbl/auto_call.h>
-#include <fbl/auto_lock.h>
 #include <inttypes.h>
 #include <trace.h>
 #include <vm/fault.h>
@@ -19,8 +18,6 @@
 #include <vm/vm_aspace.h>
 #include <vm/vm_object.h>
 #include <zircon/types.h>
-
-using fbl::AutoLock;
 
 #define LOCAL_TRACE MAX(VM_GLOBAL_TRACE, 0)
 
@@ -42,7 +39,7 @@ VmMapping::~VmMapping() {
 
 size_t VmMapping::AllocatedPagesLocked() const {
     canary_.Assert();
-    DEBUG_ASSERT(is_mutex_held(aspace_->lock()));
+    DEBUG_ASSERT(aspace_->lock()->lock().IsHeld());
 
     if (state_ != LifeCycleState::ALIVE) {
         return 0;
@@ -70,8 +67,9 @@ void VmMapping::Dump(uint depth, bool verbose) const {
            // lock.
            object_->AllocatedPagesInRange(object_offset_, size_),
            ref_count_debug(), vmo_name);
-    if (verbose)
+    if (verbose) {
         object_->Dump(depth + 1, false);
+    }
 }
 
 zx_status_t VmMapping::Protect(vaddr_t base, size_t size, uint new_arch_mmu_flags) {
@@ -84,7 +82,7 @@ zx_status_t VmMapping::Protect(vaddr_t base, size_t size, uint new_arch_mmu_flag
 
     size = ROUNDUP(size, PAGE_SIZE);
 
-    AutoLock guard(aspace_->lock());
+    Guard<fbl::Mutex> guard{aspace_->lock()};
     if (state_ != LifeCycleState::ALIVE) {
         return ZX_ERR_BAD_STATE;
     }
@@ -111,7 +109,7 @@ zx_status_t ProtectOrUnmap(const fbl::RefPtr<VmAspace>& aspace, vaddr_t base, si
 } // namespace
 
 zx_status_t VmMapping::ProtectLocked(vaddr_t base, size_t size, uint new_arch_mmu_flags) {
-    DEBUG_ASSERT(is_mutex_held(aspace_->lock()));
+    DEBUG_ASSERT(aspace_->lock()->lock().IsHeld());
     DEBUG_ASSERT(size != 0 && IS_PAGE_ALIGNED(base) && IS_PAGE_ALIGNED(size));
 
     // Do not allow changing caching
@@ -125,7 +123,7 @@ zx_status_t VmMapping::ProtectLocked(vaddr_t base, size_t size, uint new_arch_mm
 
     DEBUG_ASSERT(object_);
     // grab the lock for the vmo
-    AutoLock al(object_->lock());
+    Guard<fbl::Mutex> guard{object_->lock()};
 
     // Persist our current caching mode
     new_arch_mmu_flags |= (arch_mmu_flags_ & ARCH_MMU_FLAG_CACHE_MASK);
@@ -231,7 +229,7 @@ zx_status_t VmMapping::Unmap(vaddr_t base, size_t size) {
         return ZX_ERR_BAD_STATE;
     }
 
-    AutoLock guard(aspace->lock());
+    Guard<fbl::Mutex> guard{aspace_->lock()};
     if (state_ != LifeCycleState::ALIVE) {
         return ZX_ERR_BAD_STATE;
     }
@@ -250,7 +248,7 @@ zx_status_t VmMapping::Unmap(vaddr_t base, size_t size) {
 
 zx_status_t VmMapping::UnmapLocked(vaddr_t base, size_t size) {
     canary_.Assert();
-    DEBUG_ASSERT(is_mutex_held(aspace_->lock()));
+    DEBUG_ASSERT(aspace_->lock()->lock().IsHeld());
     DEBUG_ASSERT(size != 0 && IS_PAGE_ALIGNED(size) && IS_PAGE_ALIGNED(base));
     DEBUG_ASSERT(base >= base_ && base - base_ < size_);
     DEBUG_ASSERT(size_ - (base - base_) >= size);
@@ -267,13 +265,13 @@ zx_status_t VmMapping::UnmapLocked(vaddr_t base, size_t size) {
 
     // grab the lock for the vmo
     DEBUG_ASSERT(object_);
-    AutoLock al(object_->lock());
+    Guard<fbl::Mutex> guard{object_->lock()};
 
     // Check if unmapping from one of the ends
     if (base_ == base || base + size == base_ + size_) {
         LTRACEF("unmapping base %#lx size %#zx\n", base, size);
         zx_status_t status = aspace_->arch_aspace().Unmap(base, size / PAGE_SIZE, nullptr);
-        if (status < 0) {
+        if (status != ZX_OK) {
             return status;
         }
 
@@ -308,7 +306,7 @@ zx_status_t VmMapping::UnmapLocked(vaddr_t base, size_t size) {
     // Unmap the middle segment
     LTRACEF("unmapping base %#lx size %#zx\n", base, size);
     zx_status_t status = aspace_->arch_aspace().Unmap(base, size / PAGE_SIZE, nullptr);
-    if (status < 0) {
+    if (status != ZX_OK) {
         return status;
     }
 
@@ -334,7 +332,7 @@ zx_status_t VmMapping::UnmapVmoRangeLocked(uint64_t offset, uint64_t len) const 
     DEBUG_ASSERT(state_ == LifeCycleState::ALIVE);
 
     DEBUG_ASSERT(object_);
-    DEBUG_ASSERT(object_->lock()->IsHeld());
+    DEBUG_ASSERT(object_->lock()->lock().IsHeld());
 
     DEBUG_ASSERT(IS_PAGE_ALIGNED(offset));
     DEBUG_ASSERT(IS_PAGE_ALIGNED(len));
@@ -350,15 +348,17 @@ zx_status_t VmMapping::UnmapVmoRangeLocked(uint64_t offset, uint64_t len) const 
         return ZX_OK;
     }
 
-    if (len == 0)
+    if (len == 0) {
         return ZX_OK;
+    }
 
     // compute the intersection of the passed in vmo range and our mapping
     uint64_t offset_new;
     uint64_t len_new;
     if (!GetIntersect(object_offset_, static_cast<uint64_t>(size_), offset, len,
-                      &offset_new, &len_new))
+                      &offset_new, &len_new)) {
         return ZX_OK;
+    }
 
     DEBUG_ASSERT(len_new > 0 && len_new <= SIZE_MAX);
     DEBUG_ASSERT(offset_new >= object_offset_);
@@ -380,8 +380,9 @@ zx_status_t VmMapping::UnmapVmoRangeLocked(uint64_t offset, uint64_t len) const 
 
     zx_status_t status = aspace_->arch_aspace().Unmap(unmap_base,
                                                       static_cast<size_t>(len_new) / PAGE_SIZE, nullptr);
-    if (status < 0)
+    if (status != ZX_OK) {
         return status;
+    }
 
     return ZX_OK;
 }
@@ -419,6 +420,7 @@ public:
     void Abort() {
         aborted_ = true;
     }
+
 private:
     DISALLOW_COPY_ASSIGN_AND_MOVE(VmMappingCoalescer);
 
@@ -430,7 +432,7 @@ private:
 };
 
 VmMappingCoalescer::VmMappingCoalescer(VmMapping* mapping, vaddr_t base)
-    : mapping_(mapping), base_(base), count_(0), aborted_(false) { }
+    : mapping_(mapping), base_(base), count_(0), aborted_(false) {}
 
 VmMappingCoalescer::~VmMappingCoalescer() {
     // Make sure we've flushed or aborted
@@ -469,7 +471,7 @@ zx_status_t VmMapping::MapRange(size_t offset, size_t len, bool commit) {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    AutoLock guard(aspace_->lock());
+    Guard<fbl::Mutex> aspace_guard{aspace_->lock()};
     if (state_ != LifeCycleState::ALIVE) {
         return ZX_ERR_BAD_STATE;
     }
@@ -484,11 +486,12 @@ zx_status_t VmMapping::MapRange(size_t offset, size_t len, bool commit) {
     // precompute the flags we'll pass GetPageLocked
     // if committing, then tell it to soft fault in a page
     uint pf_flags = VMM_PF_FLAG_WRITE;
-    if (commit)
+    if (commit) {
         pf_flags |= VMM_PF_FLAG_SW_FAULT;
+    }
 
     // grab the lock for the vmo
-    AutoLock al(object_->lock());
+    Guard<fbl::Mutex> object_guard{object_->lock()};
 
     // set the currently faulting flag for any recursive calls the vmo may make back into us.
     DEBUG_ASSERT(!currently_faulting_);
@@ -505,7 +508,7 @@ zx_status_t VmMapping::MapRange(size_t offset, size_t len, bool commit) {
         zx_status_t status;
         paddr_t pa;
         status = object_->GetPageLocked(vmo_offset, pf_flags, nullptr, nullptr, &pa);
-        if (status < 0) {
+        if (status != ZX_OK) {
             // no page to map
             if (commit) {
                 // fail when we can't commit every requested page
@@ -533,7 +536,7 @@ zx_status_t VmMapping::DecommitRange(size_t offset, size_t len,
     LTRACEF("%p [%#zx+%#zx], offset %#zx, len %#zx\n",
             this, base_, size_, offset, len);
 
-    AutoLock guard(aspace_->lock());
+    Guard<fbl::Mutex> guard{aspace_->lock()};
     if (state_ != LifeCycleState::ALIVE) {
         return ZX_ERR_BAD_STATE;
     }
@@ -547,7 +550,7 @@ zx_status_t VmMapping::DecommitRange(size_t offset, size_t len,
 
 zx_status_t VmMapping::DestroyLocked() {
     canary_.Assert();
-    DEBUG_ASSERT(is_mutex_held(aspace_->lock()));
+    DEBUG_ASSERT(aspace_->lock()->lock().IsHeld());
     LTRACEF("%p\n", this);
 
     // Take a reference to ourself, so that we do not get destructed after
@@ -555,15 +558,14 @@ zx_status_t VmMapping::DestroyLocked() {
     // subregions_.erase below).
     fbl::RefPtr<VmMapping> self(this);
 
-#if WITH_LIB_VDSO
     // The vDSO code mapping can never be unmapped, not even
     // by VMAR destruction (except for process exit, of course).
     // TODO(mcgrathr): Turn this into a policy-driven process-fatal case
     // at some point.  teisenbe@ wants to eventually make zx_vmar_destroy
     // never fail.
-    if (aspace_->vdso_code_mapping_ == self)
+    if (aspace_->vdso_code_mapping_ == self) {
         return ZX_ERR_ACCESS_DENIED;
-#endif
+    }
 
     // unmap our entire range
     zx_status_t status = UnmapLocked(base_, size_);
@@ -576,7 +578,7 @@ zx_status_t VmMapping::DestroyLocked() {
 
     // grab the object lock and remove ourself from its list
     {
-        AutoLock al(object_->lock());
+        Guard<fbl::Mutex> guard{object_->lock()};
         object_->RemoveMappingLocked(this);
     }
 
@@ -597,7 +599,7 @@ zx_status_t VmMapping::DestroyLocked() {
 
 zx_status_t VmMapping::PageFault(vaddr_t va, const uint pf_flags) {
     canary_.Assert();
-    DEBUG_ASSERT(is_mutex_held(aspace_->lock()));
+    DEBUG_ASSERT(aspace_->lock()->lock().IsHeld());
 
     DEBUG_ASSERT(va >= base_ && va <= base_ + size_ - 1);
 
@@ -632,7 +634,7 @@ zx_status_t VmMapping::PageFault(vaddr_t va, const uint pf_flags) {
     }
 
     // grab the lock for the vmo
-    AutoLock al(object_->lock());
+    Guard<fbl::Mutex> guard{object_->lock()};
 
     // set the currently faulting flag for any recursive calls the vmo may make back into us
     // The specific path we're avoiding is if the VMO calls back into us during vmo->GetPageLocked()
@@ -646,9 +648,11 @@ zx_status_t VmMapping::PageFault(vaddr_t va, const uint pf_flags) {
     paddr_t new_pa;
     vm_page_t* page;
     zx_status_t status = object_->GetPageLocked(vmo_offset, pf_flags, nullptr, &page, &new_pa);
-    if (status < 0) {
-        TRACEF("ERROR: failed to fault in or grab existing page\n");
-        TRACEF("%p vmo_offset %#" PRIx64 ", pf_flags %#x\n", this, vmo_offset, pf_flags);
+    if (status != ZX_OK) {
+        // TODO(cpu): This trace was originally TRACEF() always on, but it fires if the
+        // VMO was resized, rather than just when the system is running out of memory.
+        LTRACEF("ERROR: failed to fault in or grab existing page\n");
+        LTRACEF("%p vmo_offset %#" PRIx64 ", pf_flags %#x\n", this, vmo_offset, pf_flags);
         return status;
     }
 
@@ -673,15 +677,16 @@ zx_status_t VmMapping::PageFault(vaddr_t va, const uint pf_flags) {
             // page was already mapped, are the permissions compatible?
             // test that the page is already mapped with either the region's mmu flags
             // or the flags that we're about to try to switch it to, which may be read-only
-            if (page_flags == arch_mmu_flags_ || page_flags == mmu_flags)
+            if (page_flags == arch_mmu_flags_ || page_flags == mmu_flags) {
                 return ZX_OK;
+            }
 
             // assert that we're not accidentally marking the zero page writable
             DEBUG_ASSERT((pa != vm_get_zero_page_paddr()) || !(mmu_flags & ARCH_MMU_FLAG_PERM_WRITE));
 
             // same page, different permission
             status = aspace_->arch_aspace().Protect(va, 1, mmu_flags);
-            if (status < 0) {
+            if (status != ZX_OK) {
                 TRACEF("failed to modify permissions on existing mapping\n");
                 return ZX_ERR_NO_MEMORY;
             }
@@ -696,14 +701,14 @@ zx_status_t VmMapping::PageFault(vaddr_t va, const uint pf_flags) {
 
             // unmap the old one and put the new one in place
             status = aspace_->arch_aspace().Unmap(va, 1, nullptr);
-            if (status < 0) {
+            if (status != ZX_OK) {
                 TRACEF("failed to remove old mapping before replacing\n");
                 return ZX_ERR_NO_MEMORY;
             }
 
             size_t mapped;
             status = aspace_->arch_aspace().MapContiguous(va, new_pa, 1, mmu_flags, &mapped);
-            if (status < 0) {
+            if (status != ZX_OK) {
                 TRACEF("failed to map replacement page\n");
                 return ZX_ERR_NO_MEMORY;
             }
@@ -721,7 +726,7 @@ zx_status_t VmMapping::PageFault(vaddr_t va, const uint pf_flags) {
 
         size_t mapped;
         status = aspace_->arch_aspace().MapContiguous(va, new_pa, 1, mmu_flags, &mapped);
-        if (status < 0) {
+        if (status != ZX_OK) {
             TRACEF("failed to map page\n");
             return ZX_ERR_NO_MEMORY;
         }
@@ -749,8 +754,8 @@ zx_status_t VmMapping::PageFault(vaddr_t va, const uint pf_flags) {
 // function.
 void VmMapping::ActivateLocked() TA_NO_THREAD_SAFETY_ANALYSIS {
     DEBUG_ASSERT(state_ == LifeCycleState::NOT_READY);
-    DEBUG_ASSERT(is_mutex_held(aspace_->lock()));
-    DEBUG_ASSERT(object_->lock()->IsHeld());
+    DEBUG_ASSERT(aspace_->lock()->lock().IsHeld());
+    DEBUG_ASSERT(object_->lock()->lock().IsHeld());
     DEBUG_ASSERT(parent_);
 
     state_ = LifeCycleState::ALIVE;
@@ -759,6 +764,6 @@ void VmMapping::ActivateLocked() TA_NO_THREAD_SAFETY_ANALYSIS {
 }
 
 void VmMapping::Activate() {
-    AutoLock guard(object_->lock());
+    Guard<fbl::Mutex> guard{object_->lock()};
     ActivateLocked();
 }

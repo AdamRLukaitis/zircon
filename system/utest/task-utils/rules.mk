@@ -23,4 +23,7 @@ MODULE_LIBS := \
     system/ulib/c \
     system/ulib/unittest
 
+MODULE_FIDL_LIBS := \
+    system/fidl/fuchsia-sysinfo
+
 include make/module.mk

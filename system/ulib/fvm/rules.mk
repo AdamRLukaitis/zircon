@@ -8,14 +8,16 @@ MODULE := $(LOCAL_DIR)
 
 MODULE_TYPE := userlib
 
+MODULE_COMPILEFLAGS += -fvisibility=hidden
+
 MODULE_SRCS += \
     $(LOCAL_DIR)/fvm.cpp \
+    $(LOCAL_DIR)/fvm-check.cpp \
     $(LOCAL_DIR)/fvm-lz4.cpp \
 
 MODULE_STATIC_LIBS := \
     system/ulib/digest \
     system/ulib/fbl \
-    system/ulib/fs \
     system/ulib/gpt \
     system/ulib/sync \
     system/ulib/zx \
@@ -38,6 +40,7 @@ MODULE_TYPE := hostlib
 
 MODULE_SRCS := \
     $(LOCAL_DIR)/fvm.cpp \
+    $(LOCAL_DIR)/fvm-check.cpp \
     $(LOCAL_DIR)/fvm-lz4.cpp \
 
 MODULE_COMPILEFLAGS := \
@@ -58,7 +61,5 @@ MODULE_HOST_LIBS := \
     third_party/ulib/lz4.hostlib \
     system/ulib/digest.hostlib \
     system/ulib/fbl.hostlib \
-
-MODULE_DEFINES += DISABLE_THREAD_ANNOTATIONS
 
 include make/module.mk

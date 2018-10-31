@@ -6,6 +6,8 @@
 
 #include "fvm/container.h"
 
+constexpr size_t kLz4HeaderSize = 15;
+
 static LZ4F_preferences_t lz4_prefs = {
     .frameInfo = {
         .blockSizeID = LZ4F_max64KB,
@@ -14,11 +16,58 @@ static LZ4F_preferences_t lz4_prefs = {
     .compressionLevel = 0,
 };
 
-zx_status_t SparseContainer::Create(const char* path, size_t slice_size, compress_type_t compress,
+zx_status_t CompressionContext::Setup(size_t max_len) {
+    LZ4F_errorCode_t errc = LZ4F_createCompressionContext(&cctx_, LZ4F_VERSION);
+    if (LZ4F_isError(errc)) {
+        fprintf(stderr, "Could not create compression context: %s\n", LZ4F_getErrorName(errc));
+        return ZX_ERR_INTERNAL;
+    }
+
+    Reset(kLz4HeaderSize + LZ4F_compressBound(max_len, &lz4_prefs));
+
+    size_t r = LZ4F_compressBegin(cctx_, GetBuffer(), GetRemaining(), &lz4_prefs);
+    if (LZ4F_isError(r)) {
+        fprintf(stderr, "Could not begin compression: %s\n", LZ4F_getErrorName(r));
+        return ZX_ERR_INTERNAL;
+    }
+
+    IncreaseOffset(r);
+    return ZX_OK;
+}
+
+zx_status_t CompressionContext::Compress(const void* data, size_t length) {
+    size_t r = LZ4F_compressUpdate(cctx_, GetBuffer(), GetRemaining(), data, length, NULL);
+    if (LZ4F_isError(r)) {
+        fprintf(stderr, "Could not compress data: %s\n", LZ4F_getErrorName(r));
+        return ZX_ERR_INTERNAL;
+    }
+
+    IncreaseOffset(r);
+    return ZX_OK;
+}
+
+zx_status_t CompressionContext::Finish() {
+    size_t r = LZ4F_compressEnd(cctx_, GetBuffer(), GetRemaining(), NULL);
+    if (LZ4F_isError(r)) {
+        fprintf(stderr, "Could not finish compression: %s\n", LZ4F_getErrorName(r));
+        return ZX_ERR_INTERNAL;
+    }
+
+    IncreaseOffset(r);
+    LZ4F_errorCode_t errc = LZ4F_freeCompressionContext(cctx_);
+    if (LZ4F_isError(errc)) {
+        fprintf(stderr, "Could not free compression context: %s\n", LZ4F_getErrorName(errc));
+        return ZX_ERR_INTERNAL;
+    }
+
+    return ZX_OK;
+}
+
+zx_status_t SparseContainer::Create(const char* path, size_t slice_size, uint32_t flags,
                                     fbl::unique_ptr<SparseContainer>* out) {
     fbl::AllocChecker ac;
     fbl::unique_ptr<SparseContainer> sparseContainer(new (&ac) SparseContainer(path, slice_size,
-                                                                               compress));
+                                                                               flags));
     if (!ac.check()) {
         return ZX_ERR_NO_MEMORY;
     }
@@ -32,8 +81,8 @@ zx_status_t SparseContainer::Create(const char* path, size_t slice_size, compres
     return ZX_OK;
 }
 
-SparseContainer::SparseContainer(const char* path, uint64_t slice_size, compress_type_t compress)
-    : Container(path, slice_size), valid_(false), compress_(compress), disk_size_(0),
+SparseContainer::SparseContainer(const char* path, uint64_t slice_size, uint32_t flags)
+    : Container(path, slice_size, flags), valid_(false), disk_size_(0),
       extent_size_(0) {
     fd_.reset(open(path, O_CREAT | O_RDWR, 0666));
 
@@ -95,7 +144,7 @@ zx_status_t SparseContainer::Init() {
     image_.slice_size = slice_size_;
     image_.partition_count = 0;
     image_.header_length = sizeof(fvm::sparse_image_t);
-    image_.flags = compress_ == LZ4 ? fvm::kSparseFlagLz4 : 0;
+    image_.flags = flags_;
     partitions_.reset();
     dirty_ = true;
     valid_ = true;
@@ -211,8 +260,7 @@ zx_status_t SparseContainer::Commit() {
     }
 
     zx_status_t status;
-    compression_t comp;
-    if ((status = SetupCompression(&comp, extent_size_)) != ZX_OK) {
+    if ((status = PrepareWrite(extent_size_)) != ZX_OK) {
         return status;
     }
 
@@ -236,7 +284,7 @@ zx_status_t SparseContainer::Commit() {
                     return ZX_ERR_IO;
                 }
 
-                if (WriteData(format->Data(), format->BlockSize(), &comp) != ZX_OK) {
+                if (WriteData(format->Data(), format->BlockSize()) != ZX_OK) {
                     fprintf(stderr, "Failed to write data to sparse file\n");
                     return ZX_ERR_IO;
                 }
@@ -244,7 +292,7 @@ zx_status_t SparseContainer::Commit() {
         }
     }
 
-    if ((status = FinishCompression(&comp)) != ZX_OK) {
+    if ((status = CompleteWrite()) != ZX_OK) {
         return status;
     }
 
@@ -286,7 +334,7 @@ zx_status_t SparseContainer::AllocatePartition(fbl::unique_ptr<Format> format) {
     format->Type(partition.descriptor.type);
     format->Name(reinterpret_cast<char*>(partition.descriptor.name));
     partition.descriptor.extent_count = 0;
-    //TODO(planders): flags?
+    partition.descriptor.flags = format->Flags();
     image_.header_length += sizeof(fvm::partition_descriptor_t);
     uint32_t part_index = image_.partition_count;
 
@@ -348,41 +396,17 @@ zx_status_t SparseContainer::AllocateExtent(uint32_t part_index, uint64_t slice_
     return ZX_OK;
 }
 
-zx_status_t SparseContainer::SetupCompression(compression_t* comp, size_t max_len) {
-    if (!compress_) {
+zx_status_t SparseContainer::PrepareWrite(size_t max_len) {
+    if ((flags_ & fvm::kSparseFlagLz4) == 0) {
         return ZX_OK;
     }
 
-    LZ4F_errorCode_t errc = LZ4F_createCompressionContext(&comp->cctx, LZ4F_VERSION);
-    if (LZ4F_isError(errc)) {
-        fprintf(stderr, "Could not create compression context: %s\n", LZ4F_getErrorName(errc));
-        return ZX_ERR_INTERNAL;
-    }
-
-    size_t max = LZ4F_compressBound(max_len, &lz4_prefs);
-    if (!comp->reset(max)) {
-        return ZX_ERR_NO_MEMORY;
-    }
-
-    size_t r = LZ4F_compressBegin(comp->cctx, comp->buf(), comp->size(), &lz4_prefs);
-    if (LZ4F_isError(r)) {
-        fprintf(stderr, "Could not begin compression: %s\n", LZ4F_getErrorName(r));
-        return ZX_ERR_INTERNAL;
-    }
-
-    comp->offset += r;
-    return ZX_OK;
+    return compression_.Setup(max_len);
 }
 
-zx_status_t SparseContainer::WriteData(const void* data, size_t length, compression_t* comp) {
-    if (compress_) {
-        size_t r = LZ4F_compressUpdate(comp->cctx, comp->buf(), comp->size(), data, length, NULL);
-        if (LZ4F_isError(r)) {
-            fprintf(stderr, "Could not compress data: %s\n", LZ4F_getErrorName(r));
-            return ZX_ERR_INTERNAL;
-        }
-
-        comp->offset += r;
+zx_status_t SparseContainer::WriteData(const void* data, size_t length) {
+    if ((flags_ & fvm::kSparseFlagLz4) != 0) {
+        return compression_.Compress(data, length);
     } else if (write(fd_.get(), data, length) != length) {
         return ZX_ERR_IO;
     }
@@ -390,26 +414,20 @@ zx_status_t SparseContainer::WriteData(const void* data, size_t length, compress
     return ZX_OK;
 }
 
-zx_status_t SparseContainer::FinishCompression(compression_t* comp) {
-    if (!compress_) {
+zx_status_t SparseContainer::CompleteWrite() {
+    if ((flags_ & fvm::kSparseFlagLz4) == 0) {
         return ZX_OK;
     }
 
-    size_t r = LZ4F_compressEnd(comp->cctx, comp->buf(), comp->size(), NULL);
-    if (LZ4F_isError(r)) {
-        fprintf(stderr, "Could not finish compression: %s\n", LZ4F_getErrorName(r));
-        return ZX_ERR_INTERNAL;
+    zx_status_t status = compression_.Finish();
+
+    if (status != ZX_OK) {
+        return status;
     }
 
-    comp->offset += r;
-    if (write(fd_.get(), comp->data.get(), comp->offset) != comp->offset) {
+    if (write(fd_.get(), compression_.GetData(), compression_.GetLength())
+        != compression_.GetLength()) {
         return ZX_ERR_IO;
-    }
-
-    LZ4F_errorCode_t errc = LZ4F_freeCompressionContext(comp->cctx);
-    if (LZ4F_isError(errc)) {
-        fprintf(stderr, "Could not free compression context: %s\n", LZ4F_getErrorName(errc));
-        return ZX_ERR_INTERNAL;
     }
 
     return ZX_OK;

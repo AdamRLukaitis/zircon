@@ -9,7 +9,7 @@ fifo_create - create a fifo
 ```
 #include <zircon/syscalls.h>
 
-zx_status_t zx_fifo_create(uint32_t elem_count, uint32_t elem_size,
+zx_status_t zx_fifo_create(size_t elem_count, size_t elem_size,
                            uint32_t options,
                            zx_handle_t* out0, zx_handle_t* out1);
 
@@ -19,7 +19,7 @@ zx_status_t zx_fifo_create(uint32_t elem_count, uint32_t elem_size,
 
 **fifo_create**() creates a fifo, which is actually a pair of fifos
 of *elem_count* entries of *elem_size* bytes.  Two endpoints are
-returned.  Writing to one endpoint enqueus an element into the fifo
+returned.  Writing to one endpoint enqueues an element into the fifo
 that the opposing endpoint reads from.
 
 Fifos are intended to be the control plane for shared memory transports.
@@ -31,6 +31,10 @@ The *elem_count* must be a power of two.  The total size of each fifo
 (*elem_count* * *elem_size*) may not exceed 4096 bytes.
 
 The *options* argument must be 0.
+
+## RIGHTS
+
+TODO(ZX-2399)
 
 ## RETURN VALUE
 
@@ -45,7 +49,9 @@ failure, one of the following values is returned.
 **ZX_ERR_OUT_OF_RANGE**  *elem_count* or *elem_size* is zero, or *elem_count*
 is not a power of two, or *elem_count* * *elem_size* is greater than 4096.
 
-**ZX_ERR_NO_MEMORY**  (Temporary) Failure due to lack of memory.
+**ZX_ERR_NO_MEMORY**  Failure due to lack of memory.
+There is no good way for userspace to handle this (unlikely) error.
+In a future build this error will no longer occur.
 
 
 ## SEE ALSO

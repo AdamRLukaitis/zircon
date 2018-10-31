@@ -11,8 +11,10 @@ MODULE_TYPE := usertest
 MODULE_SRCS += \
     $(LOCAL_DIR)/main.c \
     $(LOCAL_DIR)/fdio_handle_fd.c \
+    $(LOCAL_DIR)/fdio_open_max.c \
     $(LOCAL_DIR)/fdio_root.c \
     $(LOCAL_DIR)/fdio_path_canonicalize.c \
+    $(LOCAL_DIR)/fdio_socket.c \
     $(LOCAL_DIR)/fdio_socketpair.c
 
 MODULE_NAME := fdio-test

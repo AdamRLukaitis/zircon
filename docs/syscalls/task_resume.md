@@ -1,5 +1,11 @@
 # zx_task_resume
 
+This function is deprecated. When you suspend a thread with
+[task_suspend_token](task_suspend_token.md) closing the suspend token will
+automatically resume the thread.
+And when you want to resume a thread from an exception,
+use [task_resume_from_exception](task_resume_from_exception.md].
+
 ## NAME
 
 task_resume - resume the given task
@@ -76,6 +82,10 @@ handlers to not trip over each other, as well as all other
 software calling **zx_task_resume**() with **ZX_RESUME_EXCEPTION**.
 (ZX-562 documents this issue.)
 
+## RIGHTS
+
+TODO(ZX-2399)
+
 ## RETURN VALUE
 
 **task_resume**() returns **ZX_OK** on success.
@@ -90,6 +100,10 @@ In the event of failure, a negative error value is returned.
 **ZX_ERR_BAD_STATE**  The task is not in a state where resuming is possible (e.g.
 it is dead or **ZX_RESUME_EXCEPTION** was passed but the thread is not in an
 exception).
+
+This is also returned if *options* was 0 meaning to resume the
+thread after being suspended. This is no longer supported, instead close
+the suspend token. See [task_suspend](task_suspend.md).
 
 **ZX_ERR_INVALID_ARGS** *options* is not a valid combination.
 

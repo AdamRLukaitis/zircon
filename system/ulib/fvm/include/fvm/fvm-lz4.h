@@ -76,7 +76,7 @@ private:
         }
 
         // Data buffer
-        fbl::unique_ptr<uint8_t> data;
+        fbl::unique_ptr<uint8_t[]> data;
         // Actual size of data contained within buffer
         size_t size;
         // Offset into buffer where valid data begins
@@ -113,9 +113,9 @@ private:
 
 #ifdef __Fuchsia__
     // Total time spent reading/decompressing data
-    zx_time_t total_time_ = 0;
+    zx_ticks_t total_time_ = 0;
     // Total time spent reading data from fd
-    zx_time_t read_time_ = 0;
+    zx_ticks_t read_time_ = 0;
 #endif
 };
 

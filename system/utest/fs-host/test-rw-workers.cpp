@@ -4,7 +4,7 @@
 
 #include <assert.h>
 #include <errno.h>
-#include <zircon/misc/xorshiftrand.h>
+#include <lib/zircon-internal/xorshiftrand.h>
 
 #include "util.h"
 
@@ -207,14 +207,14 @@ static bool init_environment() {
 
     // assemble workers
     const char* where = "::";
-    for (unsigned n = 0; n < countof(WORK); n++) {
+    for (unsigned n = 0; n < fbl::count_of(WORK); n++) {
         ASSERT_TRUE(worker_new(where, WORK[n].name, WORK[n].work,
                                WORK[n].size, WORK[n].flags));
     }
     return true;
 }
 
-bool test_work_single_thread(void) {
+bool TestWorkSingleThread(void) {
     BEGIN_TEST;
 
     ASSERT_TRUE(init_environment());
@@ -231,5 +231,5 @@ bool test_work_single_thread(void) {
 }
 
 RUN_MINFS_TESTS(rw_workers_test,
-    RUN_TEST_MEDIUM(test_work_single_thread)
+    RUN_TEST_MEDIUM(TestWorkSingleThread)
 )

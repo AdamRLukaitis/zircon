@@ -14,12 +14,13 @@
 #include <unistd.h>
 
 #include <lib/async-loop/cpp/loop.h>
+#include <lib/zx/channel.h>
 #include <blobfs/blobfs.h>
 #include <blobfs/fsck.h>
 #include <fbl/auto_call.h>
-#include <fbl/ref_ptr.h>
 #include <fbl/string.h>
 #include <fbl/unique_fd.h>
+#include <fbl/unique_ptr.h>
 #include <fbl/vector.h>
 #include <fs/vfs.h>
 #include <trace-provider/provider.h>
@@ -28,14 +29,8 @@
 
 namespace {
 
-typedef struct {
-    bool readonly = false;
-    bool metrics = false;
-} blob_options_t;
-
-int do_blobfs_mount(fbl::unique_fd fd, const blob_options_t& options) {
-    bool readonly = options.readonly;
-    if (!readonly) {
+int Mount(fbl::unique_fd fd, blobfs::MountOptions* options) {
+    if (!options->readonly) {
         block_info_t block_info;
         zx_status_t status = static_cast<zx_status_t>(ioctl_block_get_info(fd.get(), &block_info));
         if (status < ZX_OK) {
@@ -43,64 +38,57 @@ int do_blobfs_mount(fbl::unique_fd fd, const blob_options_t& options) {
                            fd.get(), status);
             return -1;
         }
-        readonly = block_info.flags & BLOCK_FLAG_READONLY;
+        options->readonly = block_info.flags & BLOCK_FLAG_READONLY;
     }
 
-    fbl::RefPtr<blobfs::VnodeBlob> vn;
-    async::Loop loop;
-    if (blobfs::blobfs_mount(loop.async(), fbl::move(fd), options.metrics, &vn) != ZX_OK) {
-        return -1;
-    }
-    zx_handle_t h = zx_get_startup_handle(PA_HND(PA_USER0, 0));
-    if (h == ZX_HANDLE_INVALID) {
+    zx::channel root = zx::channel(zx_take_startup_handle(PA_HND(PA_USER0, 0)));
+    if (!root.is_valid()) {
         FS_TRACE_ERROR("blobfs: Could not access startup handle to mount point\n");
         return -1;
     }
 
-    fs::Vfs vfs(loop.async());
-    vfs.SetReadonly(readonly);
-    zx_status_t status;
-    if ((status = vfs.ServeDirectory(fbl::move(vn), zx::channel(h))) != ZX_OK) {
-        return status;
+    async::Loop loop(&kAsyncLoopConfigNoAttachToThread);
+    trace::TraceProvider provider(loop.dispatcher());
+    auto loop_quit = [&loop]() { loop.Quit(); };
+    if (blobfs::Mount(loop.dispatcher(), fbl::move(fd), *options,
+                            fbl::move(root), fbl::move(loop_quit)) != ZX_OK) {
+        return -1;
     }
-    trace::TraceProvider provider(loop.async());
     loop.Run();
     return ZX_OK;
 }
 
-int do_blobfs_mkfs(fbl::unique_fd fd, const blob_options_t& options) {
+int Mkfs(fbl::unique_fd fd, blobfs::MountOptions* options) {
     uint64_t block_count;
-    if (blobfs::blobfs_get_blockcount(fd.get(), &block_count)) {
+    if (blobfs::GetBlockCount(fd.get(), &block_count)) {
         fprintf(stderr, "blobfs: cannot find end of underlying device\n");
         return -1;
     }
 
-    int r = blobfs::blobfs_mkfs(fd.get(), block_count);
-
-    return r;
+    return blobfs::Mkfs(fd.get(), block_count);
 }
 
-int do_blobfs_check(fbl::unique_fd fd, const blob_options_t& options) {
-    fbl::RefPtr<blobfs::Blobfs> vn;
-    if (blobfs::blobfs_create(&vn, fbl::move(fd)) < 0) {
+int Fsck(fbl::unique_fd fd, blobfs::MountOptions* options) {
+    fbl::unique_ptr<blobfs::Blobfs> blobfs;
+    if (blobfs::Initialize(fbl::move(fd), *options, &blobfs) != ZX_OK) {
         return -1;
     }
 
-    return blobfs::blobfs_check(vn);
+    return blobfs::Fsck(fbl::move(blobfs));
 }
 
-typedef int (*CommandFunction)(fbl::unique_fd fd, const blob_options_t& options);
+typedef int (*CommandFunction)(fbl::unique_fd fd, blobfs::MountOptions* options);
 
-struct {
+const struct {
     const char* name;
     CommandFunction func;
     const char* help;
-} CMDS[] = {
-    {"create", do_blobfs_mkfs, "initialize filesystem"},
-    {"mkfs", do_blobfs_mkfs, "initialize filesystem"},
-    {"check", do_blobfs_check, "check filesystem integrity"},
-    {"fsck", do_blobfs_check, "check filesystem integrity"},
-    {"mount", do_blobfs_mount, "mount filesystem"},
+} kCmds[] = {
+    {"create", Mkfs, "initialize filesystem"},
+    {"mkfs", Mkfs, "initialize filesystem"},
+    {"check", Fsck, "check filesystem integrity"},
+    {"fsck", Fsck, "check filesystem integrity"},
+    {"mount", Mount, "mount filesystem"},
 };
 
 int usage() {
@@ -115,25 +103,26 @@ int usage() {
             "This can make 'blobfs' commands hard to invoke from command line.\n"
             "Try using the [mkfs,fsck,mount,umount] commands instead\n"
             "\n");
-    for (unsigned n = 0; n < (sizeof(CMDS) / sizeof(CMDS[0])); n++) {
+    for (unsigned n = 0; n < (sizeof(kCmds) / sizeof(kCmds[0])); n++) {
         fprintf(stderr, "%9s %-10s %s\n", n ? "" : "commands:",
-                CMDS[n].name, CMDS[n].help);
+                kCmds[n].name, kCmds[n].help);
     }
     fprintf(stderr, "\n");
     return -1;
 }
 
 // Process options/commands and return open fd to device
-int process_args(int argc, char** argv, CommandFunction* func, blob_options_t* options) {
+int ProcessArgs(int argc, char** argv, CommandFunction* func, blobfs::MountOptions* options) {
     while (1) {
         static struct option opts[] = {
             {"readonly", no_argument, nullptr, 'r'},
             {"metrics", no_argument, nullptr, 'm'},
+            {"journal", no_argument, nullptr, 'j'},
             {"help", no_argument, nullptr, 'h'},
             {nullptr, 0, nullptr, 0},
         };
         int opt_index;
-        int c = getopt_long(argc, argv, "rmh", opts, &opt_index);
+        int c = getopt_long(argc, argv, "rmjh", opts, &opt_index);
         if (c < 0) {
             break;
         }
@@ -143,6 +132,9 @@ int process_args(int argc, char** argv, CommandFunction* func, blob_options_t* o
             break;
         case 'm':
             options->metrics = true;
+            break;
+        case 'j':
+            options->journal = true;
             break;
         case 'h':
         default:
@@ -159,9 +151,9 @@ int process_args(int argc, char** argv, CommandFunction* func, blob_options_t* o
     const char* command = argv[0];
 
     // Validate command
-    for (unsigned i = 0; i < sizeof(CMDS) / sizeof(CMDS[0]); i++) {
-        if (!strcmp(command, CMDS[i].name)) {
-            *func = CMDS[i].func;
+    for (unsigned i = 0; i < sizeof(kCmds) / sizeof(kCmds[0]); i++) {
+        if (!strcmp(command, kCmds[i].name)) {
+            *func = kCmds[i].func;
         }
     }
 
@@ -177,12 +169,12 @@ int process_args(int argc, char** argv, CommandFunction* func, blob_options_t* o
 
 int main(int argc, char** argv) {
     CommandFunction func = nullptr;
-    blob_options_t options;
-    fbl::unique_fd fd(process_args(argc, argv, &func, &options));
+    blobfs::MountOptions options;
+    fbl::unique_fd fd(ProcessArgs(argc, argv, &func, &options));
 
     if (!fd) {
         return -1;
     }
 
-    return func(fbl::move(fd), options);
+    return func(fbl::move(fd), &options);
 }

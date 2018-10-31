@@ -13,10 +13,10 @@ object_set_property - Set various properties of various kernel objects.
 #include <zircon/syscalls/object.h>
 
 zx_status_t zx_object_get_property(zx_handle_t handle, uint32_t property,
-                                   void* value, size_t size);
+                                   void* value, size_t value_size);
 
 zx_status_t zx_object_set_property(zx_handle_t handle, uint32_t property,
-                                   const void* value, size_t size);
+                                   const void* value, size_t value_size);
 ```
 
 ## DESCRIPTION
@@ -55,7 +55,7 @@ Allowed operations: **get**, **set**
 
 The name of the object, as a NUL-terminated string.
 
-### ZX_PROP_REGISTER_FS
+### ZX_PROP_REGISTER_FS and ZX_PROP_REGISTER_GS
 
 *handle* type: **Thread**
 
@@ -63,7 +63,8 @@ The name of the object, as a NUL-terminated string.
 
 Allowed operations: **set**
 
-The value of the x86 FS segment register.
+The value of the x86 FS or GS segment register. `value` must be a
+canonical address, and must be a userspace address.
 
 Only defined for x86-64.
 
@@ -75,7 +76,13 @@ Only defined for x86-64.
 
 Allowed operations: **get**, **set**
 
-The value of ld.so's `_dl_debug_addr`.
+The value of ld.so's `_dl_debug_addr`. This can be used by debuggers to
+interrogate the state of the dynamic loader.
+
+If this value is set to `ZX_PROCESS_DEBUG_ADDR_BREAK_ON_SET` on process
+creation, the loader will manually issue a debug breakpoint when the property
+has been set to its correct value. This gives an opportunity to read or modify
+the initial state of the program.
 
 ### ZX_PROP_PROCESS_VDSO_BASE_ADDRESS
 
@@ -144,6 +151,62 @@ Allowed operations: **get**
 
 The size of the transmit buffer of a socket, in bytes.
 
+### ZX_PROP_SOCKET_RX_THRESHOLD
+
+*handle* type: **Socket**
+
+*value* type: **size_t**
+
+Allowed operations: **get**, **set**
+
+The size of the read threshold of a socket, in bytes. Setting this will
+assert ZX_SOCKET_READ_THRESHOLD if the amount of data that can be read
+is greater than or equal to the threshold. Setting this property to zero
+will result in the deasserting of ZX_SOCKET_READ_THRESHOLD.
+
+### ZX_PROP_SOCKET_TX_THRESHOLD
+
+*handle* type: **Socket**
+
+*value* type: **size_t**
+
+Allowed operations: **get**, **set**
+
+The size of the write threshold of a socket, in bytes. Setting this will
+assert ZX_SOCKET_WRITE_THRESHOLD if the amount of space available for writing
+is greater than or equal to the threshold. Setting this property to zero
+will result in the deasserting of ZX_SOCKET_WRITE_THRESHOLD. Setting the
+write threshold after the peer has closed is an error, and results in a
+ZX_ERR_PEER_CLOSED error being returned.
+
+### ZX_PROP_CHANNEL_TX_MSG_MAX
+
+*handle* type: **Channel**
+
+*value* type: **size_t**
+
+Allowed operations: **get**
+
+The maximum number of packets a channel endpoint can have pending in
+its outgoing direction.
+
+### ZX_PROP_JOB_KILL_ON_OOM
+
+*handle* type: **Job**
+
+*value* type: **size_t**
+
+Allowed operations: **set**
+
+The value of 1 means the Job and its children will be terminated if the
+system finds itself in a system-wide low memory situation. Called with 0
+(which is the default) opts out the job from being terminated in this
+scenario.
+
+## RIGHTS
+
+TODO(ZX-2399)
+
 ## RETURN VALUE
 
 **zx_object_get_property**() returns **ZX_OK** on success. In the event of
@@ -160,9 +223,11 @@ operation
 
 **ZX_ERR_INVALID_ARGS**: *value* is an invalid pointer
 
-**ZX_ERR_NO_MEMORY**: Temporary out of memory failure
+**ZX_ERR_NO_MEMORY**  Failure due to lack of memory.
+There is no good way for userspace to handle this (unlikely) error.
+In a future build this error will no longer occur.
 
-**ZX_ERR_BUFFER_TOO_SMALL**: *size* is too small for *property*
+**ZX_ERR_BUFFER_TOO_SMALL**: *value_size* is too small for *property*
 
 **ZX_ERR_NOT_SUPPORTED**: *property* does not exist
 

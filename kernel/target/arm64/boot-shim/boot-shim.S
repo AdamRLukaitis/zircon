@@ -6,6 +6,7 @@
 
 #include <asm.h>
 #include <arch/asm_macros.h>
+#include <zircon/boot/image.h>
 
 #define SCTLR_I     (1 << 12)   // Instruction cache enable
 #define SCTLR_C     (1 << 2)    // Cache enable
@@ -18,6 +19,25 @@ tmp             .req x16
 
 .section .text.boot0,"ax"
 FUNCTION(_start)
+    // magic instruction that gives us UEFI "MZ" signature
+    add x13, x18, #0x16
+    b header_end
+
+    .quad   0             // image offset from start of ram (unused)
+    .quad   0             // image size (unused)
+    .quad   0
+    .quad   0
+    .quad   0
+    .quad   0
+
+    // arm64 magic number
+    .byte   'A'
+    .byte   'R'
+    .byte   'M'
+    .byte   0x64
+    .align 3
+
+header_end:
     // x0 typically points to device tree at entry
 
    // what EL are we running at?
@@ -42,38 +62,21 @@ cache_disable_el1:
     msr     sctlr_el1, tmp
 
 cache_disable_done:
-    // compute beginning of kernel bootdata container
-    adr     x1, _start
-    add     x1, x1, #KERNEL_ALIGN
-
     // setup stack
-    adr_global tmp, stack_end
+    adr     tmp, stack_end
     mov     sp, tmp
 
     // x0: pointer to device tree
-    // x1: pointer to kernel bootdata container
     bl      boot_shim
 
-    // kernel entry point is returned in x0
-    mov     tmp, x0
-
-    // pass bootdata to kernel in x0
-    adr     x0, bootdata_return
-    ldr     x0, [x0]
-
-    br      tmp
-
+    // x0: bootdata_t* to pass to kernel
+    // x1: kernel entry point
+    br      x1
 END_FUNCTION(_start)
 
-.data
-DATA(bootdata_return)
-    .balign 8
-    .quad 0
-END_DATA(bootdata_return)
-
-.section .boot-shim.stack,"a",%nobits
+.bss
+.balign 16
 LOCAL_DATA(stack)
-    .balign 16
     .skip STACK_SIZE
 LOCAL_DATA(stack_end)
 END_DATA(stack)

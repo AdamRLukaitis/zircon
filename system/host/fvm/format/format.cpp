@@ -4,6 +4,8 @@
 
 #include "fvm/format.h"
 
+Format::Format() : fvm_ready_(false), vpart_index_(0),  flags_(0) {}
+
 zx_status_t Format::Detect(int fd, off_t offset, disk_format_t* out) {
     uint8_t data[HEADER_SIZE];
     if (lseek(fd, offset, SEEK_SET) < 0) {
@@ -70,7 +72,7 @@ zx_status_t Format::Check(fbl::unique_fd fd, off_t start, off_t end,
     if (part == DISK_FORMAT_BLOBFS) {
         return blobfs::blobfs_fsck(fbl::move(fd), start, end, extent_lengths);
     } else if (part == DISK_FORMAT_MINFS) {
-        return minfs::minfs_fsck(fbl::move(fd), start, end, extent_lengths);
+        return minfs::SparseFsck(fbl::move(fd), start, end, extent_lengths);
     }
 
     fprintf(stderr, "Format not supported\n");

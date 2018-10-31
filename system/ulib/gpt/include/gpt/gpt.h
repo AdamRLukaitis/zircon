@@ -69,8 +69,15 @@ int gpt_device_sync(gpt_device_t* dev);
 int gpt_device_finalize(gpt_device_t* dev);
 
 // adds a partition
-int gpt_partition_add(gpt_device_t* dev, const char* name, uint8_t* type, uint8_t* guid,
-                      uint64_t offset, uint64_t blocks, uint64_t flags);
+int gpt_partition_add(gpt_device_t* dev, const char* name, const uint8_t* type,
+                      const uint8_t* guid, uint64_t offset, uint64_t blocks,
+                      uint64_t flags);
+
+// Writes zeroed blocks at an arbitrary offset (in blocks) within the device.
+//
+// Can be used alongside gpt_partition_add to ensure a newly created partition
+// will not read stale superblock data.
+int gpt_partition_clear(gpt_device_t* dev, uint64_t offset, uint64_t blocks);
 
 // removes a partition
 int gpt_partition_remove(gpt_device_t* dev, const uint8_t* guid);
@@ -88,24 +95,21 @@ void gpt_device_get_header_guid(gpt_device_t* dev,
 // return true if partition# idx has been locally modified
 int gpt_get_diffs(gpt_device_t* dev, int idx, unsigned* diffs);
 
-// get the size, in blocks of the space reserved by the GPT. This includes the
-// space for the MBR block, GPT header, and partition table entries.
-uint32_t gpt_device_get_size_blocks(uint32_t block_sz);
-
 // print out the GPT
 void print_table(gpt_device_t* device);
 
-// Sort an array of gpt_partition_t pointers based on the values of
-// gpt_partition_t->first. sorted_out will contain an array of pointers
-// to partitions in sorted order.
-void gpt_sort_partitions(gpt_partition_t** in, gpt_partition_t** sorted_out,
-                         uint16_t count);
+// Sort an array of gpt_partition_t pointers in-place based on the values of
+// gpt_partition_t->first.
+void gpt_sort_partitions(gpt_partition_t** partitions, size_t count);
 
 // Attempt to read a GPT from the file descriptor. dev_out will be NULL if
 // the read fails or read succeeds and GPT is invalid.
 int gpt_device_read_gpt(int fd, gpt_device_t** dev_out);
 
 void gpt_set_debug_output_enabled(bool enabled);
+
+// Return the human-readable version of the type GUID.
+const char* gpt_guid_to_type(const char* guid);
 
 #define GPT_DIFF_TYPE    (0x01u)
 #define GPT_DIFF_GUID    (0x02u)

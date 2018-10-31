@@ -23,8 +23,10 @@ namespace minfs {
 class MinfsChecker {
 public:
     MinfsChecker();
-    zx_status_t Init(fbl::unique_ptr<Bcache> bc, const minfs_info_t* info);
+    zx_status_t Init(fbl::unique_ptr<Bcache> bc, const Superblock* info);
+    void CheckReserved();
     zx_status_t CheckInode(ino_t ino, ino_t parent, bool dot_or_dotdot);
+    zx_status_t CheckUnlinkedInodes();
     zx_status_t CheckForUnusedBlocks() const;
     zx_status_t CheckForUnusedInodes() const;
     zx_status_t CheckLinkCounts() const;
@@ -37,21 +39,21 @@ public:
 private:
     DISALLOW_COPY_ASSIGN_AND_MOVE(MinfsChecker);
 
-    zx_status_t GetInode(minfs_inode_t* inode, ino_t ino);
+    zx_status_t GetInode(Inode* inode, ino_t ino);
 
     // Returns the nth block within an inode, relative to the start of the
     // file. Returns the "next_n" which might contain a bno. This "next_n"
     // is for performance reasons -- it allows fsck to avoid repeatedly checking
     // the same indirect / doubly indirect blocks with all internal
     // bno unallocated.
-    zx_status_t GetInodeNthBno(minfs_inode_t* inode, blk_t n, blk_t* next_n,
+    zx_status_t GetInodeNthBno(Inode* inode, blk_t n, blk_t* next_n,
                                blk_t* bno_out);
-    zx_status_t CheckDirectory(minfs_inode_t* inode, ino_t ino,
+    zx_status_t CheckDirectory(Inode* inode, ino_t ino,
                                ino_t parent, uint32_t flags);
     const char* CheckDataBlock(blk_t bno);
-    zx_status_t CheckFile(minfs_inode_t* inode, ino_t ino);
+    zx_status_t CheckFile(Inode* inode, ino_t ino);
 
-    fbl::RefPtr<Minfs> fs_;
+    fbl::unique_ptr<Minfs> fs_;
     RawBitmap checked_inodes_;
     RawBitmap checked_blocks_;
 
@@ -65,28 +67,14 @@ private:
     uint8_t indirect_cache_[kMinfsBlockSize];
 };
 
-zx_status_t MinfsChecker::GetInode(minfs_inode_t* inode, ino_t ino) {
-    if (ino >= fs_->info_.inode_count) {
+zx_status_t MinfsChecker::GetInode(Inode* inode, ino_t ino) {
+    if (ino >= fs_->Info().inode_count) {
         FS_TRACE_ERROR("check: ino %u out of range (>=%u)\n",
-              ino, fs_->info_.inode_count);
+              ino, fs_->Info().inode_count);
         return ZX_ERR_OUT_OF_RANGE;
     }
-    blk_t bno_of_ino = ino / kMinfsInodesPerBlock;
-    uint32_t off_of_ino = (ino % kMinfsInodesPerBlock) * kMinfsInodeSize;
 
-#ifdef __Fuchsia__
-    uintptr_t iaddr = reinterpret_cast<uintptr_t>(fs_->inode_table_->GetData()) +
-                      bno_of_ino * kMinfsBlockSize + off_of_ino;
-#else
-    char data[kMinfsBlockSize];
-    zx_status_t status;
-
-    if ((status = fs_->ReadIno(bno_of_ino, data)) != ZX_OK) {
-        return status;
-    }
-    uintptr_t iaddr = reinterpret_cast<uintptr_t>(data + off_of_ino);
-#endif
-    memcpy(inode, reinterpret_cast<void*>(iaddr), kMinfsInodeSize);
+    fs_->inodes_->Load(ino, inode);
     if ((inode->magic != kMinfsMagicFile) && (inode->magic != kMinfsMagicDir)) {
         FS_TRACE_ERROR("check: ino %u has bad magic %#x\n", ino, inode->magic);
         return ZX_ERR_IO_DATA_INTEGRITY;
@@ -97,7 +85,7 @@ zx_status_t MinfsChecker::GetInode(minfs_inode_t* inode, ino_t ino) {
 #define CD_DUMP 1
 #define CD_RECURSE 2
 
-zx_status_t MinfsChecker::GetInodeNthBno(minfs_inode_t* inode, blk_t n,
+zx_status_t MinfsChecker::GetInodeNthBno(Inode* inode, blk_t n,
                                          blk_t* next_n, blk_t* bno_out) {
     // The default value for the "next n". It's easier to set it here anyway,
     // since we proceed to modify n in the code below.
@@ -180,7 +168,7 @@ zx_status_t MinfsChecker::GetInodeNthBno(minfs_inode_t* inode, blk_t n,
     return ZX_ERR_OUT_OF_RANGE;
 }
 
-zx_status_t MinfsChecker::CheckDirectory(minfs_inode_t* inode, ino_t ino,
+zx_status_t MinfsChecker::CheckDirectory(Inode* inode, ino_t ino,
                                          ino_t parent, uint32_t flags) {
     unsigned eno = 0;
     bool dot = false;
@@ -189,7 +177,7 @@ zx_status_t MinfsChecker::CheckDirectory(minfs_inode_t* inode, ino_t ino,
 
     zx_status_t status;
     fbl::RefPtr<VnodeMinfs> vn;
-    if ((status = VnodeMinfs::Recreate(fs_.get(), ino, inode, &vn)) != ZX_OK) {
+    if ((status = VnodeMinfs::Recreate(fs_.get(), ino, &vn)) != ZX_OK) {
         return status;
     }
 
@@ -208,7 +196,7 @@ zx_status_t MinfsChecker::CheckDirectory(minfs_inode_t* inode, ino_t ino,
             }
             return status != ZX_OK ? status : ZX_ERR_IO;
         }
-        minfs_dirent_t* de = reinterpret_cast<minfs_dirent_t*>(data);
+        Dirent* de = reinterpret_cast<Dirent*>(data);
         uint32_t rlen = static_cast<uint32_t>(MinfsReclen(de, off));
         uint32_t dlen = DirentSize(de->namelen);
         bool is_last = de->reclen & kMinfsReclenLast;
@@ -229,7 +217,7 @@ zx_status_t MinfsChecker::CheckDirectory(minfs_inode_t* inode, ino_t ino,
                 FS_TRACE_ERROR("check: Error reading dirent of size: %u\n", DirentSize(de->namelen));
                 return ZX_ERR_IO;
             }
-            de = reinterpret_cast<minfs_dirent_t*>(record_full);
+            de = reinterpret_cast<Dirent*>(record_full);
             bool dot_or_dotdot = false;
 
             if ((de->namelen == 0) || (de->namelen > (rlen - MINFS_DIRENT_SIZE))) {
@@ -293,10 +281,10 @@ const char* MinfsChecker::CheckDataBlock(blk_t bno) {
     if (bno == 0) {
         return "reserved bno";
     }
-    if (bno >= fs_->info_.block_count) {
+    if (bno >= fs_->Info().block_count) {
         return "out of range";
     }
-    if (!fs_->block_map_.Get(bno, bno + 1)) {
+    if (!fs_->block_allocator_->map_.Get(bno, bno + 1)) {
         return "not allocated";
     }
     if (checked_blocks_.Get(bno, bno + 1)) {
@@ -307,7 +295,7 @@ const char* MinfsChecker::CheckDataBlock(blk_t bno) {
     return nullptr;
 }
 
-zx_status_t MinfsChecker::CheckFile(minfs_inode_t* inode, ino_t ino) {
+zx_status_t MinfsChecker::CheckFile(Inode* inode, ino_t ino) {
     xprintf("Direct blocks: \n");
     for (unsigned n = 0; n < kMinfsDirect; n++) {
         xprintf(" %d,", inode->dnum[n]);
@@ -407,8 +395,28 @@ zx_status_t MinfsChecker::CheckFile(minfs_inode_t* inode, ino_t ino) {
     return ZX_OK;
 }
 
+void MinfsChecker::CheckReserved() {
+    // Check reserved inode '0'.
+    if (fs_->inodes_->inode_allocator_->map_.Get(0, 1)) {
+        checked_inodes_.Set(0, 1);
+        alloc_inodes_++;
+    } else {
+        FS_TRACE_WARN("check: reserved inode#0: not marked in-use\n");
+        conforming_ = false;
+    }
+
+    // Check reserved data block '0'.
+    if (fs_->block_allocator_->map_.Get(0, 1)) {
+        checked_blocks_.Set(0, 1);
+        alloc_blocks_++;
+    } else {
+        FS_TRACE_WARN("check: reserved block#0: not marked in-use\n");
+        conforming_ = false;
+    }
+}
+
 zx_status_t MinfsChecker::CheckInode(ino_t ino, ino_t parent, bool dot_or_dotdot) {
-    minfs_inode_t inode;
+    Inode inode;
     zx_status_t status;
 
     if ((status = GetInode(&inode, ino)) < 0) {
@@ -434,7 +442,7 @@ zx_status_t MinfsChecker::CheckInode(ino_t ino, ino_t parent, bool dot_or_dotdot
     checked_inodes_.Set(ino, ino + 1);
     alloc_inodes_++;
 
-    if (!fs_->inode_map_.Get(ino, ino + 1)) {
+    if (!fs_->inodes_->inode_allocator_->map_.Get(ino, ino + 1)) {
        FS_TRACE_WARN("check: ino#%u: not marked in-use\n", ino);
         conforming_ = false;
     }
@@ -460,10 +468,59 @@ zx_status_t MinfsChecker::CheckInode(ino_t ino, ino_t parent, bool dot_or_dotdot
     return ZX_OK;
 }
 
+zx_status_t MinfsChecker::CheckUnlinkedInodes() {
+    ino_t last_ino = 0;
+    ino_t next_ino = fs_->Info().unlinked_head;
+    ino_t unlinked_count = 0;
+
+    while (next_ino != 0) {
+        unlinked_count++;
+
+        Inode inode;
+        zx_status_t status = GetInode(&inode, next_ino);
+        if (status != ZX_OK) {
+            FS_TRACE_ERROR("check: ino#%u: not readable\n", next_ino);
+            return status;
+        }
+
+        if (inode.link_count > 0) {
+            FS_TRACE_ERROR("check: ino#%u: should have 0 links\n", next_ino);
+            return ZX_ERR_BAD_STATE;
+        }
+
+        if (inode.last_inode != last_ino) {
+            FS_TRACE_ERROR("check: ino#%u: incorrect last unlinked inode\n", next_ino);
+            return ZX_ERR_BAD_STATE;
+        }
+
+        links_[next_ino - 1] = -1;
+
+        if ((status = CheckInode(next_ino, 0, 0)) != ZX_OK) {
+            FS_TRACE_ERROR("minfs_check: CheckInode failure: %d\n", status);
+            return status;
+        }
+
+        last_ino = next_ino;
+        next_ino = inode.next_inode;
+    }
+
+    if (fs_->Info().unlinked_tail != last_ino) {
+        FS_TRACE_ERROR("minfs_check: Incorrect unlinked tail\n");
+        return ZX_ERR_BAD_STATE;
+    }
+
+    if (unlinked_count > 0) {
+        FS_TRACE_WARN("minfs_check: Warning: %u unlinked inodes found\n", unlinked_count);
+    }
+
+    return ZX_OK;
+}
+
 zx_status_t MinfsChecker::CheckForUnusedBlocks() const {
     unsigned missing = 0;
-    for (unsigned n = fs_->info_.dat_block; n < fs_->info_.block_count; n++) {
-        if (fs_->block_map_.Get(n, n + 1)) {
+
+    for (unsigned n = 0; n < fs_->Info().block_count; n++) {
+        if (fs_->block_allocator_->map_.Get(n, n + 1)) {
             if (!checked_blocks_.Get(n, n + 1)) {
                 missing++;
             }
@@ -479,8 +536,8 @@ zx_status_t MinfsChecker::CheckForUnusedBlocks() const {
 
 zx_status_t MinfsChecker::CheckForUnusedInodes() const {
     unsigned missing = 0;
-    for (unsigned n = 1; n < fs_->info_.inode_count; n++) {
-        if (fs_->inode_map_.Get(n, n + 1)) {
+    for (unsigned n = 0; n < fs_->Info().inode_count; n++) {
+        if (fs_->inodes_->inode_allocator_->map_.Get(n, n + 1)) {
             if (!checked_inodes_.Get(n, n + 1)) {
                 missing++;
             }
@@ -496,7 +553,7 @@ zx_status_t MinfsChecker::CheckForUnusedInodes() const {
 
 zx_status_t MinfsChecker::CheckLinkCounts() const {
     unsigned error = 0;
-    for (uint32_t n = 0; n < fs_->info_.inode_count; n++) {
+    for (uint32_t n = 0; n < fs_->Info().inode_count; n++) {
         if (links_[n] != 0) {
             error += 1;
             FS_TRACE_ERROR("check: inode#%u has incorrect link count %u\n", n + 1, links_[n]);
@@ -513,13 +570,15 @@ zx_status_t MinfsChecker::CheckLinkCounts() const {
 
 zx_status_t MinfsChecker::CheckAllocatedCounts() const {
     zx_status_t status = ZX_OK;
-    if (alloc_blocks_ != fs_->info_.alloc_block_count) {
-        FS_TRACE_ERROR("check: incorrect allocated block count %u (should be %u)\n", fs_->info_.alloc_block_count, alloc_blocks_);
+    if (alloc_blocks_ != fs_->Info().alloc_block_count) {
+        FS_TRACE_ERROR("check: incorrect allocated block count %u (should be %u)\n",
+                       fs_->Info().alloc_block_count, alloc_blocks_);
         status = ZX_ERR_BAD_STATE;
     }
 
-    if (alloc_inodes_ != fs_->info_.alloc_inode_count) {
-        FS_TRACE_ERROR("check: incorrect allocated inode count %u (should be %u)\n", fs_->info_.alloc_inode_count, alloc_inodes_);
+    if (alloc_inodes_ != fs_->Info().alloc_inode_count) {
+        FS_TRACE_ERROR("check: incorrect allocated inode count %u (should be %u)\n",
+                       fs_->Info().alloc_inode_count, alloc_inodes_);
         status = ZX_ERR_BAD_STATE;
     }
 
@@ -529,7 +588,7 @@ zx_status_t MinfsChecker::CheckAllocatedCounts() const {
 MinfsChecker::MinfsChecker()
     : conforming_(true), fs_(nullptr), alloc_inodes_(0), alloc_blocks_(0), links_() {};
 
-zx_status_t MinfsChecker::Init(fbl::unique_ptr<Bcache> bc, const minfs_info_t* info) {
+zx_status_t MinfsChecker::Init(fbl::unique_ptr<Bcache> bc, const Superblock* info) {
     links_.reset(new int32_t[info->inode_count]{0}, info->inode_count);
     links_[0] = -1;
 
@@ -545,16 +604,17 @@ zx_status_t MinfsChecker::Init(fbl::unique_ptr<Bcache> bc, const minfs_info_t* i
         FS_TRACE_ERROR("MinfsChecker::Init Failed to reset checked blocks: %d\n", status);
         return status;
     }
-    fbl::RefPtr<Minfs> fs;
+    fbl::unique_ptr<Minfs> fs;
     if ((status = Minfs::Create(fbl::move(bc), info, &fs)) != ZX_OK) {
         FS_TRACE_ERROR("MinfsChecker::Create Failed to Create Minfs: %d\n", status);
         return status;
     }
-    fs_ = fs;
+    fs_ = fbl::move(fs);
+
     return ZX_OK;
 }
 
-zx_status_t minfs_check(fbl::unique_ptr<Bcache> bc) {
+zx_status_t Fsck(fbl::unique_ptr<Bcache> bc) {
     zx_status_t status;
 
     char data[kMinfsBlockSize];
@@ -562,22 +622,24 @@ zx_status_t minfs_check(fbl::unique_ptr<Bcache> bc) {
         FS_TRACE_ERROR("minfs: could not read info block\n");
         return ZX_ERR_IO;
     }
-    const minfs_info_t* info = reinterpret_cast<const minfs_info_t*>(data);
-    minfs_dump_info(info);
-    if ((status = minfs_check_info(info, bc.get())) != ZX_OK) {
-        FS_TRACE_ERROR("minfs_check: check_info failure: %d\n", status);
+    const Superblock* info = reinterpret_cast<const Superblock*>(data);
+    DumpInfo(info);
+    if ((status = CheckSuperblock(info, bc.get())) != ZX_OK) {
+        FS_TRACE_ERROR("Fsck: check_info failure: %d\n", status);
         return status;
     }
 
     MinfsChecker chk;
     if ((status = chk.Init(fbl::move(bc), info)) != ZX_OK) {
-        FS_TRACE_ERROR("minfs_check: Init failure: %d\n", status);
+        FS_TRACE_ERROR("Fsck: Init failure: %d\n", status);
         return status;
     }
 
+    chk.CheckReserved();
+
     //TODO: check root not a directory
     if ((status = chk.CheckInode(1, 1, 0)) != ZX_OK) {
-        FS_TRACE_ERROR("minfs_check: CheckInode failure: %d\n", status);
+        FS_TRACE_ERROR("Fsck: CheckInode failure: %d\n", status);
         return status;
     }
 
@@ -585,6 +647,8 @@ zx_status_t minfs_check(fbl::unique_ptr<Bcache> bc) {
 
     // Save an error if it occurs, but check for subsequent errors
     // anyway.
+    r = chk.CheckUnlinkedInodes();
+    status |= (status != ZX_OK) ? 0 : r;
     r = chk.CheckForUnusedBlocks();
     status |= (status != ZX_OK) ? 0 : r;
     r = chk.CheckForUnusedInodes();

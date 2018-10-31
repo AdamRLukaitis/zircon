@@ -10,7 +10,7 @@
 namespace ddk {
 namespace internal {
 
-// base_device is a tag that default initalizes the zx_protocol_device_t so the mixin classes
+// base_device is a tag that default initializes the zx_protocol_device_t so the mixin classes
 // can fill in the table.
 struct base_device {
   protected:
@@ -47,7 +47,7 @@ struct base_protocol {
 //         internal::CheckMyProtocol<D, NewMethod>();
 //         ops_.foo = Foo;
 //
-//         // Can only inherit from one base_protocol implemenation
+//         // Can only inherit from one base_protocol implementation
 //         ZX_ASSERT(this->ddk_proto_ops_ == nullptr);
 //         ddk_proto_id_ = ZX_PROTOCOL_MY_FOO;
 //         ddk_proto_ops_ = &ops_;
@@ -235,6 +235,20 @@ constexpr void CheckIoctlable() {
                   "'zx_status_t DdkIoctl(uint32_t, const void*, size_t, void*, size_t, size_t*)'.");
 }
 
+DECLARE_HAS_MEMBER_FN(has_ddk_message, DdkMessage);
+
+template <typename D>
+constexpr void CheckMessageable() {
+    static_assert(has_ddk_message<D>::value,
+                  "Messageable classes must implement DdkMessage");
+    static_assert(fbl::is_base_of<base_device, D>::value,
+                  "Messageable classes must be derived from ddk::Device<...>.");
+    static_assert(fbl::is_same<decltype(&D::DdkMessage),
+                               zx_status_t (D::*)(fidl_msg_t*, fidl_txn_t*)>::value,
+                  "DdkMessage must be a public non-static member function with signature "
+                  "'zx_status_t DdkMessage(fidl_msg_t*, fidl_txn_t*)'.");
+}
+
 DECLARE_HAS_MEMBER_FN(has_ddk_suspend, DdkSuspend);
 
 template <typename D>
@@ -259,6 +273,19 @@ constexpr void CheckResumable() {
     static_assert(fbl::is_same<decltype(&D::DdkResume), zx_status_t (D::*)(uint32_t)>::value,
                   "DdkResume must be a public non-static member function with signature "
                   "'zx_status_t DdkResume(uint32_t)'.");
+}
+
+DECLARE_HAS_MEMBER_FN(has_ddk_rxrpc, DdkRxrpc);
+
+template <typename D>
+constexpr void CheckRxrpcable() {
+    static_assert(has_ddk_rxrpc<D>::value,
+                  "Rxrpcable classes must implement DdkRxrpc");
+    static_assert(fbl::is_base_of<base_device, D>::value,
+                  "Rxrpcable classes must be derived from ddk::Device<...>.");
+    static_assert(fbl::is_same<decltype(&D::DdkRxrpc), zx_status_t (D::*)(uint32_t)>::value,
+                  "DdkRxrpc must be a public non-static member function with signature "
+                  "'zx_status_t DdkRxrpc(zx_handle_t)'.");
 }
 
 // all_mixins

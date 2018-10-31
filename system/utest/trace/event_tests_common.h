@@ -12,8 +12,8 @@
 
 #include <trace/event.h>
 
-#include <zircon/syscalls.h>
 #include <unittest/unittest.h>
+#include <zircon/syscalls.h>
 
 #ifdef __cplusplus
 #include <fbl/string.h>
@@ -466,6 +466,146 @@ KernelObject(koid: <>, type: event, name: \"\", {k1: string(\"v1\"), k2: string(
                    "");
 
     zx_handle_close(event);
+
+    END_TRACE_TEST;
+}
+
+static bool test_vthread_duration_begin(void) {
+    BEGIN_TRACE_TEST;
+
+    fixture_start_tracing();
+
+    TRACE_VTHREAD_DURATION_BEGIN("+enabled", "name", "virtual-thread", 1u);
+    TRACE_VTHREAD_DURATION_BEGIN("+enabled", "name", "virtual-thread", 1u, STR_ARGS1);
+    TRACE_VTHREAD_DURATION_BEGIN("+enabled", "name", "virtual-thread", 1u, STR_ARGS4);
+
+    ASSERT_RECORDS("\
+String(index: 1, \"+enabled\")\n\
+String(index: 2, \"process\")\n\
+KernelObject(koid: <>, type: thread, name: \"virtual-thread\", {process: koid(<>)})\n\
+Thread(index: 1, <>)\n\
+String(index: 3, \"name\")\n\
+Event(ts: <>, pt: <>, category: \"+enabled\", name: \"name\", DurationBegin, {})\n\
+String(index: 4, \"k1\")\n\
+Event(ts: <>, pt: <>, category: \"+enabled\", name: \"name\", DurationBegin, {k1: string(\"v1\")})\n\
+String(index: 5, \"k2\")\n\
+String(index: 6, \"k3\")\n\
+String(index: 7, \"k4\")\n\
+Event(ts: <>, pt: <>, category: \"+enabled\", name: \"name\", DurationBegin, {k1: string(\"v1\"), k2: string(\"v2\"), k3: string(\"v3\"), k4: string(\"v4\")})\n\
+",
+                   "");
+
+    END_TRACE_TEST;
+}
+
+static bool test_vthread_duration_end(void) {
+    BEGIN_TRACE_TEST;
+
+    fixture_start_tracing();
+
+    TRACE_VTHREAD_DURATION_END("+enabled", "name", "virtual-thread", 1u);
+    TRACE_VTHREAD_DURATION_END("+enabled", "name", "virtual-thread", 1u, STR_ARGS1);
+    TRACE_VTHREAD_DURATION_END("+enabled", "name", "virtual-thread", 1u, STR_ARGS4);
+
+    ASSERT_RECORDS("\
+String(index: 1, \"+enabled\")\n\
+String(index: 2, \"process\")\n\
+KernelObject(koid: <>, type: thread, name: \"virtual-thread\", {process: koid(<>)})\n\
+Thread(index: 1, <>)\n\
+String(index: 3, \"name\")\n\
+Event(ts: <>, pt: <>, category: \"+enabled\", name: \"name\", DurationEnd, {})\n\
+String(index: 4, \"k1\")\n\
+Event(ts: <>, pt: <>, category: \"+enabled\", name: \"name\", DurationEnd, {k1: string(\"v1\")})\n\
+String(index: 5, \"k2\")\n\
+String(index: 6, \"k3\")\n\
+String(index: 7, \"k4\")\n\
+Event(ts: <>, pt: <>, category: \"+enabled\", name: \"name\", DurationEnd, {k1: string(\"v1\"), k2: string(\"v2\"), k3: string(\"v3\"), k4: string(\"v4\")})\n\
+",
+                   "");
+
+    END_TRACE_TEST;
+}
+
+static bool test_vthread_flow_begin(void) {
+    BEGIN_TRACE_TEST;
+
+    fixture_start_tracing();
+
+    TRACE_VTHREAD_FLOW_BEGIN("+enabled", "name", "virtual-thread", 1u, 2u);
+    TRACE_VTHREAD_FLOW_BEGIN("+enabled", "name", "virtual-thread", 1u, 2u, STR_ARGS1);
+    TRACE_VTHREAD_FLOW_BEGIN("+enabled", "name", "virtual-thread", 1u, 2u, STR_ARGS4);
+
+    ASSERT_RECORDS("\
+String(index: 1, \"+enabled\")\n\
+String(index: 2, \"process\")\n\
+KernelObject(koid: <>, type: thread, name: \"virtual-thread\", {process: koid(<>)})\n\
+Thread(index: 1, <>)\n\
+String(index: 3, \"name\")\n\
+Event(ts: <>, pt: <>, category: \"+enabled\", name: \"name\", FlowBegin(id: 2), {})\n\
+String(index: 4, \"k1\")\n\
+Event(ts: <>, pt: <>, category: \"+enabled\", name: \"name\", FlowBegin(id: 2), {k1: string(\"v1\")})\n\
+String(index: 5, \"k2\")\n\
+String(index: 6, \"k3\")\n\
+String(index: 7, \"k4\")\n\
+Event(ts: <>, pt: <>, category: \"+enabled\", name: \"name\", FlowBegin(id: 2), {k1: string(\"v1\"), k2: string(\"v2\"), k3: string(\"v3\"), k4: string(\"v4\")})\n\
+",
+                   "");
+
+    END_TRACE_TEST;
+}
+
+static bool test_vthread_flow_step(void) {
+    BEGIN_TRACE_TEST;
+
+    fixture_start_tracing();
+
+    TRACE_VTHREAD_FLOW_STEP("+enabled", "name", "virtual-thread", 1u, 2u);
+    TRACE_VTHREAD_FLOW_STEP("+enabled", "name", "virtual-thread", 1u, 2u, STR_ARGS1);
+    TRACE_VTHREAD_FLOW_STEP("+enabled", "name", "virtual-thread", 1u, 2u, STR_ARGS4);
+
+    ASSERT_RECORDS("\
+String(index: 1, \"+enabled\")\n\
+String(index: 2, \"process\")\n\
+KernelObject(koid: <>, type: thread, name: \"virtual-thread\", {process: koid(<>)})\n\
+Thread(index: 1, <>)\n\
+String(index: 3, \"name\")\n\
+Event(ts: <>, pt: <>, category: \"+enabled\", name: \"name\", FlowStep(id: 2), {})\n\
+String(index: 4, \"k1\")\n\
+Event(ts: <>, pt: <>, category: \"+enabled\", name: \"name\", FlowStep(id: 2), {k1: string(\"v1\")})\n\
+String(index: 5, \"k2\")\n\
+String(index: 6, \"k3\")\n\
+String(index: 7, \"k4\")\n\
+Event(ts: <>, pt: <>, category: \"+enabled\", name: \"name\", FlowStep(id: 2), {k1: string(\"v1\"), k2: string(\"v2\"), k3: string(\"v3\"), k4: string(\"v4\")})\n\
+",
+                   "");
+
+    END_TRACE_TEST;
+}
+
+static bool test_vthread_flow_end(void) {
+    BEGIN_TRACE_TEST;
+
+    fixture_start_tracing();
+
+    TRACE_VTHREAD_FLOW_END("+enabled", "name", "virtual-thread", 1u, 2u);
+    TRACE_VTHREAD_FLOW_END("+enabled", "name", "virtual-thread", 1u, 2u, STR_ARGS1);
+    TRACE_VTHREAD_FLOW_END("+enabled", "name", "virtual-thread", 1u, 2u, STR_ARGS4);
+
+    ASSERT_RECORDS("\
+String(index: 1, \"+enabled\")\n\
+String(index: 2, \"process\")\n\
+KernelObject(koid: <>, type: thread, name: \"virtual-thread\", {process: koid(<>)})\n\
+Thread(index: 1, <>)\n\
+String(index: 3, \"name\")\n\
+Event(ts: <>, pt: <>, category: \"+enabled\", name: \"name\", FlowEnd(id: 2), {})\n\
+String(index: 4, \"k1\")\n\
+Event(ts: <>, pt: <>, category: \"+enabled\", name: \"name\", FlowEnd(id: 2), {k1: string(\"v1\")})\n\
+String(index: 5, \"k2\")\n\
+String(index: 6, \"k3\")\n\
+String(index: 7, \"k4\")\n\
+Event(ts: <>, pt: <>, category: \"+enabled\", name: \"name\", FlowEnd(id: 2), {k1: string(\"v1\"), k2: string(\"v2\"), k3: string(\"v3\"), k4: string(\"v4\")})\n\
+",
+                   "");
 
     END_TRACE_TEST;
 }
@@ -1000,7 +1140,11 @@ Event(ts: <>, pt: <>, category: \"+enabled\", name: \"name\", DurationBegin, {ke
     END_TRACE_TEST;
 }
 
+#ifdef NO_OPTIM
+static bool test_koid_arguments_no_optim(void) {
+#else
 static bool test_koid_arguments(void) {
+#endif
     BEGIN_TRACE_TEST;
 
     fixture_start_tracing();
@@ -1074,17 +1218,23 @@ Event(ts: <>, pt: <>, category: \"+enabled\", name: \"name\", DurationBegin, {k1
 }
 
 #ifdef __cplusplus
+
 #ifndef NTRACE
 #define _NAME event_tests_cpp
 #else
 #define _NAME event_tests_cpp_ntrace
 #endif // NTRACE
+
 #else
-#ifndef NTRACE
-#define _NAME event_tests_c
-#else
+
+#if defined(NTRACE)
 #define _NAME event_tests_c_ntrace
+#elif defined(NO_OPTIM)
+#define _NAME event_tests_c_no_optim
+#else
+#define _NAME event_tests_c
 #endif // NTRACE
+
 #endif // __cplusplus
 
 #define _BEGIN_TEST_CASE(name) BEGIN_TEST_CASE(name)
@@ -1106,6 +1256,11 @@ RUN_TEST(test_flow_begin)
 RUN_TEST(test_flow_step)
 RUN_TEST(test_flow_end)
 RUN_TEST(test_kernel_object)
+RUN_TEST(test_vthread_duration_begin)
+RUN_TEST(test_vthread_duration_end)
+RUN_TEST(test_vthread_flow_begin)
+RUN_TEST(test_vthread_flow_step)
+RUN_TEST(test_vthread_flow_end)
 RUN_TEST(test_null_arguments)
 RUN_TEST(test_bool_arguments)
 RUN_TEST(test_int32_arguments)
@@ -1118,7 +1273,11 @@ RUN_TEST(test_char_array_arguments)
 RUN_TEST(test_string_arguments)
 RUN_TEST(test_string_literal_arguments)
 RUN_TEST(test_pointer_arguments)
+#ifdef NO_OPTIM
+RUN_TEST(test_koid_arguments_no_optim)
+#else
 RUN_TEST(test_koid_arguments)
+#endif
 RUN_TEST(test_all_argument_counts)
 _END_TEST_CASE(_NAME)
 

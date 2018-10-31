@@ -10,6 +10,7 @@ LOCAL_DIR := $(GET_LOCAL_DIR)
 MODULE := $(LOCAL_DIR)
 
 MODULE_SRCS := \
+    $(LOCAL_DIR)/buffer_chain.cpp \
     $(LOCAL_DIR)/bus_transaction_initiator_dispatcher.cpp \
     $(LOCAL_DIR)/channel_dispatcher.cpp \
     $(LOCAL_DIR)/diagnostics.cpp \
@@ -39,27 +40,32 @@ MODULE_SRCS := \
     $(LOCAL_DIR)/process_dispatcher.cpp \
     $(LOCAL_DIR)/profile_dispatcher.cpp \
     $(LOCAL_DIR)/resource_dispatcher.cpp \
-    $(LOCAL_DIR)/resources.cpp \
+    $(LOCAL_DIR)/resource.cpp \
     $(LOCAL_DIR)/semaphore.cpp \
     $(LOCAL_DIR)/socket_dispatcher.cpp \
+    $(LOCAL_DIR)/suspend_token_dispatcher.cpp \
     $(LOCAL_DIR)/thread_dispatcher.cpp \
     $(LOCAL_DIR)/timer_dispatcher.cpp \
     $(LOCAL_DIR)/vcpu_dispatcher.cpp \
+    $(LOCAL_DIR)/virtual_interrupt_dispatcher.cpp \
     $(LOCAL_DIR)/vm_address_region_dispatcher.cpp \
     $(LOCAL_DIR)/vm_object_dispatcher.cpp \
     $(LOCAL_DIR)/wait_state_observer.cpp \
 
 # Tests
 MODULE_SRCS += \
+    $(LOCAL_DIR)/buffer_chain_tests.cpp \
     $(LOCAL_DIR)/mbuf_tests.cpp \
     $(LOCAL_DIR)/message_packet_tests.cpp \
     $(LOCAL_DIR)/state_tracker_tests.cpp \
 
 MODULE_DEPS := \
-    kernel/lib/hypervisor \
-    kernel/lib/fbl \
-    kernel/lib/oom \
     kernel/dev/interrupt \
     kernel/dev/udisplay \
+    kernel/lib/fbl \
+    kernel/lib/hypervisor \
+    kernel/lib/oom \
+    kernel/lib/pretty \
+    kernel/lib/region-alloc \
 
 include make/module.mk

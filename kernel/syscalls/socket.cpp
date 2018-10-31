@@ -19,15 +19,13 @@
 #include <object/socket_dispatcher.h>
 
 #include <zircon/syscalls/policy.h>
-#include <fbl/auto_lock.h>
 #include <fbl/ref_ptr.h>
 
 #include "priv.h"
 
-using fbl::AutoLock;
-
 #define LOCAL_TRACE 0
 
+// zx_status_t zx_socket_create
 zx_status_t sys_socket_create(uint32_t options,
                               user_out_handle* out0,
                               user_out_handle* out1) {
@@ -47,6 +45,7 @@ zx_status_t sys_socket_create(uint32_t options,
     return result;
 }
 
+// zx_status_t zx_socket_write
 zx_status_t sys_socket_write(zx_handle_t handle, uint32_t options,
                              user_in_ptr<const void> buffer, size_t size,
                              user_out_ptr<size_t> actual) {
@@ -77,7 +76,7 @@ zx_status_t sys_socket_write(zx_handle_t handle, uint32_t options,
     case ZX_SOCKET_SHUTDOWN_READ | ZX_SOCKET_SHUTDOWN_WRITE:
         if (size == 0)
             return socket->Shutdown(options & ZX_SOCKET_SHUTDOWN_MASK);
-        // fallthrough
+        __FALLTHROUGH;
     default:
         return ZX_ERR_INVALID_ARGS;
     }
@@ -89,6 +88,7 @@ zx_status_t sys_socket_write(zx_handle_t handle, uint32_t options,
     return status;
 }
 
+// zx_status_t zx_socket_read
 zx_status_t sys_socket_read(zx_handle_t handle, uint32_t options,
                             user_out_ptr<void> buffer, size_t size,
                             user_out_ptr<size_t> actual) {
@@ -124,36 +124,40 @@ zx_status_t sys_socket_read(zx_handle_t handle, uint32_t options,
     return status;
 }
 
+// zx_status_t zx_socket_share
 zx_status_t sys_socket_share(zx_handle_t handle, zx_handle_t other) {
     auto up = ProcessDispatcher::GetCurrent();
 
     fbl::RefPtr<SocketDispatcher> socket;
     zx_status_t status = up->GetDispatcherWithRights(handle, ZX_RIGHT_WRITE, &socket);
-    if (status != ZX_OK)
-        return status;
-
-    fbl::RefPtr<SocketDispatcher> other_socket;
-    status = up->GetDispatcherWithRights(other, ZX_RIGHT_TRANSFER, &other_socket);
-    if (status != ZX_OK)
-        return status;
-
-    status = socket->CheckShareable(other_socket.get());
-    if (status != ZX_OK)
-        return status;
-
-    Handle* h = up->RemoveHandle(other).release();
-
-    status = socket->Share(h);
-
     if (status != ZX_OK) {
-        AutoLock lock(up->handle_table_lock());
-        up->UndoRemoveHandleLocked(other);
+        up->RemoveHandle(other);
         return status;
     }
 
-    return ZX_OK;
+    HandleOwner other_handle = up->RemoveHandle(other);
+    if (!other_handle) {
+        return ZX_ERR_BAD_HANDLE;
+    }
+    if (!other_handle->HasRights(ZX_RIGHT_TRANSFER)) {
+        return ZX_ERR_ACCESS_DENIED;
+    }
+
+    fbl::RefPtr<Dispatcher> other_dispatcher = other_handle->dispatcher();
+    auto other_socket = DownCastDispatcher<SocketDispatcher>(&other_dispatcher);
+    if (other_socket == nullptr) {
+        return ZX_ERR_WRONG_TYPE;
+    }
+
+    status = socket->CheckShareable(other_socket.get());
+    if (status != ZX_OK) {
+        return status;
+    }
+
+    return socket->Share(fbl::move(other_handle));
 }
 
+// zx_status_t zx_socket_accept
 zx_status_t sys_socket_accept(zx_handle_t handle, user_out_handle* out) {
     auto up = ProcessDispatcher::GetCurrent();
 

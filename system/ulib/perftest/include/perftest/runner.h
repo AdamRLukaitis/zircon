@@ -20,7 +20,8 @@ struct NamedTest {
 
 typedef fbl::Vector<NamedTest> TestList;
 
-bool RunTests(TestList* test_list, uint32_t run_count, const char* regex_string,
+bool RunTests(const char* test_suite, TestList* test_list,
+              uint32_t run_count, const char* regex_string,
               FILE* log_stream, ResultsSet* results_set);
 
 struct CommandArgs {
@@ -28,6 +29,8 @@ struct CommandArgs {
     // Note that this default matches any string.
     const char* filter_regex = "";
     uint32_t run_count = 1000;
+    bool enable_tracing = false;
+    double startup_delay_seconds = 0;
 };
 
 void ParseCommandArgs(int argc, char** argv, CommandArgs* dest);

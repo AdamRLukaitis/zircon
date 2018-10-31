@@ -17,6 +17,7 @@ MODULE_SRCS := \
     $(LOCAL_DIR)/data.S \
     $(LOCAL_DIR)/zx_cache_flush.cpp \
     $(LOCAL_DIR)/zx_channel_call.cpp \
+    $(LOCAL_DIR)/zx_cprng_draw.cpp \
     $(LOCAL_DIR)/zx_deadline_after.cpp \
     $(LOCAL_DIR)/zx_status_get_string.cpp \
     $(LOCAL_DIR)/zx_system_get_dcache_line_size.cpp \
@@ -50,5 +51,8 @@ MODULE_SO_INSTALL_NAME := -
 # does not need any writable data (except its caller's stack).
 # Make it use a simplified, hardened memory layout.
 MODULE_LDFLAGS := $(RODSO_LDFLAGS)
+
+# Instruct the linker to preserve the hidden alternate entry points.
+MODULE_EXTRA_OBJS += $(LOCAL_DIR)/alternates.ld
 
 include make/module.mk

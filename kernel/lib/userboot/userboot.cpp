@@ -71,10 +71,10 @@ public:
         fbl::RefPtr<VmAddressRegionDispatcher> vmar;
         zx_rights_t vmar_rights;
         zx_status_t status = root_vmar->Allocate(0, size(),
-                                                 ZX_VM_FLAG_CAN_MAP_READ |
-                                                 ZX_VM_FLAG_CAN_MAP_WRITE |
-                                                 ZX_VM_FLAG_CAN_MAP_EXECUTE |
-                                                 ZX_VM_FLAG_CAN_MAP_SPECIFIC,
+                                                 ZX_VM_CAN_MAP_READ |
+                                                 ZX_VM_CAN_MAP_WRITE |
+                                                 ZX_VM_CAN_MAP_EXECUTE |
+                                                 ZX_VM_CAN_MAP_SPECIFIC,
                                                  &vmar, &vmar_rights);
         if (status != ZX_OK)
             return status;
@@ -132,7 +132,8 @@ static zx_status_t get_job_handle(Handle** ptr) {
 static zx_status_t get_resource_handle(Handle** ptr) {
     zx_rights_t rights;
     fbl::RefPtr<ResourceDispatcher> root;
-    zx_status_t result = ResourceDispatcher::Create(&root, &rights, ZX_RSRC_KIND_ROOT, 0, 0);
+    zx_status_t result = ResourceDispatcher::Create(&root, &rights, ZX_RSRC_KIND_ROOT, 0, 0, 0,
+                                                    "root");
     if (result == ZX_OK)
         *ptr = Handle::Make(fbl::RefPtr<Dispatcher>(root.get()),
                             rights).release();
@@ -272,7 +273,7 @@ static void clog_to_vmo(const void* data, size_t off, size_t len, void* cookie) 
 static zx_status_t crashlog_to_vmo(fbl::RefPtr<VmObject>* out) {
     size_t size = platform_recover_crashlog(0, NULL, NULL);
     fbl::RefPtr<VmObject> crashlog_vmo;
-    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, size, &crashlog_vmo);
+    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, 0u, size, &crashlog_vmo);
     if (status != ZX_OK) {
         return status;
     }
@@ -290,7 +291,7 @@ static zx_status_t attempt_userboot() {
         dprintf(INFO, "userboot: ramdisk %#15zx @ %p\n", rsize, rbase);
 
     fbl::RefPtr<VmObject> stack_vmo;
-    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, stack_size, &stack_vmo);
+    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, 0u, stack_size, &stack_vmo);
     if (status != ZX_OK)
         return status;
     stack_vmo->set_name(STACK_VMO_NAME, sizeof(STACK_VMO_NAME) - 1);
@@ -351,7 +352,7 @@ static zx_status_t attempt_userboot() {
     status = ProcessDispatcher::Create(GetRootJobDispatcher(), "userboot", 0,
                                        &proc_disp, &rights,
                                        &vmar, &vmar_rights);
-    if (status < 0)
+    if (status != ZX_OK)
         return status;
 
     handles[BOOTSTRAP_PROC] = Handle::Make(proc_disp, rights).release();
@@ -379,7 +380,7 @@ static zx_status_t attempt_userboot() {
     fbl::RefPtr<VmMapping> stack_mapping;
     status = vmar->Map(0,
                        fbl::move(stack_vmo), 0, stack_size,
-                       ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE,
+                       ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
                        &stack_mapping);
     if (status != ZX_OK)
         return status;
@@ -394,7 +395,7 @@ static zx_status_t attempt_userboot() {
         // Make a copy of proc, as we need to a keep a copy for the
         // bootstrap message.
         status = ThreadDispatcher::Create(proc, 0, "userboot", &ut_disp, &rights);
-        if (status < 0)
+        if (status != ZX_OK)
             return status;
         handles[BOOTSTRAP_THREAD] = Handle::Make(ut_disp, rights).release();
         thread = DownCastDispatcher<ThreadDispatcher>(&ut_disp);

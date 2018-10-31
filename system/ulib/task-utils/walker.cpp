@@ -11,7 +11,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-#include <zircon/device/sysinfo.h>
+#include <fuchsia/sysinfo/c/fidl.h>
+#include <lib/fdio/util.h>
+#include <lib/zx/channel.h>
 #include <zircon/status.h>
 #include <zircon/syscalls.h>
 
@@ -333,10 +335,16 @@ zx_status_t walk_root_job_tree(task_callback_t job_callback,
         return ZX_ERR_NOT_FOUND;
     }
 
+    zx::channel channel;
+    zx_status_t status = fdio_get_service_handle(fd, channel.reset_and_get_address());
+    if (status != ZX_OK) {
+        return status;
+    }
+
     zx_handle_t root_job;
-    size_t n = ioctl_sysinfo_get_root_job(fd, &root_job);
-    close(fd);
-    if (n != sizeof(root_job)) {
+    zx_status_t fidl_status = fuchsia_sysinfo_DeviceGetRootJob(channel.get(), &status, &root_job);
+
+    if (fidl_status != ZX_OK || status != ZX_OK) {
         fprintf(stderr, "task-utils/walker: cannot obtain root job\n");
         return ZX_ERR_NOT_FOUND;
     }

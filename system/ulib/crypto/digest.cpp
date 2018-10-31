@@ -5,10 +5,13 @@
 #include <stddef.h>
 
 #include <crypto/digest.h>
-#include <fdio/debug.h>
-#include <openssl/digest.h>
+#include <lib/fdio/debug.h>
 #include <zircon/assert.h>
 #include <zircon/types.h>
+
+// See note in //zircon/third_party/ulib/uboringssl/rules.mk
+#define BORINGSSL_NO_CXX
+#include <openssl/digest.h>
 
 #define ZXDEBUG 0
 

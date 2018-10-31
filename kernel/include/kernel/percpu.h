@@ -18,34 +18,46 @@
 __BEGIN_CDECLS
 
 struct percpu {
-    /* per cpu timer queue */
+    // per cpu timer queue
     struct list_node timer_queue;
 
-    /* per cpu preemption timer */
-    timer_t preempt_timer;
+    // per cpu preemption timer; ZX_TIME_INFINITE means not set
+    zx_time_t preempt_timer_deadline;
 
-    /* per cpu run queue and bitmap to indicate which queues are non empty */
+    // deadline of this cpu's platform timer or ZX_TIME_INFINITE if not set
+    zx_time_t next_timer_deadline;
+
+    // per cpu run queue and bitmap to indicate which queues are non empty
     struct list_node run_queue[NUM_PRIORITIES];
     uint32_t run_queue_bitmap;
 
-    /* thread/cpu level statistics */
+#if WITH_LOCK_DEP
+    // state for runtime lock validation when in irq context
+    lockdep_state_t lock_state;
+#endif
+
+    // thread/cpu level statistics
     struct cpu_stats stats;
 
-    /* per cpu idle thread */
+    // per cpu idle thread
     thread_t idle_thread;
 
-    /* kernel counters arena */
-    uint64_t* counters;
+    // kernel counters arena
+    int64_t* counters;
 
-    /* dpc context */
+    // dpc context
     list_node_t dpc_list;
     event_t dpc_event;
+    // request the dpc thread to stop by setting to true; guarded by dpc_lock
+    bool dpc_stop;
+    // each cpu has a dedicated thread for processing dpcs
+    thread_t* dpc_thread;
 } __CPU_ALIGN;
 
-/* the kernel per-cpu structure */
+// the kernel per-cpu structure
 extern struct percpu percpu[SMP_MAX_CPUS];
 
-/* make sure the bitmap is large enough to cover our number of priorities */
+// make sure the bitmap is large enough to cover our number of priorities
 static_assert(NUM_PRIORITIES <= sizeof(percpu[0].run_queue_bitmap) * CHAR_BIT, "");
 
 static inline struct percpu* get_local_percpu(void) {

@@ -4,7 +4,7 @@
 
 #include <ddk/debug.h>
 #include <ddk/device.h>
-#include <ddk/protocol/platform-defs.h>
+#include <ddk/platform-defs.h>
 #include <soc/aml-a113/a113-hw.h>
 
 #include <limits.h>
@@ -19,6 +19,10 @@ static const pbus_mmio_t gpio_mmios[] = {
     {
         .base = 0xff800000,
         .length = PAGE_SIZE,
+    },
+    {
+        .base = 0xffd00000,
+        .length = 0x10000,
     },
 };
 
@@ -62,24 +66,18 @@ static const pbus_dev_t gpio_dev = {
     .vid = PDEV_VID_AMLOGIC,
     .pid = PDEV_PID_AMLOGIC_A113,
     .did = PDEV_DID_AMLOGIC_GPIO,
-    .mmios = gpio_mmios,
+    .mmio_list = gpio_mmios,
     .mmio_count = countof(gpio_mmios),
-    .irqs = gpio_irqs,
+    .irq_list = gpio_irqs,
     .irq_count = countof(gpio_irqs),
 };
 
 zx_status_t gauss_gpio_init(gauss_bus_t* bus) {
-    zx_status_t status = pbus_device_add(&bus->pbus, &gpio_dev, PDEV_ADD_PBUS_DEVHOST);
+    zx_status_t status = pbus_protocol_device_add(&bus->pbus, ZX_PROTOCOL_GPIO_IMPL, &gpio_dev);
     if (status != ZX_OK) {
-        zxlogf(ERROR, "gauss_gpio_init: pbus_device_add failed: %d\n", status);
+        zxlogf(ERROR, "gauss_gpio_init: pbus_protocol_device_add failed: %d\n", status);
         return status;
     }
 
-    status = pbus_wait_protocol(&bus->pbus, ZX_PROTOCOL_GPIO);
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "gauss_gpio_init: pbus_wait_protocol failed: %d\n", status);
-        return status;
-    }
-
-    return device_get_protocol(bus->parent, ZX_PROTOCOL_GPIO, &bus->gpio);
+    return device_get_protocol(bus->parent, ZX_PROTOCOL_GPIO_IMPL, &bus->gpio);
 }

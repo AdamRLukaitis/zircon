@@ -5,6 +5,7 @@
 #include <zircon/assert.h>
 #include <zircon/compiler.h>
 #include <lib/zx/channel.h>
+#include <fbl/algorithm.h>
 #include <fbl/auto_lock.h>
 #include <fbl/limits.h>
 #include <string.h>
@@ -44,9 +45,12 @@ zx_protocol_device_t IntelHDACodecDriverBase::CODEC_DEVICE_THUNKS = {
     .write        = nullptr,
     .get_size     = nullptr,
     .ioctl        = nullptr,
-    .suspend      = nullptr,
+    .suspend      = [](void* ctx, uint32_t flags) -> zx_status_t {
+                        return DEV(ctx)->Suspend(flags);
+                    },
     .resume       = nullptr,
     .rxrpc        = nullptr,
+    .message      = nullptr,
 };
 #undef DEV
 
@@ -169,6 +173,10 @@ void IntelHDACodecDriverBase::Shutdown() {
     UnlinkFromController();
 
     DEBUG_LOG("Shutdown complete\n");
+}
+
+zx_status_t IntelHDACodecDriverBase::Suspend(uint32_t flags) {
+    return ZX_ERR_NOT_SUPPORTED;
 }
 
 void IntelHDACodecDriverBase::DeviceRelease() {
@@ -465,7 +473,7 @@ void IntelHDACodecDriverBase::ReleaseUnsolTag(uint32_t stream_id, uint8_t tag) {
 
     ZX_DEBUG_ASSERT(mask != 0);
     ZX_DEBUG_ASSERT(!(free_unsol_tags_ & mask));
-    ZX_DEBUG_ASSERT(tag < countof(unsol_tag_to_stream_id_map_));
+    ZX_DEBUG_ASSERT(tag < fbl::count_of(unsol_tag_to_stream_id_map_));
     ZX_DEBUG_ASSERT(unsol_tag_to_stream_id_map_[tag] == stream_id);
 
     free_unsol_tags_ |= mask;
@@ -474,7 +482,7 @@ void IntelHDACodecDriverBase::ReleaseUnsolTag(uint32_t stream_id, uint8_t tag) {
 void IntelHDACodecDriverBase::ReleaseAllUnsolTags(uint32_t stream_id) {
     fbl::AutoLock unsol_tag_lock(&unsol_tag_lock_);
 
-    for (uint32_t tmp = 0u; tmp < countof(unsol_tag_to_stream_id_map_); ++tmp) {
+    for (uint32_t tmp = 0u; tmp < fbl::count_of(unsol_tag_to_stream_id_map_); ++tmp) {
         uint64_t mask = uint64_t(1u) << tmp;
         if (!(free_unsol_tags_ & mask) && (unsol_tag_to_stream_id_map_[tmp] == stream_id)) {
             free_unsol_tags_ |= mask;
@@ -491,7 +499,7 @@ zx_status_t IntelHDACodecDriverBase::MapUnsolTagToStreamId(uint8_t tag, uint32_t
     if ((!mask) || (free_unsol_tags_ & mask))
         return ZX_ERR_NOT_FOUND;
 
-    ZX_DEBUG_ASSERT(tag < countof(unsol_tag_to_stream_id_map_));
+    ZX_DEBUG_ASSERT(tag < fbl::count_of(unsol_tag_to_stream_id_map_));
     *out_stream_id = unsol_tag_to_stream_id_map_[tag];
     return ZX_OK;
 }

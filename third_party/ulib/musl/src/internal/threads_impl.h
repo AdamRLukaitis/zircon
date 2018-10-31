@@ -110,16 +110,7 @@ static inline struct pthread* tp_to_pthread(void* tp) {
     return (struct pthread*)((char*)tp - PTHREAD_TP_OFFSET);
 }
 
-#ifndef DTP_OFFSET
-#define DTP_OFFSET 0
-#endif
-
 #define SIGALL_SET ((sigset_t*)(const unsigned long long[2]){-1, -1})
-#define SIGPT_SET                                                                     \
-    ((sigset_t*)(const unsigned long[_NSIG / 8 / sizeof(long)]){[sizeof(long) == 4] = \
-                                                                    3UL               \
-                                                                    << (32 * (sizeof(long) > 4))})
-#define SIGTIMER_SET ((sigset_t*)(const unsigned long[_NSIG / 8 / sizeof(long)]){0x80000000})
 
 #define PTHREAD_MUTEX_MASK (PTHREAD_MUTEX_RECURSIVE | PTHREAD_MUTEX_ERRORCHECK)
 // The bit used in the recursive and errorchecking cases, which track thread owners.
@@ -143,7 +134,7 @@ static inline pid_t __thread_get_tid(void) {
     // We rely on the fact that the high bit is not set. For now,
     // let's incur the cost of this check, until we consider the
     // userspace handle value representation completely baked.
-    pid_t id = __pthread_self()->zxr_thread.handle;
+    pid_t id = zxr_thread_get_handle(&__pthread_self()->zxr_thread);
     if (id & PTHREAD_MUTEX_OWNED_LOCK_BIT) {
         __builtin_trap();
     }
@@ -179,13 +170,12 @@ void __thread_tsd_run_dtors(void) ATTR_LIBC_VISIBILITY;
         ._a_guardsize = PAGE_SIZE,                                            \
     })
 
-pthread_t __allocate_thread(const pthread_attr_t* attr,
-                            const char* thread_name,
-                            char default_name[ZX_MAX_NAME_LEN])
-    __attribute__((nonnull(1,2))) ATTR_LIBC_VISIBILITY;
+thrd_t __allocate_thread(size_t guard_size,
+                         size_t stack_size,
+                         const char* thread_name,
+                         char default_name[ZX_MAX_NAME_LEN])
+    __attribute__((nonnull(3))) ATTR_LIBC_VISIBILITY;
 
 pthread_t __init_main_thread(zx_handle_t thread_self) ATTR_LIBC_VISIBILITY;
-
-int __pthread_once(pthread_once_t*, void (*)(void)) ATTR_LIBC_VISIBILITY;
 
 int __clock_gettime(clockid_t, struct timespec*) ATTR_LIBC_VISIBILITY;

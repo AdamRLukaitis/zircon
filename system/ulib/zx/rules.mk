@@ -8,8 +8,11 @@ MODULE := $(LOCAL_DIR)
 
 MODULE_TYPE := userlib
 
+MODULE_COMPILEFLAGS += -fvisibility=hidden
+
 MODULE_SRCS += \
     $(LOCAL_DIR)/channel.cpp \
+    $(LOCAL_DIR)/debuglog.cpp \
     $(LOCAL_DIR)/event.cpp \
     $(LOCAL_DIR)/eventpair.cpp \
     $(LOCAL_DIR)/fifo.cpp \
@@ -23,6 +26,7 @@ MODULE_SRCS += \
     $(LOCAL_DIR)/socket.cpp \
     $(LOCAL_DIR)/thread.cpp \
     $(LOCAL_DIR)/timer.cpp \
+    $(LOCAL_DIR)/vcpu.cpp \
     $(LOCAL_DIR)/vmar.cpp \
     $(LOCAL_DIR)/vmo.cpp \
 

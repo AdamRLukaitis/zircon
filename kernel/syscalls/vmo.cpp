@@ -15,9 +15,12 @@
 
 #include <object/handle.h>
 #include <object/process_dispatcher.h>
+#include <object/resource.h>
 #include <object/vm_object_dispatcher.h>
 
+#include <fbl/auto_call.h>
 #include <fbl/ref_ptr.h>
+#include <zircon/thread_annotations.h>
 
 #include "priv.h"
 
@@ -34,12 +37,16 @@ static_assert(ZX_CACHE_POLICY_WRITE_COMBINING == ARCH_MMU_FLAG_WRITE_COMBINING,
 static_assert(ZX_CACHE_POLICY_MASK == ARCH_MMU_FLAG_CACHE_MASK,
               "Cache policy constant mismatch - CACHE_MASK");
 
+// zx_status_t zx_vmo_create
 zx_status_t sys_vmo_create(uint64_t size, uint32_t options,
                            user_out_handle* out) {
     LTRACEF("size %#" PRIx64 "\n", size);
 
-    if (options != 0u)
-        return ZX_ERR_INVALID_ARGS;
+    switch (options) {
+    case 0: options = VmObjectPaged::kResizable; break;
+    case ZX_VMO_NON_RESIZABLE: options = 0u; break;
+    default: return ZX_ERR_INVALID_ARGS;
+    }
 
     auto up = ProcessDispatcher::GetCurrent();
     zx_status_t res = up->QueryPolicy(ZX_POL_NEW_VMO);
@@ -48,7 +55,7 @@ zx_status_t sys_vmo_create(uint64_t size, uint32_t options,
 
     // create a vm object
     fbl::RefPtr<VmObject> vmo;
-    res = VmObjectPaged::Create(0, size, &vmo);
+    res = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, options, size, &vmo);
     if (res != ZX_OK)
         return res;
 
@@ -63,6 +70,7 @@ zx_status_t sys_vmo_create(uint64_t size, uint32_t options,
     return out->make(fbl::move(dispatcher), rights);
 }
 
+// zx_status_t zx_vmo_read
 zx_status_t sys_vmo_read(zx_handle_t handle, user_out_ptr<void> _data,
                          uint64_t offset, size_t len) {
     LTRACEF("handle %x, data %p, offset %#" PRIx64 ", len %#zx\n",
@@ -99,6 +107,7 @@ zx_status_t sys_vmo_read(zx_handle_t handle, user_out_ptr<void> _data,
     return vmo->Read(_data, len, offset);
 }
 
+// zx_status_t zx_vmo_write
 zx_status_t sys_vmo_write(zx_handle_t handle, user_in_ptr<const void> _data,
                           uint64_t offset, size_t len) {
     LTRACEF("handle %x, data %p, offset %#" PRIx64 ", len %#zx\n",
@@ -135,6 +144,7 @@ zx_status_t sys_vmo_write(zx_handle_t handle, user_in_ptr<const void> _data,
     return vmo->Write(_data, len, offset);
 }
 
+// zx_status_t zx_vmo_get_size
 zx_status_t sys_vmo_get_size(zx_handle_t handle, user_out_ptr<uint64_t> _size) {
     LTRACEF("handle %x, sizep %p\n", handle, _size.get());
 
@@ -160,6 +170,7 @@ zx_status_t sys_vmo_get_size(zx_handle_t handle, user_out_ptr<uint64_t> _size) {
     return status;
 }
 
+// zx_status_t zx_vmo_set_size
 zx_status_t sys_vmo_set_size(zx_handle_t handle, uint64_t size) {
     LTRACEF("handle %x, size %#" PRIx64 "\n", handle, size);
 
@@ -175,6 +186,7 @@ zx_status_t sys_vmo_set_size(zx_handle_t handle, uint64_t size) {
     return vmo->SetSize(size);
 }
 
+// zx_status_t zx_vmo_op_range
 zx_status_t sys_vmo_op_range(zx_handle_t handle, uint32_t op, uint64_t offset, uint64_t size,
                              user_inout_ptr<void> _buffer, size_t buffer_size) {
     LTRACEF("handle %x op %u offset %#" PRIx64 " size %#" PRIx64
@@ -184,15 +196,18 @@ zx_status_t sys_vmo_op_range(zx_handle_t handle, uint32_t op, uint64_t offset, u
     auto up = ProcessDispatcher::GetCurrent();
 
     // lookup the dispatcher from handle
-    // TODO(ZX-967): test rights on the handle
+    // save the rights and pass down into the dispatcher for further testing
     fbl::RefPtr<VmObjectDispatcher> vmo;
-    zx_status_t status = up->GetDispatcher(handle, &vmo);
-    if (status != ZX_OK)
+    zx_rights_t rights;
+    zx_status_t status = up->GetDispatcherAndRights(handle, &vmo, &rights);
+    if (status != ZX_OK) {
         return status;
+    }
 
-    return vmo->RangeOp(op, offset, size, _buffer, buffer_size);
+    return vmo->RangeOp(op, offset, size, _buffer, buffer_size, rights);
 }
 
+// zx_status_t zx_vmo_set_cache_policy
 zx_status_t sys_vmo_set_cache_policy(zx_handle_t handle, uint32_t cache_policy) {
     fbl::RefPtr<VmObjectDispatcher> vmo;
     zx_status_t status = ZX_OK;
@@ -212,6 +227,7 @@ zx_status_t sys_vmo_set_cache_policy(zx_handle_t handle, uint32_t cache_policy) 
     return vmo->SetMappingCachePolicy(cache_policy);
 }
 
+// zx_status_t zx_vmo_clone
 zx_status_t sys_vmo_clone(zx_handle_t handle, uint32_t options,
                           uint64_t offset, uint64_t size,
                           user_out_handle* out_handle) {
@@ -259,4 +275,36 @@ zx_status_t sys_vmo_clone(zx_handle_t handle, uint32_t options,
 
     // create a handle and attach the dispatcher to it
     return out_handle->make(fbl::move(dispatcher), rights);
+}
+
+// zx_status_t zx_vmo_replace_as_executable
+zx_status_t sys_vmo_replace_as_executable(
+    zx_handle_t vmo, zx_handle_t vmex, user_out_handle* out) {
+    LTRACEF("repexec %x %x\n", vmo, vmex);
+
+    zx_status_t vmex_status = ZX_OK;
+    if (vmex != ZX_HANDLE_INVALID) {
+        vmex_status = validate_resource(vmex, ZX_RSRC_KIND_VMEX);
+    } else {
+        // TODO(mdempsky): Print warning that VMEX resource is
+        // required, and eventually reject outright.
+    }
+
+    auto up = ProcessDispatcher::GetCurrent();
+
+    Guard<fbl::Mutex> guard{up->handle_table_lock()};
+    auto source = up->GetHandleLocked(vmo);
+    if (!source)
+        return ZX_ERR_BAD_HANDLE;
+
+    auto handle_cleanup = fbl::MakeAutoCall([up, vmo]() TA_NO_THREAD_SAFETY_ANALYSIS {
+        up->RemoveHandleLocked(vmo);
+    });
+
+    if (vmex_status != ZX_OK)
+        return vmex_status;
+    if (source->dispatcher()->get_type() != ZX_OBJ_TYPE_VMO)
+        return ZX_ERR_BAD_HANDLE;
+
+    return out->dup(source, source->rights() | ZX_RIGHT_EXECUTE);
 }

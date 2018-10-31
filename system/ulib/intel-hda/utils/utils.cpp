@@ -3,11 +3,49 @@
 // found in the LICENSE file.
 
 #include <zircon/syscalls/object.h>
+#include <zircon/time.h>
+#include <zircon/types.h>
 
+#include <fbl/algorithm.h>
 #include <intel-hda/utils/utils.h>
 
 namespace audio {
 namespace intel_hda {
+
+zx_status_t WaitCondition(zx_duration_t timeout,
+                          zx_duration_t poll_interval,
+                          WaitConditionFn cond) {
+    ZX_DEBUG_ASSERT(poll_interval != ZX_TIME_INFINITE);
+    ZX_DEBUG_ASSERT(cond);
+
+    zx_time_t now = zx_clock_get_monotonic();
+    zx_time_t deadline = zx_time_add_duration(now, timeout);
+
+    while (!cond()) {
+        now = zx_clock_get_monotonic();
+        if (now >= deadline)
+            return ZX_ERR_TIMED_OUT;
+
+        zx_duration_t sleep_time = zx_time_sub_time(deadline, now);
+        if (poll_interval < sleep_time)
+            sleep_time = poll_interval;
+
+        zx_nanosleep(zx_deadline_after(sleep_time));
+    }
+
+    return ZX_OK;
+}
+
+fbl::RefPtr<RefCountedBti> RefCountedBti::Create(zx::bti initiator) {
+    fbl::AllocChecker ac;
+
+    auto ret = fbl::AdoptRef(new (&ac) RefCountedBti(fbl::move(initiator)));
+    if (!ac.check()) {
+        return nullptr;
+    }
+
+    return ret;
+}
 
 static constexpr audio_sample_format_t AUDIO_SAMPLE_FORMAT_UNSIGNED_8BIT =
     static_cast<audio_sample_format_t>(AUDIO_SAMPLE_FORMAT_8BIT |
@@ -45,8 +83,8 @@ static const struct {
     size_t lut_size;
     uint16_t family_flag;
 } FRAME_RATE_LUTS[] = {
-    { FRAME_RATE_LUT_48K,   countof(FRAME_RATE_LUT_48K),   ASF_RANGE_FLAG_FPS_48000_FAMILY },
-    { FRAME_RATE_LUT_44_1K, countof(FRAME_RATE_LUT_44_1K), ASF_RANGE_FLAG_FPS_44100_FAMILY },
+    { FRAME_RATE_LUT_48K,   fbl::count_of(FRAME_RATE_LUT_48K),   ASF_RANGE_FLAG_FPS_48000_FAMILY },
+    { FRAME_RATE_LUT_44_1K, fbl::count_of(FRAME_RATE_LUT_44_1K), ASF_RANGE_FLAG_FPS_44100_FAMILY },
 };
 
 zx_obj_type_t GetHandleType(const zx::handle& handle) {

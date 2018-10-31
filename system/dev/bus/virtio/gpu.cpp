@@ -12,6 +12,7 @@
 #include <fbl/auto_call.h>
 #include <fbl/auto_lock.h>
 #include <zircon/compiler.h>
+#include <zircon/time.h>
 
 #include "trace.h"
 #include "virtio_gpu.h"
@@ -21,6 +22,9 @@
 namespace virtio {
 
 namespace {
+
+constexpr uint32_t kRefreshRateHz = 30;
+constexpr uint64_t kDisplayId = 1;
 
 zx_status_t to_zx_status(uint32_t type) {
     LTRACEF("response type %#x\n", type);
@@ -34,53 +38,135 @@ zx_status_t to_zx_status(uint32_t type) {
 
 // DDK level ops
 
-// Queue an iotxn. iotxn's are always completed by its complete() op
-zx_status_t GpuDevice::virtio_gpu_set_mode(void* ctx, zx_display_info_t* info) {
+typedef struct imported_image {
+    uint32_t resource_id;
+    zx::pmt pmt;
+} imported_image_t;
+
+void GpuDevice::virtio_gpu_set_display_controller_cb(void* ctx, void* cb_ctx,
+                                                     display_controller_cb_t* cb) {
     GpuDevice* gd = static_cast<GpuDevice*>(ctx);
+    {
+        fbl::AutoLock al(&gd->flush_lock_);
+        gd->dc_cb_ = cb;
+        gd->dc_cb_ctx_ = cb_ctx;
+    }
 
-    LTRACEF("dev %p, info %p\n", gd, info);
-
-    return ZX_ERR_NOT_SUPPORTED;
+    added_display_args_t args = {};
+    args.display_id = kDisplayId,
+    args.edid_present = false,
+    args.panel.params = {
+        .width = gd->pmode_.r.width,
+        .height = gd->pmode_.r.height,
+        .refresh_rate_e2 = kRefreshRateHz * 100,
+    },
+    args.pixel_formats = &gd->supported_formats_,
+    args.pixel_format_count = 1,
+    cb->on_displays_changed(cb_ctx, &args, 1, nullptr, 0);
 }
 
-zx_status_t GpuDevice::virtio_gpu_get_mode(void* ctx, zx_display_info_t* info) {
+zx_status_t GpuDevice::virtio_gpu_import_vmo_image(void* ctx, image_t* image,
+                                                   zx_handle_t vmo, size_t offset) {
     GpuDevice* gd = static_cast<GpuDevice*>(ctx);
+    if (image->type != IMAGE_TYPE_SIMPLE) {
+        return ZX_ERR_INVALID_ARGS;
+    }
 
-    LTRACEF("dev %p, info %p\n", gd, info);
+    fbl::AllocChecker ac;
+    auto import_data = fbl::make_unique_checked<imported_image_t>(&ac);
+    if (!ac.check()) {
+        return ZX_ERR_NO_MEMORY;
+    }
 
-    *info = {};
+    unsigned pixel_size = ZX_PIXEL_FORMAT_BYTES(image->pixel_format);
+    unsigned size = ROUNDUP(image->width * image->height * pixel_size, PAGE_SIZE);
+    zx_paddr_t paddr;
+    zx_status_t status = zx_bti_pin(gd->bti_.get(), ZX_BTI_PERM_READ | ZX_BTI_CONTIGUOUS,
+                                    vmo, offset, size,
+                                    &paddr, 1, import_data->pmt.reset_and_get_address());
+    if (status != ZX_OK) {
+        return status;
+    }
 
-    auto pmode = gd->pmode();
+    status = gd->allocate_2d_resource(&import_data->resource_id, image->width, image->height);
+    if (status != ZX_OK) {
+        zxlogf(ERROR, "%s: failed to allocate 2d resource\n", gd->tag());
+        return status;
+    }
 
-    info->format = ZX_PIXEL_FORMAT_RGB_x888;
-    info->width = pmode->r.width;
-    info->height = pmode->r.height;
-    info->stride = pmode->r.width;
-    info->pixelsize = 4;
-    info->flags = ZX_DISPLAY_FLAG_HW_FRAMEBUFFER;
+    status = gd->attach_backing(import_data->resource_id, paddr, size);
+    if (status != ZX_OK) {
+        zxlogf(ERROR, "%s: failed to attach backing store\n", gd->tag());
+        return status;
+    }
+
+    image->handle = import_data.release();
 
     return ZX_OK;
 }
 
-zx_status_t GpuDevice::virtio_gpu_get_framebuffer(void* ctx, void** framebuffer) {
-    GpuDevice* gd = static_cast<GpuDevice*>(ctx);
-
-    LTRACEF("dev %p, framebuffer %p\n", gd, framebuffer);
-
-    void* fb = gd->framebuffer();
-    if (!fb)
-        return ZX_ERR_NOT_SUPPORTED;
-
-    *framebuffer = fb;
-    return ZX_OK;
+void GpuDevice::virtio_gpu_release_image(void* ctx, image_t* image) {
+    delete reinterpret_cast<imported_image_t*>(image->handle);
 }
 
-void GpuDevice::virtio_gpu_flush(void* ctx) {
+void GpuDevice::virtio_gpu_check_configuration(void* ctx,
+                                               const display_config_t** display_configs,
+                                               uint32_t* display_cfg_result,
+                                               uint32_t** layer_cfg_results,
+                                               uint32_t display_count) {
     GpuDevice* gd = static_cast<GpuDevice*>(ctx);
+    if (display_count != 1) {
+        ZX_DEBUG_ASSERT(display_count == 0);
+        return;
+    }
+    ZX_DEBUG_ASSERT(display_configs[0]->display_id == kDisplayId);
+    bool success;
+    if (display_configs[0]->layer_count != 1) {
+        success = display_configs[0]->layer_count == 0;
+    } else {
+        primary_layer_t* layer = &display_configs[0]->layers[0]->cfg.primary;
+        frame_t frame = {
+                .x_pos = 0, .y_pos = 0, .width = gd->pmode_.r.width, .height = gd->pmode_.r.height,
+        };
+        success = display_configs[0]->layers[0]->type == LAYER_PRIMARY
+                && layer->transform_mode == FRAME_TRANSFORM_IDENTITY
+                && layer->image.width == gd->pmode_.r.width
+                && layer->image.height == gd->pmode_.r.height
+                && memcmp(&layer->dest_frame, &frame, sizeof(frame_t)) == 0
+                && memcmp(&layer->src_frame, &frame, sizeof(frame_t)) == 0
+                && display_configs[0]->cc_flags == 0
+                && layer->alpha_mode == ALPHA_DISABLE;
+    }
+    if (!success) {
+        layer_cfg_results[0][0] = CLIENT_MERGE_BASE;
+        for (unsigned i = 1; i < display_configs[0]->layer_count; i++) {
+            layer_cfg_results[0][i] = CLIENT_MERGE_SRC;
+        }
+    }
+}
 
-    LTRACEF("dev %p\n", gd);
+void GpuDevice::virtio_gpu_apply_configuration(void* ctx, const display_config_t** display_configs,
+                                               uint32_t display_count) {
+    GpuDevice* gd = static_cast<GpuDevice*>(ctx);
+    void* handle = display_count == 0 || display_configs[0]->layer_count == 0
+            ? nullptr : display_configs[0]->layers[0]->cfg.primary.image.handle;
+
+    {
+        fbl::AutoLock al(&gd->flush_lock_);
+        gd->current_fb_ = reinterpret_cast<imported_image_t*>(handle);
+    }
 
     gd->Flush();
+}
+
+uint32_t GpuDevice::virtio_gpu_compute_linear_stride(void* ctx, uint32_t width,
+                                                     zx_pixel_format_t format) {
+    return width;
+}
+
+zx_status_t GpuDevice::virtio_gpu_allocate_vmo(void* ctx, uint64_t size, zx_handle_t* vmo_out) {
+    GpuDevice* gd = static_cast<GpuDevice*>(ctx);
+    return zx_vmo_create_contiguous(gd->bti().get(), size, 0, vmo_out);
 }
 
 GpuDevice::GpuDevice(zx_device_t* bus_device, zx::bti bti, fbl::unique_ptr<Backend> backend)
@@ -89,12 +175,10 @@ GpuDevice::GpuDevice(zx_device_t* bus_device, zx::bti bti, fbl::unique_ptr<Backe
     sem_init(&response_sem_, 0, 0);
     cnd_init(&flush_cond_);
 
-    memset(&fb_, 0, sizeof(fb_));
     memset(&gpu_req_, 0, sizeof(gpu_req_));
 }
 
 GpuDevice::~GpuDevice() {
-    io_buffer_release(&fb_);
     io_buffer_release(&gpu_req_);
 
     // TODO: clean up allocated physical memory
@@ -292,27 +376,53 @@ void GpuDevice::Flush() {
 
 void GpuDevice::virtio_gpu_flusher() {
     LTRACE_ENTRY;
+    zx_time_t next_deadline = zx_clock_get_monotonic();
+    zx_time_t period = ZX_SEC(1) / kRefreshRateHz;
     for (;;) {
+        zx_nanosleep(next_deadline);
+
+        bool fb_change;
         {
             fbl::AutoLock al(&flush_lock_);
-            while (!flush_pending_)
-                cnd_wait(&flush_cond_, flush_lock_.GetInternal());
-            flush_pending_ = false;
+            fb_change = displayed_fb_ != current_fb_;
+            displayed_fb_ = current_fb_;
         }
 
         LTRACEF("flushing\n");
 
-        zx_status_t status = transfer_to_host_2d(display_resource_id_, pmode_.r.width, pmode_.r.height);
-        if (status != ZX_OK) {
-            LTRACEF("failed to flush resource\n");
-            continue;
+        if (displayed_fb_) {
+            zx_status_t status = transfer_to_host_2d(
+                    displayed_fb_->resource_id, pmode_.r.width, pmode_.r.height);
+            if (status != ZX_OK) {
+                LTRACEF("failed to flush resource\n");
+                continue;
+            }
+
+            status = flush_resource(displayed_fb_->resource_id, pmode_.r.width, pmode_.r.height);
+            if (status != ZX_OK) {
+                LTRACEF("failed to flush resource\n");
+                continue;
+            }
         }
 
-        status = flush_resource(display_resource_id_, pmode_.r.width, pmode_.r.height);
-        if (status != ZX_OK) {
-            LTRACEF("failed to flush resource\n");
-            continue;
+        if (fb_change) {
+            uint32_t res_id = displayed_fb_ ? displayed_fb_->resource_id : 0;
+            zx_status_t status = set_scanout(pmode_id_, res_id, pmode_.r.width, pmode_.r.height);
+            if (status != ZX_OK) {
+                zxlogf(ERROR, "%s: failed to set scanout\n", tag());
+                continue;
+            }
         }
+
+        {
+            fbl::AutoLock al(&flush_lock_);
+            if (dc_cb_) {
+                void* handles[] = { static_cast<void*>(displayed_fb_) };
+                dc_cb_->on_display_vsync(dc_cb_ctx_, kDisplayId,
+                                         next_deadline, handles, displayed_fb_ != nullptr);
+            }
+        }
+        next_deadline = zx_time_add_duration(next_deadline, period);
     }
 }
 
@@ -336,37 +446,6 @@ zx_status_t GpuDevice::virtio_gpu_start() {
            pmode_.r.x, pmode_.r.y, pmode_.r.width, pmode_.r.height,
            pmode_.flags);
 
-    // Allocate a resource
-    status = allocate_2d_resource(&display_resource_id_, pmode_.r.width, pmode_.r.height);
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "%s: failed to allocate 2d resource\n", tag());
-        return status;
-    }
-
-    // Attach a backing store to the resource
-    size_t len = pmode_.r.width * pmode_.r.height * 4;
-
-    status = io_buffer_init(&fb_, bti_.get(), len, IO_BUFFER_RW | IO_BUFFER_CONTIG);
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "%s: failed to allocate framebuffer, wanted 0x%zx bytes\n", tag(), len);
-        return ZX_ERR_NO_MEMORY;
-    }
-
-    LTRACEF("framebuffer at %p, 0x%zx bytes\n", io_buffer_virt(&fb_), len);
-
-    status = attach_backing(display_resource_id_, io_buffer_phys(&fb_), len);
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "%s: failed to attach backing store\n", tag());
-        return status;
-    }
-
-    // Attach this resource as a scanout
-    status = set_scanout(pmode_id_, display_resource_id_, pmode_.r.width, pmode_.r.height);
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "%s: failed to set scanout\n", tag());
-        return status;
-    }
-
     // Run a worker thread to shove in flush events
     auto virtio_gpu_flusher_entry = [](void* arg) {
         static_cast<GpuDevice*>(arg)->virtio_gpu_flusher();
@@ -377,19 +456,22 @@ zx_status_t GpuDevice::virtio_gpu_start() {
 
     LTRACEF("publishing device\n");
 
-    display_proto_ops_.set_mode = virtio_gpu_set_mode;
-    display_proto_ops_.get_mode = virtio_gpu_get_mode;
-    display_proto_ops_.get_framebuffer = virtio_gpu_get_framebuffer;
-    display_proto_ops_.flush = virtio_gpu_flush;
+    display_proto_ops_.set_display_controller_cb = virtio_gpu_set_display_controller_cb;
+    display_proto_ops_.import_vmo_image = virtio_gpu_import_vmo_image;
+    display_proto_ops_.release_image = virtio_gpu_release_image;
+    display_proto_ops_.check_configuration = virtio_gpu_check_configuration;
+    display_proto_ops_.apply_configuration = virtio_gpu_apply_configuration;
+    display_proto_ops_.compute_linear_stride = virtio_gpu_compute_linear_stride;
+    display_proto_ops_.allocate_vmo = virtio_gpu_allocate_vmo;
 
     // Initialize the zx_device and publish us
     // Point the ctx of our DDK device at ourself
     device_add_args_t args = {};
     args.version = DEVICE_ADD_ARGS_VERSION;
-    args.name = "virtio-gpu";
+    args.name = "virtio-gpu-display";
     args.ctx = this;
     args.ops = &device_ops_;
-    args.proto_id = ZX_PROTOCOL_DISPLAY;
+    args.proto_id = ZX_PROTOCOL_DISPLAY_CONTROLLER_IMPL;
     args.proto_ops = &display_proto_ops_;
 
     status = device_add(bus_device_, &args, &bus_device_);

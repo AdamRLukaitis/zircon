@@ -4,14 +4,14 @@
 
 #pragma once
 
-#include <ddk/usb-request.h>
+#include <ddk/protocol/usb.h>
 #include <zircon/listnode.h>
 
 #include "xhci-trb.h"
 
 // this struct contains state needed for a virtual root hub device
 typedef struct {
-    uint32_t num_ports;
+    uint8_t num_ports;
 
     // port status for each of our ports
     usb_port_status_t*  port_status;

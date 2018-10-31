@@ -21,32 +21,7 @@
 namespace audio {
 namespace intel_hda {
 
-fbl::RefPtr<fbl::VmarManager> DriverVmars::registers_;
-
-zx_status_t WaitCondition(zx_time_t timeout,
-                          zx_time_t poll_interval,
-                          WaitConditionFn cond,
-                          void* cond_ctx) {
-    ZX_DEBUG_ASSERT(poll_interval != ZX_TIME_INFINITE);
-    ZX_DEBUG_ASSERT(cond != nullptr);
-
-    zx_time_t now = zx_clock_get(ZX_CLOCK_MONOTONIC);
-    timeout += now;
-
-    while (!cond(cond_ctx)) {
-        now = zx_clock_get(ZX_CLOCK_MONOTONIC);
-        if (now >= timeout)
-            return ZX_ERR_TIMED_OUT;
-
-        zx_time_t sleep_time = timeout - now;
-        if (poll_interval < sleep_time)
-            sleep_time = poll_interval;
-
-        zx_nanosleep(zx_deadline_after(sleep_time));
-    }
-
-    return ZX_OK;
-}
+fbl::RefPtr<fzl::VmarManager> DriverVmars::registers_;
 
 zx_status_t DriverVmars::Initialize() {
     if (registers_ != nullptr) {
@@ -69,18 +44,23 @@ zx_status_t DriverVmars::Initialize() {
     constexpr size_t MAX_SIZE_PER_CONTROLLER =
         sizeof(hda_all_registers_t) +
         MAPPED_CORB_RIRB_SIZE +
-        (MAX_STREAMS_PER_CONTROLLER * MAPPED_BDL_SIZE);
+        (MAX_STREAMS_PER_CONTROLLER * MAPPED_BDL_SIZE) +
+        sizeof(adsp_registers_t) +
+        MAPPED_BDL_SIZE;
 
-    // One alloc for the main registers, one for the CORB/RIRB, and one for each
-    // possible stream BDL.
-    constexpr size_t MAX_ALLOCS_PER_CONTROLLER = 2 + MAX_STREAMS_PER_CONTROLLER;
+    // One alloc for the main registers, one for code loader BDL.
+    constexpr size_t MAX_ALLOCS_PER_DSP = 2;
+    // One alloc for the main registers, one for the CORB/RIRB, two for DSP,
+    // and one for each possible stream BDL.
+    constexpr size_t MAX_ALLOCS_PER_CONTROLLER = 2 + MAX_ALLOCS_PER_DSP +
+                                                 MAX_STREAMS_PER_CONTROLLER;
     constexpr size_t MAX_CONTROLLERS = 4;
     constexpr size_t VMAR_SIZE = 2 *
         ((MAX_CONTROLLERS * MAX_SIZE_PER_CONTROLLER) +
         (((MAX_CONTROLLERS * MAX_ALLOCS_PER_CONTROLLER) - 1) * (512u << 10)));
 
     GLOBAL_LOG(TRACE, "Allocating 0x%zx byte VMAR for registers.\n", VMAR_SIZE);
-    registers_ = fbl::VmarManager::Create(VMAR_SIZE);
+    registers_ = fzl::VmarManager::Create(VMAR_SIZE);
     if (registers_ == nullptr) {
         return ZX_ERR_NO_MEMORY;
     }
@@ -90,17 +70,6 @@ zx_status_t DriverVmars::Initialize() {
 
 void DriverVmars::Shutdown() {
     registers_.reset();
-}
-
-fbl::RefPtr<RefCountedBti> RefCountedBti::Create(zx::bti initiator) {
-    fbl::AllocChecker ac;
-
-    auto ret = fbl::AdoptRef(new (&ac) RefCountedBti(fbl::move(initiator)));
-    if (!ac.check()) {
-        return nullptr;
-    }
-
-    return ret;
 }
 
 zx_status_t HandleDeviceIoctl(uint32_t op,

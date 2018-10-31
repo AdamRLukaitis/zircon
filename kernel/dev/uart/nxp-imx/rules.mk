@@ -8,11 +8,10 @@ LOCAL_DIR := $(GET_LOCAL_DIR)
 MODULE := $(LOCAL_DIR)
 
 MODULE_SRCS += \
-	$(LOCAL_DIR)/uart.c
+	$(LOCAL_DIR)/uart.cpp
 
 MODULE_DEPS += \
 	kernel/dev/pdev \
 	kernel/dev/pdev/uart \
-	kernel/lib/mdi \
 
 include make/module.mk

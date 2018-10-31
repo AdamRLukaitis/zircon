@@ -7,24 +7,25 @@
 
 #include <arch/mmu.h>
 #include <assert.h>
-#include <zircon/compiler.h>
 #include <debug.h>
+#include <dev/interrupt.h>
 #include <dev/pcie_bridge.h>
 #include <dev/pcie_bus_driver.h>
 #include <dev/pcie_device.h>
 #include <err.h>
-#include <inttypes.h>
-#include <kernel/spinlock.h>
-#include <vm/arch_vm_aspace.h>
-#include <lk/init.h>
 #include <fbl/algorithm.h>
 #include <fbl/auto_lock.h>
 #include <fbl/limits.h>
-#include <dev/interrupt.h>
+#include <inttypes.h>
+#include <kernel/spinlock.h>
+#include <lk/init.h>
+#include <platform.h>
 #include <string.h>
 #include <trace.h>
-#include <platform.h>
+#include <vm/arch_vm_aspace.h>
 #include <vm/vm.h>
+#include <zircon/compiler.h>
+#include <zircon/time.h>
 #include <zircon/types.h>
 
 #include <fbl/alloc_checker.h>
@@ -281,7 +282,7 @@ zx_status_t PcieDevice::DoFunctionLevelReset() {
             break;
         }
         thread_sleep_relative(ZX_MSEC(1));
-    } while ((current_time() - start) < ZX_SEC(5));
+    } while (zx_time_sub_time(current_time(), start) < ZX_SEC(5));
 
     if (ret != ZX_OK) {
         TRACEF("Timeout waiting for pending transactions to clear the bus "
@@ -315,7 +316,7 @@ zx_status_t PcieDevice::DoFunctionLevelReset() {
             break;
         }
         thread_sleep_relative(ZX_MSEC(1));
-    } while ((current_time() - start) < ZX_SEC(5));
+    } while (zx_time_sub_time(current_time(), start) < ZX_SEC(5));
 
     if (ret == ZX_OK) {
         // 6) Software reconfigures the function and enables it for normal operation
@@ -439,7 +440,7 @@ zx_status_t PcieDevice::ProbeBarLocked(uint bar_id) {
     /* Disable either MMIO or PIO (depending on the BAR type) access while we
      * perform the probe.  We don't want the addresses written during probing to
      * conflict with anything else on the bus.  Note:  No drivers should have
-     * acccess to this device's registers during the probe process as the device
+     * access to this device's registers during the probe process as the device
      * should not have been published yet.  That said, there could be other
      * (special case) parts of the system accessing a devices registers at this
      * point in time, like an early init debug console or serial port.  Don't
@@ -540,7 +541,9 @@ zx_status_t PcieDevice::AllocateBarLocked(pcie_bar_info_t& info) {
      * it, if possible. */
     if (info.bus_addr != 0) {
         RegionAllocator* alloc = nullptr;
-        if (info.is_mmio) {
+        if (upstream->type() == PcieUpstreamNode::Type::BRIDGE && info.is_prefetchable) {
+            alloc = &upstream->pf_mmio_regions();
+        } else if (info.is_mmio) {
             /* We currently do not support preserving an MMIO region which spans
              * the 4GB mark.  If we encounter such a thing, clear out the
              * allocation and attempt to re-allocate. */
@@ -566,7 +569,7 @@ zx_status_t PcieDevice::AllocateBarLocked(pcie_bar_info_t& info) {
         TRACEF("Failed to preserve device %02x:%02x.%01x's %s window "
                "[%#" PRIx64 ", %#" PRIx64 "] Attempting to re-allocate.\n",
                bus_id_, dev_id_, func_id_,
-               info.is_mmio ? "MMIO" : "PIO",
+               info.is_mmio ? (info.is_prefetchable ? "PFMMIO" : "MMIO") : "PIO",
                info.bus_addr, info.bus_addr + info.size - 1);
         info.bus_addr = 0;
     }
@@ -613,7 +616,7 @@ zx_status_t PcieDevice::AllocateBarLocked(pcie_bar_info_t& info) {
 
             TRACEF("Failed to dynamically allocate %s BAR region (size %#" PRIx64 ") "
                    "while configuring BARs for device at %02x:%02x.%01x (res = %d)\n",
-                   info.is_mmio ? "MMIO" : "PIO", info.size,
+                   info.is_mmio ? (info.is_prefetchable ? "PFMMIO" : "MMIO") : "PIO", info.size,
                    bus_id_, dev_id_, func_id_, res);
 
             // Looks like we are out of luck.  Propagate the error up the stack
@@ -661,4 +664,10 @@ void PcieDevice::DisableLocked() {
     // Release all BAR allocations back into the pool they came from.
     for (auto& bar : bars_)
         bar.allocation = nullptr;
+}
+
+void PcieDevice::Dump() const {
+    printf("PCI: device at %02x:%02x:%02x vid:did %04x:%04x\n",
+            bus_id(), dev_id(), func_id(),
+            vendor_id(), device_id());
 }

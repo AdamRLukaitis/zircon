@@ -16,12 +16,16 @@
 #include <arch.h>
 #include <dev/display.h>
 #include <dev/hw_rng.h>
+#include <dev/interrupt.h>
 #include <dev/power.h>
 #include <dev/psci.h>
 #include <dev/uart.h>
 #include <kernel/cmdline.h>
+#include <kernel/dpc.h>
 #include <kernel/spinlock.h>
 #include <lk/init.h>
+#include <object/resource_dispatcher.h>
+#include <vm/kstack.h>
 #include <vm/physmap.h>
 #include <vm/vm.h>
 
@@ -30,35 +34,38 @@
 
 #include <target.h>
 
+#include <arch/arch_ops.h>
 #include <arch/arm64.h>
 #include <arch/arm64/mmu.h>
 #include <arch/arm64/mp.h>
+#include <arch/arm64/periphmap.h>
 #include <arch/mp.h>
 
-#include <vm/vm_aspace.h>
 #include <vm/bootreserve.h>
+#include <vm/vm_aspace.h>
 
 #include <lib/console.h>
-#include <lib/memory_limit.h>
-#if WITH_LIB_DEBUGLOG
 #include <lib/debuglog.h>
-#endif
+#include <lib/memory_limit.h>
 #if WITH_PANIC_BACKTRACE
 #include <kernel/thread.h>
 #endif
 
-#include <mdi/mdi-defs.h>
-#include <mdi/mdi.h>
+#include <libzbi/zbi-cpp.h>
 #include <pdev/pdev.h>
-#include <zircon/boot/bootdata.h>
+#include <zircon/boot/image.h>
+#include <zircon/rights.h>
+#include <zircon/syscalls/smc.h>
 #include <zircon/types.h>
 
 // Defined in start.S.
 extern paddr_t kernel_entry_paddr;
-extern paddr_t bootdata_paddr;
+extern paddr_t zbi_paddr;
 
 static void* ramdisk_base;
 static size_t ramdisk_size;
+
+static zbi_nvram_t lastlog_nvram;
 
 static uint cpu_cluster_count = 0;
 static uint cpu_cluster_cpus[SMP_CPU_MAX_CLUSTERS] = {0};
@@ -66,30 +73,20 @@ static uint cpu_cluster_cpus[SMP_CPU_MAX_CLUSTERS] = {0};
 static bool halt_on_panic = false;
 static bool uart_disabled = false;
 
-struct mem_bank {
-    size_t num;
-    uint64_t base_phys;
-    uint64_t base_virt;
-    uint64_t length;
-};
-
-// save a list of peripheral memory banks
-const size_t MAX_PERIPH_BANKS = 4;
-static mem_bank periph_banks[MAX_PERIPH_BANKS];
-static size_t num_periph_banks = 0;
-
-// all of the configured memory arenas from the bootdata
+// all of the configured memory arenas from the zbi
 // at the moment, only support 1 arena
 static pmm_arena_info_t mem_arena = {
     /* .name */ "sdram",
-    /* .flags */ PMM_ARENA_FLAG_KMAP,
+    /* .flags */ 0,
     /* .priority */ 0,
-    /* .base */ 0, // filled in by bootdata
-    /* .size */ 0, // filled in by bootdata
+    /* .base */ 0, // filled in by zbi
+    /* .size */ 0, // filled in by zbi
 };
 
-// kernel drivers node in the MDI
-static mdi_node_ref_t kernel_drivers;
+// boot items to save for mexec
+// TODO(voydanoff): more generic way of doing this that can be shared with PC platform
+static uint8_t mexec_zbi[4096];
+static size_t mexec_zbi_length = 0;
 
 static volatile int panic_started;
 
@@ -115,9 +112,7 @@ void platform_panic_start(void) {
     halt_other_cpus();
 
     if (atomic_swap(&panic_started, 1) == 0) {
-#if WITH_LIB_DEBUGLOG
         dlog_bluescreen_init();
-#endif
     }
 }
 
@@ -132,152 +127,102 @@ void* platform_get_ramdisk(size_t* size) {
 }
 
 void platform_halt_cpu(void) {
-    psci_cpu_off();
-}
-
-// One of these threads is spun up per CPU and calls halt which does not return.
-static int park_cpu_thread(void* arg) {
-    event_t* shutdown_cplt = (event_t*)arg;
-
-    mp_set_curr_cpu_online(false);
-    mp_set_curr_cpu_active(false);
-
-    arch_disable_ints();
-
-    // Let the thread on the boot CPU know that we're just about done shutting down.
-    event_signal(shutdown_cplt, true);
-
-    // This method will not return because the target cpu has halted.
-    platform_halt_cpu();
-
-    panic("control should never reach here");
-    return -1;
+    uint32_t result = psci_cpu_off();
+    // should have never returned
+    panic("psci_cpu_off returned %u\n", result);
 }
 
 void platform_halt_secondary_cpus(void) {
-    // Make sure that the current thread is pinned to the boot cpu.
-    const thread_t* current_thread = get_current_thread();
-    DEBUG_ASSERT(current_thread->cpu_affinity == (1 << BOOT_CPU_ID));
+    // Ensure the current thread is pinned to the boot CPU.
+    DEBUG_ASSERT(get_current_thread()->cpu_affinity == cpu_num_to_mask(BOOT_CPU_ID));
 
-    // Threads responsible for parking the cores.
-    thread_t* park_thread[SMP_MAX_CPUS];
-
-    // These are signalled when the CPU has almost shutdown.
-    event_t shutdown_cplt[SMP_MAX_CPUS];
-
-    for (uint i = 0; i < arch_max_num_cpus(); i++) {
-        // The boot cpu is going to be performing the remainder of the mexec
-        // for us so we don't want to park that one.
-        if (i == BOOT_CPU_ID) {
-            continue;
-        }
-
-        event_init(&shutdown_cplt[i], false, 0);
-
-        char park_thread_name[20];
-        snprintf(park_thread_name, sizeof(park_thread_name), "park %u", i);
-        park_thread[i] = thread_create(park_thread_name, park_cpu_thread,
-                                       (void*)(&shutdown_cplt[i]), DEFAULT_PRIORITY,
-                                       DEFAULT_STACK_SIZE);
-
-        thread_set_cpu_affinity(park_thread[i], cpu_num_to_mask(i));
-        thread_resume(park_thread[i]);
-    }
-
-    // Wait for all CPUs to signal that they're shutting down.
-    for (uint i = 0; i < arch_max_num_cpus(); i++) {
-        if (i == BOOT_CPU_ID) {
-            continue;
-        }
-        event_wait(&shutdown_cplt[i]);
-    }
-
-    // TODO(gkalsi): Wait for the secondaries to shutdown rather than sleeping.
-    //               After the shutdown thread shuts down the core, we never
-    //               hear from it again, so we wait 1 second to allow each
-    //               thread to shut down. This is somewhat of a hack.
-    thread_sleep_relative(ZX_SEC(1));
+    // "Unplug" online secondary CPUs before halting them.
+    cpu_mask_t primary = cpu_num_to_mask(BOOT_CPU_ID);
+    cpu_mask_t mask = mp_get_online_mask() & ~primary;
+    zx_status_t result = mp_unplug_cpu_mask(mask);
+    DEBUG_ASSERT(result == ZX_OK);
 }
 
-static void platform_start_cpu(uint cluster, uint cpu) {
+static zx_status_t platform_start_cpu(uint cluster, uint cpu) {
+    // Issue memory barrier before starting to ensure previous stores will be visible to new CPU.
+    smp_mb();
+
     uint32_t ret = psci_cpu_on(cluster, cpu, kernel_entry_paddr);
     dprintf(INFO, "Trying to start cpu %u:%u returned: %d\n", cluster, cpu, (int)ret);
-}
-
-static void* allocate_one_stack(void) {
-    uint8_t* stack = static_cast<uint8_t*>(
-        pmm_alloc_kpages(ARCH_DEFAULT_STACK_SIZE / PAGE_SIZE, nullptr, nullptr));
-    return static_cast<void*>(stack + ARCH_DEFAULT_STACK_SIZE);
+    if (ret != 0) {
+        return ZX_ERR_INTERNAL;
+    }
+    return ZX_OK;
 }
 
 static void platform_cpu_init(void) {
     for (uint cluster = 0; cluster < cpu_cluster_count; cluster++) {
         for (uint cpu = 0; cpu < cpu_cluster_cpus[cluster]; cpu++) {
             if (cluster != 0 || cpu != 0) {
-                void* sp = allocate_one_stack();
-                void* unsafe_sp = nullptr;
-#if __has_feature(safe_stack)
-                unsafe_sp = allocate_one_stack();
-#endif
-                arm64_set_secondary_sp(cluster, cpu, sp, unsafe_sp);
-                platform_start_cpu(cluster, cpu);
+                // create a stack for the cpu we're about to start
+                zx_status_t status = arm64_create_secondary_stack(cluster, cpu);
+                DEBUG_ASSERT(status == ZX_OK);
+
+                // start the cpu
+                status = platform_start_cpu(cluster, cpu);
+
+                if (status != ZX_OK) {
+                    // TODO(maniscalco): Is continuing really the right thing to do here?
+
+                    // start failed, free the stack
+                    zx_status_t status = arm64_free_secondary_stack(cluster, cpu);
+                    DEBUG_ASSERT(status == ZX_OK);
+                    continue;
+                }
+
+                // the cpu booted
+                //
+                // bootstrap thread is now responsible for freeing its stack
             }
         }
     }
 }
 
-static inline bool is_bootdata_container(void* addr) {
+static inline bool is_zbi_container(void* addr) {
     DEBUG_ASSERT(addr);
 
-    bootdata_t* header = (bootdata_t*)addr;
-
-    return header->type == BOOTDATA_CONTAINER;
+    zbi_header_t* item = (zbi_header_t*)addr;
+    return item->type == ZBI_TYPE_CONTAINER;
 }
 
-static void platform_mdi_init(const bootdata_t* section) {
-    mdi_node_ref_t root;
+static void save_mexec_zbi(zbi_header_t* item) {
+    size_t length = ZBI_ALIGN(
+        static_cast<uint32_t>(sizeof(zbi_header_t) + item->length));
+    ASSERT(sizeof(mexec_zbi) - mexec_zbi_length >= length);
 
-    if (mdi_init(section, section->length + sizeof(*section), &root) != ZX_OK) {
-        panic("mdi_init failed\n");
-    }
-
-    // find kernel drivers node and save it for later
-    if (mdi_find_node(&root, MDI_KERNEL, &kernel_drivers) != ZX_OK) {
-        panic("platform_mdi_init couldn't find kernel-drivers\n");
-    }
+    memcpy(&mexec_zbi[mexec_zbi_length], item, length);
+    mexec_zbi_length += length;
 }
 
-static void process_mem_range(const bootdata_mem_range_t* mem_range) {
+static void process_mem_range(const zbi_mem_range_t* mem_range) {
     switch (mem_range->type) {
-    case BOOTDATA_MEM_RANGE_RAM:
+    case ZBI_MEM_RANGE_RAM:
         if (mem_arena.size == 0) {
             mem_arena.base = mem_range->paddr;
             mem_arena.size = mem_range->length;
             dprintf(INFO, "mem_arena.base %#" PRIx64 " size %#" PRIx64 "\n", mem_arena.base,
                     mem_arena.size);
         } else {
+            if (mem_range->paddr) {
+                mem_arena.base = mem_range->paddr;
+                dprintf(INFO, "overriding mem arena 0 base from FDT: %#zx\n", mem_arena.base);
+            }
             // if mem_area.base is already set, then just update the size
             mem_arena.size = mem_range->length;
             dprintf(INFO, "overriding mem arena 0 size from FDT: %#zx\n", mem_arena.size);
         }
         break;
-    case BOOTDATA_MEM_RANGE_PERIPHERAL: {
-        size_t num = num_periph_banks++;
-        mem_bank* b = &periph_banks[num];
-        ASSERT(num_periph_banks <= MAX_PERIPH_BANKS);
-        ASSERT(mem_range->length && is_kernel_address(mem_range->vaddr));
-
-        b->num = num;
-        b->base_phys = mem_range->paddr;
-        b->base_virt = mem_range->vaddr;
-        b->length = mem_range->length;
-
-        auto status = arm64_boot_map_v(b->base_virt, b->base_phys, b->length,
-                                       MMU_INITIAL_MAP_DEVICE);
+    case ZBI_MEM_RANGE_PERIPHERAL: {
+        auto status = add_periph_range(mem_range->paddr, mem_range->length);
         ASSERT(status == ZX_OK);
         break;
     }
-    case BOOTDATA_MEM_RANGE_RESERVED:
+    case ZBI_MEM_RANGE_RESERVED:
         dprintf(INFO, "boot reserve mem range: phys base %#" PRIx64 " length %#" PRIx64 "\n",
                 mem_range->paddr, mem_range->length);
         boot_reserve_add_range(mem_range->paddr, mem_range->length);
@@ -288,95 +233,90 @@ static void process_mem_range(const bootdata_mem_range_t* mem_range) {
     }
 }
 
-static uint32_t process_bootsection(bootdata_t* section) {
-    switch (section->type) {
-    case BOOTDATA_MDI:
-        platform_mdi_init(section);
+static zbi_result_t process_zbi_item(zbi_header_t* item, void* payload, void* cookie) {
+    if (ZBI_TYPE_DRV_METADATA(item->type)) {
+        save_mexec_zbi(item);
+        return ZBI_RESULT_OK;
+    }
+    switch (item->type) {
+    case ZBI_TYPE_KERNEL_DRIVER:
+    case ZBI_TYPE_PLATFORM_ID:
+        // we don't process these here, but we need to save them for mexec
+        save_mexec_zbi(item);
         break;
-    case BOOTDATA_CMDLINE: {
-        if (section->length < 1) {
+    case ZBI_TYPE_CMDLINE: {
+        if (item->length < 1) {
             break;
         }
-        char* contents = reinterpret_cast<char*>(section) + sizeof(bootdata_t);
-        contents[section->length - 1] = '\0';
+        char* contents = reinterpret_cast<char*>(payload);
+        contents[item->length - 1] = '\0';
         cmdline_append(contents);
         break;
     }
-    case BOOTDATA_MEM_CONFIG: {
-        bootdata_mem_range_t* mem_range = reinterpret_cast<bootdata_mem_range_t*>(section + 1);
-        uint32_t count = section->length / (uint32_t)sizeof(bootdata_mem_range_t);
+    case ZBI_TYPE_MEM_CONFIG: {
+        zbi_mem_range_t* mem_range = reinterpret_cast<zbi_mem_range_t*>(payload);
+        uint32_t count = item->length / (uint32_t)sizeof(zbi_mem_range_t);
         for (uint32_t i = 0; i < count; i++) {
             process_mem_range(mem_range++);
         }
+        save_mexec_zbi(item);
         break;
     }
-    case BOOTDATA_CPU_CONFIG: {
-        bootdata_cpu_config_t* cpu_config = reinterpret_cast<bootdata_cpu_config_t*>(section + 1);
+    case ZBI_TYPE_CPU_CONFIG: {
+        zbi_cpu_config_t* cpu_config = reinterpret_cast<zbi_cpu_config_t*>(payload);
         cpu_cluster_count = cpu_config->cluster_count;
         for (uint32_t i = 0; i < cpu_cluster_count; i++) {
             cpu_cluster_cpus[i] = cpu_config->clusters[i].cpu_count;
         }
         arch_init_cpu_map(cpu_cluster_count, cpu_cluster_cpus);
+        save_mexec_zbi(item);
+        break;
+    }
+    case ZBI_TYPE_NVRAM: {
+        zbi_nvram_t* nvram = reinterpret_cast<zbi_nvram_t*>(payload);
+        memcpy(&lastlog_nvram, nvram, sizeof(lastlog_nvram));
+        dprintf(INFO, "boot reserve nvram range: phys base %#" PRIx64 " length %#" PRIx64 "\n",
+                nvram->base, nvram->length);
+        boot_reserve_add_range(nvram->base, nvram->length);
+        save_mexec_zbi(item);
         break;
     }
     }
 
-    return section->type;
+    return ZBI_RESULT_OK;
 }
 
-static void process_bootdata(bootdata_t* root) {
+static void process_zbi(zbi_header_t* root) {
     DEBUG_ASSERT(root);
+    zbi_result_t result;
 
-    if (root->type != BOOTDATA_CONTAINER) {
-        printf("bootdata: invalid type = %08x\n", root->type);
+    uint8_t* zbi_base = reinterpret_cast<uint8_t*>(root);
+    zbi::Zbi image(zbi_base);
+
+    // Make sure the image looks valid.
+    result = image.Check(nullptr);
+    if (result != ZBI_RESULT_OK) {
+        // TODO(gkalsi): Print something informative here?
         return;
     }
 
-    if (root->extra != BOOTDATA_MAGIC) {
-        printf("bootdata: invalid magic = %08x\n", root->extra);
-        return;
-    }
-
-    bool mdi_found = false;
-    size_t offset = sizeof(bootdata_t);
-    const size_t length = (root->length);
-
-    if (!(root->flags & BOOTDATA_FLAG_V2)) {
-        printf("bootdata: v1 no longer supported\n");
-    }
-
-    while (offset < length) {
-
-        uintptr_t ptr = reinterpret_cast<const uintptr_t>(root);
-        bootdata_t* section = reinterpret_cast<bootdata_t*>(ptr + offset);
-
-        const uint32_t type = process_bootsection(section);
-        if (BOOTDATA_MDI == type) {
-            mdi_found = true;
-        }
-
-        offset += BOOTDATA_ALIGN(sizeof(bootdata_t) + section->length);
-    }
-
-    if (!mdi_found) {
-        panic("No MDI found in ramdisk\n");
-    }
+    image.ForEach(process_zbi_item, nullptr);
 }
 
 void platform_early_init(void) {
-    // if the bootdata_paddr variable is -1, it was not set
+    // if the zbi_paddr variable is -1, it was not set
     // in start.S, so we are in a bad place.
-    if (bootdata_paddr == -1UL) {
-        panic("no bootdata_paddr!\n");
+    if (zbi_paddr == -1UL) {
+        panic("no zbi_paddr!\n");
     }
 
-    void* bootdata_vaddr = paddr_to_physmap(bootdata_paddr);
+    void* zbi_vaddr = paddr_to_physmap(zbi_paddr);
 
     // initialize the boot memory reservation system
     boot_reserve_init();
 
-    if (bootdata_vaddr && is_bootdata_container(bootdata_vaddr)) {
-        bootdata_t* header = (bootdata_t*)bootdata_vaddr;
+    if (zbi_vaddr && is_zbi_container(zbi_vaddr)) {
+        zbi_header_t* header = (zbi_header_t*)zbi_vaddr;
 
         ramdisk_base = header;
         ramdisk_size = ROUNDUP(header->length + sizeof(*header), PAGE_SIZE);
@@ -388,15 +328,19 @@ void platform_early_init(void) {
         panic("no ramdisk!\n");
     }
 
-    // walk the bootdata structure and process all the entries
-    process_bootdata(reinterpret_cast<bootdata_t*>(ramdisk_base));
+    zbi_header_t* zbi = reinterpret_cast<zbi_header_t*>(ramdisk_base);
+    // walk the zbi structure and process all the items
+    process_zbi(zbi);
+
+    // is the cmdline option to bypass dlog set ?
+    dlog_bypass_init();
 
     // bring up kernel drivers after we have mapped our peripheral ranges
-    pdev_init(&kernel_drivers);
+    pdev_init(zbi);
 
     // Serial port should be active now
 
-    // Read cmdline after processing bootdata, which may contain cmdline data.
+    // Read cmdline after processing zbi, which may contain cmdline data.
     halt_on_panic = cmdline_get_bool("kernel.halt-on-panic", false);
 
     // Check if serial should be enabled
@@ -412,22 +356,18 @@ void platform_early_init(void) {
 
     // check if a memory limit was passed in via kernel.memory-limit-mb and
     // find memory ranges to use if one is found.
-    mem_limit_ctx_t ctx;
-    zx_status_t status = mem_limit_init(&ctx);
+    zx_status_t status = memory_limit_init();
     if (status == ZX_OK) {
-        // For these ranges we're using the base physical values
-        ctx.kernel_base = get_kernel_base_phys();
-        ctx.kernel_size = get_kernel_size();
-        ctx.ramdisk_base = ramdisk_start_phys;
-        ctx.ramdisk_size = ramdisk_end_phys - ramdisk_start_phys;
-
         // Figure out and add arenas based on the memory limit and our range of DRAM
-        status = mem_limit_add_arenas_from_range(&ctx, mem_arena.base, mem_arena.size, mem_arena);
+        memory_limit_add_range(mem_arena.base, mem_arena.size, mem_arena);
+        status = memory_limit_add_arenas(mem_arena);
     }
 
     // If no memory limit was found, or adding arenas from the range failed, then add
     // the existing global arena.
     if (status != ZX_OK) {
+        dprintf(INFO, "memory limit lib returned an error (%d), falling back to default arena\n",
+                status);
         pmm_add_arena(&mem_arena);
     }
 
@@ -441,12 +381,7 @@ void platform_init(void) {
 
 // after the fact create a region to reserve the peripheral map(s)
 static void platform_init_postvm(uint level) {
-    for (auto& b : periph_banks) {
-        if (b.length == 0)
-            break;
-
-        VmAspace::kernel_aspace()->ReserveSpace("periph", b.length, b.base_virt);
-    }
+    reserve_periph_ranges();
 }
 
 LK_INIT_HOOK(platform_postvm, platform_init_postvm, LK_INIT_LEVEL_VM);
@@ -467,11 +402,11 @@ void platform_dputs_irq(const char* str, size_t len) {
 
 int platform_dgetc(char* c, bool wait) {
     if (uart_disabled) {
-        return -1;
+        return ZX_ERR_NOT_SUPPORTED;
     }
     int ret = uart_getc(wait);
-    if (ret == -1)
-        return -1;
+    if (ret < 0)
+        return ret;
     *c = static_cast<char>(ret);
     return 0;
 }
@@ -485,11 +420,11 @@ void platform_pputc(char c) {
 
 int platform_pgetc(char* c, bool wait) {
     if (uart_disabled) {
-        return -1;
+        return ZX_ERR_NOT_SUPPORTED;
     }
     int r = uart_pgetc();
-    if (r == -1) {
-        return -1;
+    if (r < 0) {
+        return r;
     }
 
     *c = static_cast<char>(r);
@@ -514,16 +449,16 @@ void platform_halt(platform_halt_action suggested_action, platform_halt_reason r
     } else if (suggested_action == HALT_ACTION_REBOOT_BOOTLOADER) {
         power_reboot(REBOOT_BOOTLOADER);
         printf("reboot-bootloader failed\n");
+    } else if (suggested_action == HALT_ACTION_REBOOT_RECOVERY) {
+        power_reboot(REBOOT_RECOVERY);
+        printf("reboot-recovery failed\n");
     } else if (suggested_action == HALT_ACTION_SHUTDOWN) {
         power_shutdown();
     }
 
-#if WITH_LIB_DEBUGLOG
-    thread_print_current_backtrace();
-    dlog_bluescreen_halt();
-#endif
-
     if (reason == HALT_REASON_SW_PANIC) {
+        thread_print_current_backtrace();
+        dlog_bluescreen_halt();
         if (!halt_on_panic) {
             power_reboot(REBOOT_NORMAL);
             printf("reboot failed\n");
@@ -543,38 +478,154 @@ void platform_halt(platform_halt_action suggested_action, platform_halt_reason r
         ;
 }
 
+typedef struct {
+    //TODO: combine with x86 nvram crashlog handling
+    //TODO: ECC for more robust crashlogs
+    uint64_t magic;
+    uint64_t length;
+    uint64_t nmagic;
+    uint64_t nlength;
+} log_hdr_t;
+
+#define NVRAM_MAGIC (0x6f8962d66b28504fULL)
+
 size_t platform_stow_crashlog(void* log, size_t len) {
-    return 0;
+    size_t max = lastlog_nvram.length - sizeof(log_hdr_t);
+    void* nvram = paddr_to_physmap(lastlog_nvram.base);
+    if (nvram == NULL) {
+        return 0;
+    }
+
+    if (log == NULL) {
+        return max;
+    }
+    if (len > max) {
+        len = max;
+    }
+
+    log_hdr_t hdr = {
+        .magic = NVRAM_MAGIC,
+        .length = len,
+        .nmagic = ~NVRAM_MAGIC,
+        .nlength = ~len,
+    };
+    memcpy(nvram, &hdr, sizeof(hdr));
+    memcpy(static_cast<char*>(nvram) + sizeof(hdr), log, len);
+    arch_clean_cache_range((uintptr_t)nvram, sizeof(hdr) + len);
+    return len;
 }
 
 size_t platform_recover_crashlog(size_t len, void* cookie,
                                  void (*func)(const void* data, size_t, size_t len, void* cookie)) {
-    return 0;
+    size_t max = lastlog_nvram.length - sizeof(log_hdr_t);
+    void* nvram = paddr_to_physmap(lastlog_nvram.base);
+    if (nvram == NULL) {
+        return 0;
+    }
+    log_hdr_t hdr;
+    memcpy(&hdr, nvram, sizeof(hdr));
+    if ((hdr.magic != NVRAM_MAGIC) || (hdr.length > max) ||
+        (hdr.nmagic != ~NVRAM_MAGIC) || (hdr.nlength != ~hdr.length)) {
+        printf("nvram-crashlog: bad header: %016lx %016lx %016lx %016lx\n",
+               hdr.magic, hdr.length, hdr.nmagic, hdr.nlength);
+        return 0;
+    }
+    if (len == 0) {
+        return hdr.length;
+    }
+    if (len > hdr.length) {
+        len = hdr.length;
+    }
+    func(static_cast<char*>(nvram) + sizeof(hdr), 0, len, cookie);
+
+    // invalidate header so we don't get a stale crashlog
+    // on future boots
+    hdr.magic = 0;
+    memcpy(nvram, &hdr, sizeof(hdr));
+    return hdr.length;
 }
 
-zx_status_t platform_mexec_patch_bootdata(uint8_t* bootdata, const size_t len) {
+zx_status_t platform_mexec_patch_zbi(uint8_t* zbi, const size_t len) {
+    size_t offset = 0;
+
+    // copy certain boot items provided by the bootloader or boot shim
+    // to the mexec zbi
+    zbi::Zbi image(zbi, len);
+    while (offset < mexec_zbi_length) {
+        zbi_header_t* item = reinterpret_cast<zbi_header_t*>(mexec_zbi + offset);
+
+        zbi_result_t status;
+        status = image.AppendSection(item->length, item->type, item->extra,
+                                     item->flags,
+                                     reinterpret_cast<uint8_t*>(item + 1));
+
+        if (status != ZBI_RESULT_OK)
+            return ZX_ERR_INTERNAL;
+
+        offset += ZBI_ALIGN(
+            static_cast<uint32_t>(sizeof(zbi_header_t)) + item->length);
+    }
+
     return ZX_OK;
+}
+
+void platform_mexec_prep(uintptr_t new_bootimage_addr, size_t new_bootimage_len) {
+    DEBUG_ASSERT(!arch_ints_disabled());
+    DEBUG_ASSERT(mp_get_online_mask() == cpu_num_to_mask(BOOT_CPU_ID));
 }
 
 void platform_mexec(mexec_asm_func mexec_assembly, memmov_ops_t* ops,
                     uintptr_t new_bootimage_addr, size_t new_bootimage_len,
                     uintptr_t entry64_addr) {
+    DEBUG_ASSERT(arch_ints_disabled());
+    DEBUG_ASSERT(mp_get_online_mask() == cpu_num_to_mask(BOOT_CPU_ID));
+
     paddr_t kernel_src_phys = (paddr_t)ops[0].src;
     paddr_t kernel_dst_phys = (paddr_t)ops[0].dst;
 
-    // check to see if the kernel is packaged as a bootdata container
-    bootdata_t* header = (bootdata_t *)paddr_to_physmap(kernel_src_phys);
-    if (header[0].type == BOOTDATA_CONTAINER && header[1].type == BOOTDATA_KERNEL) {
-        bootdata_kernel_t* kernel_header = (bootdata_kernel_t *)&header[2];
+    // check to see if the kernel is packaged as a zbi container
+    zbi_header_t* header = (zbi_header_t*)paddr_to_physmap(kernel_src_phys);
+    if (header[0].type == ZBI_TYPE_CONTAINER && header[1].type == ZBI_TYPE_KERNEL_ARM64) {
+        zbi_kernel_t* kernel_header = (zbi_kernel_t*)&header[2];
         // add offset from kernel header to entry point
-        kernel_dst_phys += kernel_header->entry64;
+        kernel_dst_phys += kernel_header->entry;
     }
     // else just jump to beginning of kernel image
 
     mexec_assembly((uintptr_t)new_bootimage_addr, 0, 0, arm64_get_boot_el(), ops,
-                  (void *)kernel_dst_phys);
+                   (void*)kernel_dst_phys);
 }
 
 bool platform_serial_enabled(void) {
     return !uart_disabled && uart_present();
 }
+
+bool platform_early_console_enabled() {
+    return false;
+}
+
+// Initialize Resource system after the heap is initialized.
+static void arm_resource_dispatcher_init_hook(unsigned int rl) {
+    // 64 bit address space for MMIO on ARM64
+    zx_status_t status = ResourceDispatcher::InitializeAllocator(ZX_RSRC_KIND_MMIO, 0,
+                                                                 UINT64_MAX);
+    if (status != ZX_OK) {
+        printf("Resources: Failed to initialize MMIO allocator: %d\n", status);
+    }
+    // Set up IRQs based on values from the GIC
+    status = ResourceDispatcher::InitializeAllocator(ZX_RSRC_KIND_IRQ,
+                                                     interrupt_get_base_vector(),
+                                                     interrupt_get_max_vector());
+    if (status != ZX_OK) {
+        printf("Resources: Failed to initialize IRQ allocator: %d\n", status);
+    }
+    // Set up SMC valid service call range
+    status = ResourceDispatcher::InitializeAllocator(ZX_RSRC_KIND_SMC,
+                                                     0,
+                                                     ARM_SMC_SERVICE_CALL_NUM_MAX + 1);
+    if (status != ZX_OK) {
+        printf("Resources: Failed to initialize SMC allocator: %d\n", status);
+    }
+}
+
+LK_INIT_HOOK(arm_resource_init, arm_resource_dispatcher_init_hook, LK_INIT_LEVEL_HEAP);

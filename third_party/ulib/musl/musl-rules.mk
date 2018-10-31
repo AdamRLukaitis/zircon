@@ -31,6 +31,7 @@ LOCAL_CFLAGS := \
     -U_ALL_SOURCE \
     -Wno-sign-compare \
     -Werror=incompatible-pointer-types \
+    -Wno-implicit-fallthrough \
 
 ifeq ($(call TOBOOL,$(USE_CLANG)),true)
 LOCAL_COMPILEFLAGS += -fno-stack-protector
@@ -44,11 +45,6 @@ endif
 LOCAL_CFLAGS += -ffreestanding
 
 LOCAL_SRCS := \
-    $(LOCAL_DIR)/zircon/get_startup_handle.c \
-    $(LOCAL_DIR)/zircon/getentropy.c \
-    $(LOCAL_DIR)/zircon/internal.c \
-    $(LOCAL_DIR)/zircon/thrd_get_zx_handle.c \
-    $(LOCAL_DIR)/pthread/allocate.c \
     $(LOCAL_DIR)/pthread/pthread_atfork.c \
     $(LOCAL_DIR)/pthread/pthread_attr_destroy.c \
     $(LOCAL_DIR)/pthread/pthread_attr_get.c \
@@ -235,8 +231,8 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/src/env/unsetenv.c \
     $(LOCAL_DIR)/src/errno/__errno_location.c \
     $(LOCAL_DIR)/src/errno/strerror.c \
-    $(LOCAL_DIR)/src/exit/__cxa_thread_atexit.c \
     $(LOCAL_DIR)/src/exit/_Exit.c \
+    $(LOCAL_DIR)/src/exit/__cxa_thread_atexit.c \
     $(LOCAL_DIR)/src/exit/abort.c \
     $(LOCAL_DIR)/src/exit/assert.c \
     $(LOCAL_DIR)/src/exit/at_quick_exit.c \
@@ -437,7 +433,6 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/src/misc/initgroups.c \
     $(LOCAL_DIR)/src/misc/issetugid.c \
     $(LOCAL_DIR)/src/misc/lockf.c \
-    $(LOCAL_DIR)/src/misc/mntent.c \
     $(LOCAL_DIR)/src/misc/openpty.c \
     $(LOCAL_DIR)/src/misc/ptsname.c \
     $(LOCAL_DIR)/src/misc/pty.c \
@@ -533,7 +528,6 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/src/network/serv.c \
     $(LOCAL_DIR)/src/passwd/fgetgrent.c \
     $(LOCAL_DIR)/src/passwd/fgetpwent.c \
-    $(LOCAL_DIR)/src/passwd/fgetspent.c \
     $(LOCAL_DIR)/src/passwd/getgr_a.c \
     $(LOCAL_DIR)/src/passwd/getgr_r.c \
     $(LOCAL_DIR)/src/passwd/getgrent.c \
@@ -543,14 +537,9 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/src/passwd/getpw_r.c \
     $(LOCAL_DIR)/src/passwd/getpwent.c \
     $(LOCAL_DIR)/src/passwd/getpwent_a.c \
-    $(LOCAL_DIR)/src/passwd/getspent.c \
-    $(LOCAL_DIR)/src/passwd/getspnam.c \
-    $(LOCAL_DIR)/src/passwd/getspnam_r.c \
-    $(LOCAL_DIR)/src/passwd/lckpwdf.c \
     $(LOCAL_DIR)/src/passwd/nscd_query.c \
     $(LOCAL_DIR)/src/passwd/putgrent.c \
     $(LOCAL_DIR)/src/passwd/putpwent.c \
-    $(LOCAL_DIR)/src/passwd/putspent.c \
     $(LOCAL_DIR)/src/prng/__rand48_step.c \
     $(LOCAL_DIR)/src/prng/__seed48.c \
     $(LOCAL_DIR)/src/prng/drand48.c \
@@ -594,10 +583,6 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/src/process/waitpid.c \
     $(LOCAL_DIR)/src/regex/fnmatch.c \
     $(LOCAL_DIR)/src/regex/glob.c \
-    $(LOCAL_DIR)/third_party/tre/regcomp.c \
-    $(LOCAL_DIR)/third_party/tre/regerror.c \
-    $(LOCAL_DIR)/third_party/tre/regexec.c \
-    $(LOCAL_DIR)/third_party/tre/tre-mem.c \
     $(LOCAL_DIR)/src/sched/affinity.c \
     $(LOCAL_DIR)/src/sched/sched_cpucount.c \
     $(LOCAL_DIR)/src/sched/sched_get_priority_max.c \
@@ -624,8 +609,6 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/src/signal/sigdelset.c \
     $(LOCAL_DIR)/src/signal/sigemptyset.c \
     $(LOCAL_DIR)/src/signal/sigfillset.c \
-    $(LOCAL_DIR)/src/signal/sighold.c \
-    $(LOCAL_DIR)/src/signal/sigignore.c \
     $(LOCAL_DIR)/src/signal/siginterrupt.c \
     $(LOCAL_DIR)/src/signal/sigisemptyset.c \
     $(LOCAL_DIR)/src/signal/sigismember.c \
@@ -635,10 +618,8 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/src/signal/sigpending.c \
     $(LOCAL_DIR)/src/signal/sigprocmask.c \
     $(LOCAL_DIR)/src/signal/sigqueue.c \
-    $(LOCAL_DIR)/src/signal/sigrelse.c \
     $(LOCAL_DIR)/src/signal/sigrtmax.c \
     $(LOCAL_DIR)/src/signal/sigrtmin.c \
-    $(LOCAL_DIR)/src/signal/sigset.c \
     $(LOCAL_DIR)/src/signal/sigsuspend.c \
     $(LOCAL_DIR)/src/signal/sigtimedwait.c \
     $(LOCAL_DIR)/src/signal/sigwait.c \
@@ -801,6 +782,7 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/src/thread/__timedwait.c \
     $(LOCAL_DIR)/src/thread/__tls_get_addr.c \
     $(LOCAL_DIR)/src/thread/__wait.c \
+    $(LOCAL_DIR)/src/thread/allocate.c \
     $(LOCAL_DIR)/src/thread/call_once.c \
     $(LOCAL_DIR)/src/thread/cnd_broadcast.c \
     $(LOCAL_DIR)/src/thread/cnd_destroy.c \
@@ -959,6 +941,14 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/third_party/math/tanf.c \
     $(LOCAL_DIR)/third_party/math/tgammal.c \
     $(LOCAL_DIR)/third_party/smoothsort/qsort.c \
+    $(LOCAL_DIR)/third_party/tre/regcomp.c \
+    $(LOCAL_DIR)/third_party/tre/regerror.c \
+    $(LOCAL_DIR)/third_party/tre/regexec.c \
+    $(LOCAL_DIR)/third_party/tre/tre-mem.c \
+    $(LOCAL_DIR)/zircon/getentropy.c \
+    $(LOCAL_DIR)/zircon/internal.c \
+    $(LOCAL_DIR)/zircon/take_startup_handle.c \
+    $(LOCAL_DIR)/zircon/thrd_get_zx_handle.c \
 
 # These refer to access.
 #    $(LOCAL_DIR)/pthread/sem_open.c \
@@ -1066,6 +1056,7 @@ MODULE_LIBS := system/ulib/zircon
 MODULE_STATIC_LIBS := \
     system/ulib/ldmsg \
     system/ulib/runtime \
+    system/ulib/sync \
 
 # At link time and in DT_SONAME, musl is known as libc.so.  But the
 # (only) place it needs to be installed at runtime is where the

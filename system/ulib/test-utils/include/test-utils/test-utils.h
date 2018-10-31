@@ -22,19 +22,6 @@
 
 __BEGIN_CDECLS
 
-// Sleep interval in the watchdog thread. Make this short so we don't need to
-// wait too long when tearing down in the success case.  This is especially
-// helpful when running "while /boot/test/sys/debugger-test; do true; done".
-#define TU_WATCHDOG_TICK_DURATION ((int64_t)ZX_MSEC(50))  // 0.05 seconds
-
-// Number of sleep intervals until the watchdog fires.
-// Note: There is a tension here between not wanting to block a complete test
-// run because of a hung test for too long, vs not wanting to introduce
-// flakyness into a test run because of a loaded machine (not uncommon on
-// bots). One solution would be a runtime determination of what a good value
-// is.
-#define TU_WATCHDOG_TIMEOUT_TICKS 100  // 5 seconds
-
 // These malloc-using calls will terminate the process on ENOMEM.
 void* tu_malloc(size_t size);
 void* tu_calloc(size_t nmemb, size_t size);
@@ -46,7 +33,7 @@ char* tu_asprintf(const char* fmt, ...);
 // |what| is typically the name of the function that had the syscall failure,
 // but it can include more descriptive text as desired.
 
-void tu_fatal(const char *what, zx_status_t status);
+void tu_fatal(const char *what, zx_status_t status) __NO_RETURN;
 
 // A wrapper on zx_handle_close.
 
@@ -85,13 +72,11 @@ void tu_thread_create_c11(thrd_t* thread, thrd_start_t entry, void* arg,
 
 // A wrapper on zx_object_wait_many that can be easier to call.
 // |num_objects| is the number of elements in |handles,signals,pending|.
-// Also, this applies |timeout_scale| to |timeout|.
 
 zx_status_t tu_wait(uint32_t num_objects,
                     const zx_handle_t* handles,
                     const zx_signals_t* signals,
-                    zx_signals_t* pending,
-                    zx_time_t timeout);
+                    zx_signals_t* pending);
 
 // A wrapper on zx_channel_create.
 
@@ -180,9 +165,17 @@ zx_handle_t tu_get_thread(zx_handle_t proc, zx_koid_t tid);
 
 zx_info_thread_t tu_thread_get_info(zx_handle_t thread);
 
+// Return the state of |thread|, one of ZX_THREAD_STATE_*.
+
+uint32_t tu_thread_get_state(zx_handle_t thread);
+
 // Return true if |thread| is dying or dead.
 
 bool tu_thread_is_dying_or_dead(zx_handle_t thread);
+
+// Kill |task|.
+
+void tu_task_kill(zx_handle_t task);
 
 // Run a program and wait for it to exit.
 // Any error in trying to run the program is fatal.
@@ -202,15 +195,5 @@ int tu_run_command(const char* progname, const char* cmd);
 // Returns the previous value.
 
 int tu_set_timeout_scale(int scale);
-
-// Start the watchdog thread.
-// If the watchdog timer expires before it is canceled with
-// tu_watchdog_cancel() then the test fails and the process is terminated.
-
-void tu_watchdog_start(void);
-
-// Cancel the watchdog and "join" the watchdog thread.
-
-void tu_watchdog_cancel(void);
 
 __END_CDECLS

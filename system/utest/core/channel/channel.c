@@ -244,6 +244,18 @@ static bool channel_close_test(void) {
     END_TEST;
 }
 
+static bool channel_peer_closed_test(void) {
+    BEGIN_TEST;
+
+    zx_handle_t channel[2];
+    ASSERT_EQ(zx_channel_create(0, &channel[0], &channel[1]), ZX_OK, "");
+    ASSERT_EQ(zx_handle_close(channel[1]), ZX_OK, "");
+    ASSERT_EQ(zx_object_signal_peer(channel[0], 0u, ZX_USER_SIGNAL_0), ZX_ERR_PEER_CLOSED, "");
+    ASSERT_EQ(zx_handle_close(channel[0]), ZX_OK, "");
+
+    END_TEST;
+}
+
 static bool channel_non_transferable(void) {
     BEGIN_TEST;
 
@@ -266,7 +278,7 @@ static bool channel_non_transferable(void) {
     EXPECT_EQ(write_result, ZX_ERR_ACCESS_DENIED, "message_write should fail with ACCESS_DENIED");
 
     zx_status_t close_result = zx_handle_close(non_transferable_event);
-    EXPECT_EQ(close_result, ZX_OK, "");
+    EXPECT_EQ(close_result, ZX_ERR_BAD_HANDLE, "");
 
     END_TEST;
 }
@@ -282,10 +294,10 @@ static bool channel_duplicate_handles(void) {
 
     zx_handle_t dup_handles[2] = { event, event };
     zx_status_t write_result = zx_channel_write(channel[0], 0u, NULL, 0, dup_handles, 2u);
-    EXPECT_EQ(write_result, ZX_ERR_INVALID_ARGS, "message_write should fail with ZX_ERR_INVALID_ARGS");
+    EXPECT_EQ(write_result, ZX_ERR_BAD_HANDLE, "message_write should fail with ZX_ERR_INVALID_ARGS");
 
     zx_status_t close_result = zx_handle_close(event);
-    EXPECT_EQ(close_result, ZX_OK, "");
+    EXPECT_EQ(close_result, ZX_ERR_BAD_HANDLE, "");
     close_result = zx_handle_close(channel[0]);
     EXPECT_EQ(close_result, ZX_OK, "");
     close_result = zx_handle_close(channel[1]);
@@ -469,279 +481,281 @@ static bool channel_may_discard(void) {
     END_TEST;
 }
 
+#define MAX_DELAY 4
 
-static uint32_t call_test_done = 0;
-static mtx_t call_test_lock;
-static cnd_t call_test_cvar;
-
-// we use txid_t for cmd here so that the test
-// works with both 32bit and 64bit txids
-typedef struct {
-    zx_txid_t txid;
-    zx_txid_t cmd;
-    uint32_t bit;
-    unsigned action;
-    zx_status_t expect;
-    zx_status_t expect_rs;
-    const char* name;
-    const char* err;
-    int val;
-    zx_handle_t h;
-    thrd_t t;
-} ccargs_t;
-
-#define SRV_SEND_HANDLE   0x0001
-#define SRV_SEND_DATA     0x0002
-#define SRV_DISCARD       0x0004
-#define CLI_SHORT_WAIT    0x0100
-#define CLI_RECV_HANDLE   0x0200
-#define CLI_SEND_HANDLE   0x0400
-
-#define TEST_SHORT_WAIT_MS    250
-#define TEST_LONG_WAIT_MS   10000
-
-static int call_client(void* _args) {
-    ccargs_t* ccargs = _args;
-    zx_channel_call_args_t args;
-
-    zx_txid_t data[2];
-    zx_handle_t txhandle = 0;
-    zx_handle_t rxhandle = 0;
-
-    zx_status_t r = ZX_OK;
-    if (ccargs->action & CLI_SEND_HANDLE) {
-        if ((r = zx_event_create(0, &txhandle)) != ZX_OK) {
-            ccargs->err = "failed to create event";
-            goto done;
-        }
-    }
-
-    args.wr_bytes = ccargs;
-    args.wr_handles = &txhandle;
-    args.wr_num_bytes = sizeof(ccargs_t);
-    args.wr_num_handles = (ccargs->action & CLI_SEND_HANDLE) ? 1 : 0;
-    args.rd_bytes = data;
-    args.rd_handles = &rxhandle;
-    args.rd_num_bytes = sizeof(data);
-    args.rd_num_handles = (ccargs->action & CLI_RECV_HANDLE) ? 1 : 0;
-
-    uint32_t act_bytes = 0xffffffff;
-    uint32_t act_handles = 0xffffffff;
-
-    zx_time_t deadline = (ccargs->action & CLI_SHORT_WAIT) ?
-        zx_deadline_after(ZX_MSEC(TEST_SHORT_WAIT_MS)) :
-        zx_deadline_after(ZX_MSEC(TEST_LONG_WAIT_MS));
-
-    zx_status_t rs = ZX_OK;
-    if ((r = zx_channel_call(ccargs->h, 0, deadline, &args, &act_bytes, &act_handles, &rs)) != ccargs->expect) {
-        ccargs->err = "channel call returned";
-        ccargs->val = r;
-    }
-    if (txhandle && (r < 0)) {
-        zx_handle_close(txhandle);
-    }
-    if (rxhandle) {
-        zx_handle_close(rxhandle);
-    }
-    if (r == ZX_ERR_CALL_FAILED) {
-        if (ccargs->expect_rs && (ccargs->expect_rs != rs)) {
-            ccargs->err = "read_status not what was expected";
-            ccargs->val = ccargs->expect_rs;
-        } else {
-            r = ZX_OK;
-        }
-    } else if (r == ZX_OK) {
-        if (act_bytes != sizeof(data)) {
-            ccargs->err = "expected 8 bytes";
-            ccargs->val = act_bytes;
-        } else if (ccargs->txid != data[0]) {
-            ccargs->err = "mismatched txid";
-            ccargs->val = data[0];
-        } else if (ccargs->cmd != data[1]) {
-            ccargs->err = "mismatched cmd";
-            ccargs->val = data[1];
-        } else if ((ccargs->action & CLI_RECV_HANDLE) && (act_handles != 1)) {
-            ccargs->err = "recv handle missing";
-        }
-    } else if ((r == ZX_ERR_TIMED_OUT) && (ccargs->action & CLI_SHORT_WAIT)) {
-        // We expect CLI_SHORT_WAIT calls to time-out.
-        r = ZX_OK;
-    }
-
-done:
-    mtx_lock(&call_test_lock);
-    call_test_done |= ccargs->bit;
-    cnd_broadcast(&call_test_cvar);
-    mtx_unlock(&call_test_lock);
-    return (int) r;
-}
-
-static ccargs_t ccargs[] = {
-    {
-        .name = "too large reply",
-        .action = SRV_SEND_DATA,
-        .expect = ZX_ERR_CALL_FAILED,
-        .expect_rs = ZX_ERR_BUFFER_TOO_SMALL,
-    },
-    {
-        .name = "no reply (short wait)",
-        .action = SRV_DISCARD | CLI_SHORT_WAIT,
-        .expect = ZX_ERR_TIMED_OUT,
-    },
-    {
-        .name = "reply handle",
-        .action = SRV_SEND_HANDLE | CLI_RECV_HANDLE,
-    },
-    {
-        .name = "unwanted reply handle",
-        .action = SRV_SEND_HANDLE,
-        .expect = ZX_ERR_CALL_FAILED,
-        .expect_rs = ZX_ERR_BUFFER_TOO_SMALL,
-    },
-    {
-        .name = "send-handle",
-        .action = CLI_SEND_HANDLE,
-    },
-    {
-        .name = "send-recv-handle",
-        .action = CLI_SEND_HANDLE | CLI_RECV_HANDLE | SRV_SEND_HANDLE,
-    },
-    {
-        .name = "basic",
-    },
-    {
-        .name = "basic",
-    },
-    {
-        .name = "basic",
-    },
-    {
-        .name = "basic",
-    },
+enum {
+    OP_ECHO = 0,
+    OP_NOTXID,
+    OP_RUNT,
+    OP_TOOBIG,
+    OP_DELAY,
+    OP_IGNORE,
+    OP_HANDLE,
+    OP_SHUTDOWN,
+    OP_POSTSHUTDOWN
 };
 
-static int call_server(void* ptr) {
+typedef struct {
+    zx_txid_t txid;
+    uint32_t op;
+    unsigned data[8];
+} msg_t;
+
+static int cc_server(void* ptr) {
+    zx_status_t status;
     zx_handle_t h = (zx_handle_t) (uintptr_t) ptr;
 
-    ccargs_t msg[countof(ccargs)];
-    memset(msg, 0, sizeof(msg));
+    uint32_t pending[MAX_DELAY];
+    size_t pending_count = 0;
 
-    zx_status_t status;
+    for (;;) {
+        zx_object_wait_one(h, ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED,
+                           ZX_TIME_INFINITE, NULL);
 
-    // received the expected number of messages
-    for (unsigned n = 0; n < countof(ccargs); n++) {
-        zx_object_wait_one(h, ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED, ZX_TIME_INFINITE, NULL);
-
-        uint32_t bytes = sizeof(msg[0]);
-        uint32_t handles = 1;
-        zx_handle_t handle = 0;
-        status = zx_channel_read(h, 0, &msg[n], &handle, bytes, handles, &bytes, &handles);
+        msg_t msg;
+        zx_handle_t handle = ZX_HANDLE_INVALID;
+        uint32_t bc = 0, hc = 0;
+        status = zx_channel_read(h, 0, &msg, &handle, sizeof(msg), 1, &bc, &hc);
         if (status != ZX_OK) {
-            fprintf(stderr, "call_server() read failed\n");
-            return (int) status;
+            fprintf(stderr, "call_server() read failed: %d\n", status);
+            return -1;
         }
-        if (handle) {
-            status = zx_handle_close(handle);
-            if (status != ZX_OK)
-                return (int) status;
+
+        if (bc != sizeof(msg)) {
+            msg.op = OP_RUNT;
         }
-    }
 
-    // reply to them in reverse order received
-    for (unsigned n = 0; n < countof(ccargs); n++) {
-        ccargs_t* m = &msg[countof(ccargs) - n - 1];
+        if ((hc > 0) && (msg.op != OP_HANDLE)) {
+            fprintf(stderr, "call_server() got unexpected handle on op %u\n", msg.op);
+            return -1;
+        }
 
-        if (m->action & SRV_DISCARD) {
+        switch(msg.op) {
+        case OP_RUNT:
+            memset(msg.data, 0xee, sizeof(msg.data));
+            break;
+        case OP_ECHO:
+        case OP_TOOBIG:
+        case OP_HANDLE:
+            break;
+        case OP_DELAY:
+            for (unsigned n = 0; n < pending_count; n++) {
+                if (pending[n] == msg.txid) {
+                    fprintf(stderr, "call_server() kernel re-used a txid!\n");
+                    return -1;
+                }
+            }
+            pending[pending_count++] = msg.txid;
+            if (pending_count < MAX_DELAY) {
+                continue;
+            }
+            while (pending_count > 0) {
+                pending_count--;
+                msg.op = OP_DELAY;
+                msg.txid = pending[pending_count];
+                status = zx_channel_write(h, 0, &msg, sizeof(msg), NULL, 0);
+                if (status != ZX_OK) {
+                    fprintf(stderr, "call_server() replay write failed: %d\n", status);
+                    return -1;
+                }
+            }
             continue;
+        case OP_IGNORE:
+            continue;
+        case OP_SHUTDOWN:
+            zx_handle_close(h);
+            return 0;
         }
 
-        zx_txid_t data[4];
-        data[0] = m->txid;
-        data[1] = m->txid * 31337;
-        data[2] = 0x22222222;
-        data[3] = 0x33333333;
-
-        uint32_t bytes = sizeof(zx_txid_t) * ((m->action & SRV_SEND_DATA) ? 4 : 2);
-        uint32_t handles = (m->action & SRV_SEND_HANDLE) ? 1 : 0;
-        zx_handle_t handle = 0;
-        if (handles) {
-            zx_event_create(0, &handle);
-        }
-        status = zx_channel_write(h, 0, data, bytes, &handle, handles);
+        status = zx_channel_write(h, 0, &msg, sizeof(msg), &handle, hc);
         if (status != ZX_OK) {
-            fprintf(stderr, "call_server() write failed\n");
-            return (int) status;
+            fprintf(stderr, "call_server() write failed: %d\n", status);
+            return -1;
         }
     }
     return 0;
 }
 
+static unsigned fillbyte = 1;
+
+static zx_status_t do_cc(zx_handle_t cli, uint32_t op) {
+    msg_t msg;
+    msg_t rsp;
+    zx_handle_t h = ZX_HANDLE_INVALID;
+
+    unsigned fill = (op == OP_RUNT) ? 0xee : fillbyte++;
+
+    msg.txid = 0x11223344;
+    msg.op = op;
+    memset(msg.data, fill, sizeof(msg.data));
+
+    zx_channel_call_args_t args = {
+        .wr_bytes = &msg,
+        .wr_handles = &h,
+        .rd_bytes = &rsp,
+        .rd_handles = &h,
+        .wr_num_bytes = sizeof(msg),
+        .wr_num_handles = 0,
+        .rd_num_bytes = sizeof(msg),
+        .rd_num_handles = 0,
+    };
+
+    switch (op) {
+    case OP_RUNT:
+        args.wr_num_bytes = sizeof(zx_txid_t);
+        break;
+    case OP_NOTXID:
+        args.wr_num_bytes = 1;
+        break;
+    case OP_TOOBIG:
+        args.rd_num_bytes = sizeof(zx_txid_t);
+        break;
+    case OP_HANDLE:
+        if (zx_event_create(0, &h) != ZX_OK) {
+            return -1005;
+        }
+        args.wr_num_handles = 1;
+        args.rd_num_handles = 1;
+    }
+
+    zx_status_t status;
+    uint32_t bytes = 0;
+    uint32_t handles = 0;
+
+    zx_time_t timeout = (op == OP_IGNORE) ? 0 : ZX_TIME_INFINITE;
+
+    status = zx_channel_call(cli, 0, timeout, &args, &bytes, &handles);
+    if (status != ZX_OK) {
+        if ((op == OP_IGNORE) && (status == ZX_ERR_TIMED_OUT)) {
+            return ZX_OK;
+        }
+        if ((op == OP_NOTXID) && (status == ZX_ERR_INVALID_ARGS)) {
+            return ZX_OK;
+        }
+        if ((op == OP_SHUTDOWN) && (status == ZX_ERR_PEER_CLOSED)) {
+            return ZX_OK;
+        }
+        if ((op == OP_POSTSHUTDOWN) && (status == ZX_ERR_PEER_CLOSED)) {
+            return ZX_OK;
+        }
+        if ((op == OP_TOOBIG) && (status == ZX_ERR_BUFFER_TOO_SMALL)) {
+            return ZX_OK;
+        }
+        fprintf(stderr, "do_cc: channel_call() status=%d\n", status);
+        return -1000;
+    }
+
+    if (handles == 1) {
+        zx_handle_close(h);
+        if (op != OP_HANDLE) {
+            return -1004;
+        }
+    }
+
+    if ((bytes != sizeof(msg)) || ((op != OP_HANDLE) && (handles != 0))) {
+        return -1001;
+    }
+
+    if (msg.op != rsp.op) {
+        return -1002;
+    }
+
+    switch (op) {
+    case OP_HANDLE:
+    case OP_ECHO:
+    case OP_RUNT:
+        if (memcmp(msg.data, rsp.data, sizeof(msg.data))) {
+            return -1003;
+        }
+        break;
+    }
+
+    return ZX_OK;
+}
+
+static int cc_client(void* ptr) {
+    zx_handle_t cli = (zx_handle_t) (uintptr_t) ptr;
+    return do_cc(cli, OP_DELAY);
+}
+
 static bool channel_call(void) {
     BEGIN_TEST;
-
-    ASSERT_EQ(mtx_init(&call_test_lock, mtx_plain), thrd_success, "");
-    ASSERT_EQ(cnd_init(&call_test_cvar), thrd_success, "");
 
     zx_handle_t cli, srv;
     ASSERT_EQ(zx_channel_create(0, &cli, &srv), ZX_OK, "");
 
     // start test server
     thrd_t srvt;
-    ASSERT_EQ(thrd_create(&srvt, call_server, (void*) (uintptr_t) srv), thrd_success, "");
+    ASSERT_EQ(thrd_create(&srvt, cc_server, (void*) (uintptr_t) srv), thrd_success, "");
 
-    // start test clients
-    uint32_t waitfor = 0;
-    for (unsigned n = 0; n < countof(ccargs); n++) {
-        ccargs[n].txid = 0x11223300 | n;
-        ccargs[n].cmd = ccargs[n].txid * 31337;
-        ccargs[n].h = cli;
-        ccargs[n].bit = 1 << n;
-        waitfor |= ccargs[n].bit;
-        ASSERT_EQ(thrd_create(&ccargs[n].t, call_client, &ccargs[n]), thrd_success, "");
-    }
+    ASSERT_EQ(do_cc(cli, OP_ECHO), ZX_OK, "");
+    ASSERT_EQ(do_cc(cli, OP_RUNT), ZX_OK, "");
+    ASSERT_EQ(do_cc(cli, OP_TOOBIG), ZX_OK, "");
+    ASSERT_EQ(do_cc(cli, OP_ECHO), ZX_OK, "");
+    ASSERT_EQ(do_cc(cli, OP_NOTXID), ZX_OK, "");
+    ASSERT_EQ(do_cc(cli, OP_IGNORE), ZX_OK, "");
+    ASSERT_EQ(do_cc(cli, OP_HANDLE), ZX_OK, "");
 
-    // wait for all tests to finish or timeout
-    struct timespec until;
-    clock_gettime(CLOCK_REALTIME, &until);
-    until.tv_sec += 5;
-    int r = 0;
-    while (r == 0) {
-        mtx_lock(&call_test_lock);
-        if (call_test_done == waitfor) {
-            r = -1;
-        } else {
-            r = cnd_timedwait(&call_test_cvar, &call_test_lock, &until);
-            EXPECT_EQ(r, thrd_success, "wait failed");
-        }
-        mtx_unlock(&call_test_lock);
-    }
+    // do four OP_DELAYs on four different threads
+    thrd_t a,b,c,d;
+    ASSERT_EQ(thrd_create(&a, cc_client, (void*) (uintptr_t) cli), thrd_success, "");
+    ASSERT_EQ(thrd_create(&b, cc_client, (void*) (uintptr_t) cli), thrd_success, "");
+    ASSERT_EQ(thrd_create(&c, cc_client, (void*) (uintptr_t) cli), thrd_success, "");
+    ASSERT_EQ(thrd_create(&d, cc_client, (void*) (uintptr_t) cli), thrd_success, "");
 
-    // report tests that failed or failed to complete
-    mtx_lock(&call_test_lock);
-    for (unsigned n = 0; n < countof(ccargs); n++) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "#%d '%s' did not complete", n, ccargs[n].name);
-        EXPECT_EQ(ccargs[n].bit & call_test_done, ccargs[n].bit, buf);
-        snprintf(buf, sizeof(buf), "'%s' did not succeed", ccargs[n].name);
-        EXPECT_NULL(ccargs[n].err, buf);
-        if (ccargs[n].err) {
-            unittest_printf_critical("call_client #%d: %s: %s %d (0x%x)\n", n, ccargs[n].name,
-                                     ccargs[n].err, ccargs[n].val, ccargs[n].val);
-        }
-    }
-    mtx_unlock(&call_test_lock);
+    // server will respond in opposite order once it has received all of them
 
-    int retv = 0;
-    EXPECT_EQ(thrd_join(srvt, &retv), thrd_success, "");
-    EXPECT_EQ(retv, 0, "");
+    // verify that they all finish
+    int r;
+    ASSERT_EQ(thrd_join(a, &r), thrd_success, "");
+    ASSERT_EQ(r, 0, "");
+    ASSERT_EQ(thrd_join(b, &r), thrd_success, "");
+    ASSERT_EQ(r, 0, "");
+    ASSERT_EQ(thrd_join(c, &r), thrd_success, "");
+    ASSERT_EQ(r, 0, "");
+    ASSERT_EQ(thrd_join(d, &r), thrd_success, "");
+    ASSERT_EQ(r, 0, "");
 
-    for (unsigned n = 0; n < countof(ccargs); n++) {
-        EXPECT_EQ(thrd_join(ccargs[n].t, &retv), thrd_success, "");
-        EXPECT_EQ(retv, 0, "");
-    }
+    ASSERT_EQ(do_cc(cli, OP_SHUTDOWN), ZX_OK, "");
 
-    zx_handle_close(cli);
-    zx_handle_close(srv);
+    ASSERT_EQ(do_cc(cli, OP_POSTSHUTDOWN), ZX_OK, "");
+    ASSERT_EQ(zx_handle_close(cli), ZX_OK, "");
+
+    END_TEST;
+}
+
+static bool channel_call_consumes_handles(void) {
+    BEGIN_TEST;
+
+    zx_handle_t cli, srv;
+    ASSERT_EQ(zx_channel_create(0, &cli, &srv), ZX_OK, "");
+    ASSERT_EQ(zx_handle_close(srv), ZX_OK, "");
+
+    zx_handle_t h;
+    ASSERT_EQ(zx_event_create(0, &h), ZX_OK, "");
+
+    uint8_t msg[64];
+    memset(msg, 0, sizeof(msg));
+
+    zx_channel_call_args_t args = {
+        .wr_bytes = &msg,
+        .wr_handles = &h,
+        .rd_bytes = &msg,
+        .rd_handles = NULL,
+        .wr_num_bytes = sizeof(msg),
+        .wr_num_handles = 1,
+        .rd_num_bytes = sizeof(msg),
+        .rd_num_handles = 0,
+    };
+
+    uint32_t act_bytes = 0xffffffff;
+    uint32_t act_handles = 0xffffffff;
+
+    zx_status_t r = zx_channel_call(cli, 42, ZX_TIME_INFINITE, &args, &act_bytes,
+                                    &act_handles);
+
+    ASSERT_EQ(r, ZX_ERR_INVALID_ARGS, "");
+    ASSERT_EQ(zx_handle_close(h), ZX_ERR_BAD_HANDLE, "");
 
     END_TEST;
 }
@@ -794,14 +808,12 @@ static bool channel_call2(void) {
     uint32_t act_bytes = 0xffffffff;
     uint32_t act_handles = 0xffffffff;
 
-    zx_status_t rs = ZX_OK;
     zx_status_t r = zx_channel_call(cli, 0, zx_deadline_after(ZX_MSEC(1000)), &args, &act_bytes,
-                                    &act_handles, &rs);
+                                    &act_handles);
 
     zx_handle_close(cli);
 
-    EXPECT_EQ(r, ZX_ERR_CALL_FAILED, "");
-    EXPECT_EQ(rs, ZX_ERR_PEER_CLOSED, "");
+    EXPECT_EQ(r, ZX_ERR_PEER_CLOSED, "");
 
     int retv = 0;
     EXPECT_EQ(thrd_join(t, &retv), thrd_success, "");
@@ -825,13 +837,12 @@ static bool channel_call2(void) {
 static zx_status_t zx_channel_call_finish(zx_time_t deadline,
                                           const zx_channel_call_args_t* args,
                                           uint32_t* actual_bytes,
-                                          uint32_t* actual_handles,
-                                          zx_status_t* read_status) {
+                                          uint32_t* actual_handles) {
     uintptr_t vdso_base =
         (uintptr_t)&zx_handle_close - VDSO_SYSCALL_zx_handle_close;
     uintptr_t fnptr = vdso_base + VDSO_SYSCALL_zx_channel_call_finish;
     return (*(__typeof(zx_channel_call_finish)*)fnptr)(
-        deadline, args, actual_bytes, actual_handles, read_status);
+        deadline, args, actual_bytes, actual_handles);
 }
 
 static bool bad_channel_call_finish(void) {
@@ -853,12 +864,10 @@ static bool bad_channel_call_finish(void) {
     uint32_t act_handles = 0xffffffff;
 
     // Call channel_call_finish without having had a channel call interrupted
-    zx_status_t rs = ZX_OK;
     zx_status_t r = zx_channel_call_finish(zx_deadline_after(ZX_MSEC(1000)), &args, &act_bytes,
-                                           &act_handles, &rs);
+                                           &act_handles);
 
     EXPECT_EQ(r, ZX_ERR_BAD_STATE, "");
-    EXPECT_EQ(rs, ZX_OK, ""); // The syscall leaves this unchanged.
 
     END_TEST;
 }
@@ -896,7 +905,7 @@ static bool channel_disallow_write_to_self(void) {
     EXPECT_EQ(zx_channel_write(channel[0], 0, NULL, 0, &channel[0], 1),
               ZX_ERR_NOT_SUPPORTED, "");
     // Clean up.
-    EXPECT_EQ(zx_handle_close(channel[0]), ZX_OK, "");
+    EXPECT_EQ(zx_handle_close(channel[0]), ZX_ERR_BAD_HANDLE, "");
     EXPECT_EQ(zx_handle_close(channel[1]), ZX_OK, "");
 
     END_TEST;
@@ -949,20 +958,90 @@ static bool channel_read_etc(void) {
     END_TEST;
 }
 
+// Write and read messages of different sizes.
+static bool channel_write_different_sizes(void) {
+    BEGIN_TEST;
+    zx_handle_t channel[2];
+    ASSERT_EQ(zx_channel_create(0, &channel[0], &channel[1]), ZX_OK, "");
+
+    char* data_to_send = malloc(ZX_CHANNEL_MAX_MSG_BYTES);
+    ASSERT_NE(NULL, data_to_send, "");
+    char* data_recv = malloc(ZX_CHANNEL_MAX_MSG_BYTES);
+    ASSERT_NE(NULL, data_recv, "");
+
+    uint32_t actual_bytes = 0;
+    uint32_t actual_handles = 0;
+
+    // Send a bunch of messages, each with a random number of bytes and handles.  num_msgs should be
+    // large enough to provide decent coverage and small enough so the test executes quickly.
+    const size_t num_msgs = 1000;
+    srand(0);
+    for (size_t i = 0; i < num_msgs; ++i) {
+        uint32_t num_bytes = rand() % ZX_CHANNEL_MAX_MSG_BYTES;
+        uint32_t num_handles = rand() % ZX_CHANNEL_MAX_MSG_HANDLES;
+
+        // Create some handle pairs.  Keep one of each pair in |handles|, put the other in
+        // |handles_to_send|.
+        zx_handle_t handles[ZX_CHANNEL_MAX_MSG_HANDLES] = {0};
+        zx_handle_t handles_to_send[ZX_CHANNEL_MAX_MSG_HANDLES] = {0};
+        zx_handle_t handles_recv[ZX_CHANNEL_MAX_MSG_HANDLES] = {0};
+        for (size_t i = 0; i < ZX_CHANNEL_MAX_MSG_HANDLES; ++i) {
+            if (i < num_handles) {
+                ASSERT_EQ(zx_channel_create(0u, &handles[i], &handles_to_send[i]), ZX_OK, "");
+            } else {
+                handles[i] = ZX_HANDLE_INVALID;
+                handles_to_send[i] = ZX_HANDLE_INVALID;
+            }
+            handles_recv[i] = ZX_HANDLE_INVALID;
+        }
+
+        memset(data_to_send, i % 256, i);
+        ASSERT_EQ(zx_channel_write(channel[0], 0u, data_to_send, num_bytes, handles_to_send,
+                                   num_handles),
+                  ZX_OK, "");
+        memset(data_recv, 0, ZX_CHANNEL_MAX_MSG_BYTES);
+        ASSERT_EQ(zx_channel_read(channel[1], 0u, data_recv, handles_recv, ZX_CHANNEL_MAX_MSG_BYTES,
+                                  num_handles, &actual_bytes, &actual_handles),
+                  ZX_OK, "");
+        ASSERT_EQ(actual_bytes, num_bytes, "");
+        ASSERT_EQ(actual_handles, num_handles, "");
+        ASSERT_EQ(memcmp(data_to_send, data_recv, num_bytes), 0, "");
+
+        // Close them.
+        for (size_t i = 0; i< ZX_CHANNEL_MAX_MSG_HANDLES; ++i) {
+            if (i < num_handles) {
+                ASSERT_EQ(zx_handle_close(handles_recv[i]), ZX_OK, "");
+                ASSERT_EQ(zx_handle_close(handles[i]), ZX_OK, "");
+            } else {
+                ASSERT_EQ(handles_recv[i], ZX_HANDLE_INVALID, "");
+            }
+        }
+    }
+
+    free(data_recv);
+    free(data_to_send);
+    EXPECT_EQ(zx_handle_close(channel[0]), ZX_OK, "");
+    EXPECT_EQ(zx_handle_close(channel[1]), ZX_OK, "");
+    END_TEST;
+}
+
 BEGIN_TEST_CASE(channel_tests)
 RUN_TEST(channel_test)
 RUN_TEST(channel_read_error_test)
 RUN_TEST(channel_close_test)
+RUN_TEST(channel_peer_closed_test)
 RUN_TEST(channel_non_transferable)
 RUN_TEST(channel_duplicate_handles)
 RUN_TEST(channel_multithread_read)
 RUN_TEST(channel_may_discard)
 RUN_TEST(channel_call)
+RUN_TEST(channel_call_consumes_handles)
 RUN_TEST(channel_call2)
 RUN_TEST(bad_channel_call_finish)
 RUN_TEST(channel_nest)
 RUN_TEST(channel_disallow_write_to_self)
 RUN_TEST(channel_read_etc)
+RUN_TEST(channel_write_different_sizes)
 END_TEST_CASE(channel_tests)
 
 #ifndef BUILD_COMBINED_TESTS

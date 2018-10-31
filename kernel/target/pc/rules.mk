@@ -18,12 +18,4 @@ MODULE_DEPS := \
 
 include make/module.mk
 
-# build kernel-bootdata for fuchisa build
-KERNEL_BOOTDATA := $(BUILDDIR)/pc-kernel-bootdata.bin
-$(KERNEL_BOOTDATA): $(MKBOOTFS)
-	$(call BUILDECHO,generating $@)
-	@$(MKDIR)
-	$(NOECHO)$(MKBOOTFS) -o $@ --empty
-
-kernel-only: $(KERNEL_BOOTDATA)
-kernel: $(KERNEL_BOOTDATA)
+include $(LOCAL_DIR)/multiboot/rules.mk

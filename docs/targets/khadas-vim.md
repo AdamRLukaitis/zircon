@@ -1,7 +1,6 @@
-# Zircon on Khadas VIM and VIM2 Boards
+# Zircon on Khadas VIM2 Board
 
-This document describes running Zircon on the Khadas VIM and VIM2 boards.
-These two boards are very similar so one document can describe how to work with both of them.
+This document describes running Zircon on the Khadas VIM2 board.
 Additional documentation can be found at [docs.khadas.com](http://docs.khadas.com/)
 
 When describing the location of buttons, pins and other items on the board,
@@ -14,6 +13,12 @@ Before you start, you need a heat sink. A passive chip heat sink will allow you
 to run 2 cores out of 8 at full speed before reaching 80C, the critical
 temperature at which cores have to be throttled down.
 
+## Setup
+
+- USB C port: Connect to host. Provides power and `fastboot`.
+- Ethernet: Connect cable directly to board (do not use a USB ethernet adapter).
+- HDMI: Optional. Connects to display.
+- Serial Console: Optional but very useful. See next section.
 
 ## Serial Console
 
@@ -25,104 +30,92 @@ On the front row of the header:
 - 3rd from right: RX (Orange wire)
 - 4th from right: Ground (Black wire)
 
-In [this diagram](http://docs.khadas.com/basics/VimGPIOPinout/) of the 40 pin header,
+For FTDI serial cables with black, white, red and green wires, use this:
+
+- 2nd from right: TX (White wire)
+- 3rd from right: RX (Green wire)
+- 4th from right: Ground (Black wire)
+
+In [this diagram](http://docs.khadas.com/vim1/GPIOPinout.html) of the 40 pin header,
 these correspond to pins 17 through 19.
 
 ## Buttons
 
-The VIM and VIM2 have 3 buttons on the left side of the board.
-On the board schematic, SW1 (also labelled 'R') is the switch closest to the USB
-plug. This is the reset switch. The other two switches are general purpose,
-SW3 (farthest away from the USB plug, labelled P on the schematic) can
-be used for entering flashing mode.  If SW3 is held down while the
-board is reset or power cycled, the bootloader will enter flashing mode
-instead of booting the kernel normally.
+The VIM2 has 3 buttons on the left side of the board. On the board schematic, SW1 (switch closest to the USB plug) is the reset switch. SW3 (farthest away from the USB plug on the schematic) can be used for entering flashing mode. If SW3 is held down while the board is reset or power cycled , the bootloader will enter flashing mode instead of booting the kernel normally.
 
-## Preparing the Bootloader
+## VIM2 Bootloader
 
-The VIM boards come preinstalled with a u-boot bootloader.
-By default the bootloader is configured to use a proprietary Amlogic protocol
-for flashing the board.
-Unfortunately the Amlogic "update" flashing tool is not widely available
-and only runs on Linux. So we will configure the bootloader to use the fastboot
-protocol instead.
+Booting Zircon on the VIM2 requires a custom bootloader.
 
-To configure u-boot to use fastboot, reset the board and repeatedly press the
-space bar in the serial console. This should get you into u-boot's shell:
+### [Googlers only]
+Within Google, this can be found at [go/vim2-bootloader](http://go/vim2-bootloader). Download the .bin file and follow the instructions in the document.
 
-```
-kvim#
-```
+If you are not at Google, hang on until we make this publicly available.
 
-In the u-boot shell, type:
+To find out what version of the bootloader you have, grep for "fuchsia-bootloader"
+in the kernel boot log. You should see something like: "cmdline: fuchsia-bootloader=0.04"
 
-```
-setenv update fastboot
-saveenv
-```
-
-After resetting the board again, the board should enter fastboot mode when booting
-if you press SW3 for long enough (first you will see "detect upgrade key" on the
-serial console and if you hold it longer, you will see "USB RESET/SPEED ENUM).
-At this point, the board can be flashed with the Android fastboot tool.  
-If the board fails to enter fastboot mode, your board might have an older version of u-boot
-that does not support it.  
-In that case you will need to update the u-boot on your board.
-Otherwise, skip ahead to "Building Zircon"
-
-The steps are described [here](http://docs.khadas.com/develop/BuildAndroid/),
-but below are some simplified instructions that do not assume you checked out a full Android
-source tree, and use the Amlogic "update" tool instead of tftp:
-
-```
-# install toolchains:
-sudo apt install gcc-aarch64-linux-gnu
-sudo apt install gcc-arm-none-eabi
-
-# get the u-boot sources:
-git clone https://github.com/khadas/u-boot
-cd u-boot
-git checkout origin/Nougat
-
-# for VIM
-make kvim_defconfig
-# for VIM2
-make kvim2_defconfig
-
-make -j8 CROSS_COMPILE=aarch64-linux-gnu-
-
-# flash the new u-boot using the Amlogic "update" tool:
-update partition bootloader fip/u-boot.bin
-```
 ## Building Zircon
 
 ```
 make -j32 arm64
 ```
 
+Be sure you've already set up your network before proceeding to the next step.
+
 ## Flashing Zircon
 
-First enter fastboot mode by resetting the board with SW3 depressed. If you want
-to flash zedboot instead of zircon, please add '-m' on the command line.
-Then:
+First enter fastboot mode by holding down SW3 (leftmost button), pressing SW1 (rightmost button) quickly and keeping pressing SW3 for a few seconds.
 
-### VIM
+If you are working from the zircon layer, cd to the zircon directory and run:
 
 ```
-scripts/flash-vim [-m]
+scripts/flash-vim2 -m
 ```
 
-### VIM2
+The device should boot into zedboot by default.
+
+If you are working from the garnet layer of above, run the following:
 
 ```
-scripts/flash-vim2 [-m]
+fx flash vim2 --pave
 ```
+
+In order to get into zedboot you can reboot into the recovery:
+
+```
+dm reboot-recovery
+```
+
+Alternatively, you can get to zedboot by resetting your vim2 by pressing SW1(rightmost button) quickly and keeping pressing SW2 for a few seconds.
 
 ### netbooting
 
+To netboot zircon, enter zedboot and run the following under the zircon directory:
+
 ```
-zircon: ./build-x86/tools/bootserver ./build-arm64/zircon.bin ./build-arm64/vim2-bootdata.bin
-garnet: fx set x64 --netboot; fx build; fx boot vim2
+scripts/netboot-zircon ./build-arm64
 ```
 
+To netboot garnet, run the following under the fuchsia directory:
 
+```
+fx set arm64 --netboot && fx full-build && fx boot --netboot -- -1
+```
+
+You should be able to see "Issued boot command to ..." message printed out if this step is successful.
+
+### Paving
+
+Paving is available from garnet layers and above. Run the following under the fuchsia directory:
+
+```
+fx set arm64 && fx full-build && fx boot arm -1
+```
+
+### Fuchsia logo
+
+To update the boot splash screen to be the Fuchsia logo, do this in fastboot mode:
+```
+fastboot flash logo kernel/target/arm64/board/vim2/firmware/logo.img
+```

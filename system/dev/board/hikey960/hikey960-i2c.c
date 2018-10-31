@@ -4,7 +4,7 @@
 
 #include <ddk/debug.h>
 #include <ddk/device.h>
-#include <ddk/protocol/platform-defs.h>
+#include <ddk/platform-defs.h>
 #include <soc/hi3660/hi3660-hw.h>
 
 #include <limits.h>
@@ -46,24 +46,18 @@ static const pbus_dev_t i2c_dev = {
     .vid = PDEV_VID_GENERIC,
     .pid = PDEV_PID_GENERIC,
     .did = PDEV_DID_DW_I2C,
-    .mmios = i2c_mmios,
+    .mmio_list = i2c_mmios,
     .mmio_count = countof(i2c_mmios),
-    .irqs = i2c_irqs,
+    .irq_list = i2c_irqs,
     .irq_count = countof(i2c_irqs),
 };
 
 zx_status_t hikey960_i2c_init(hikey960_t* bus) {
-    zx_status_t status = pbus_device_add(&bus->pbus, &i2c_dev, PDEV_ADD_PBUS_DEVHOST);
+    zx_status_t status = pbus_protocol_device_add(&bus->pbus, ZX_PROTOCOL_I2C_IMPL, &i2c_dev);
     if (status != ZX_OK) {
-        zxlogf(ERROR, "hikey960_i2c_init: pbus_device_add failed: %d\n", status);
+        zxlogf(ERROR, "hikey960_i2c_init: pbus_protocol_device_add failed: %d\n", status);
         return status;
     }
 
-    status = pbus_wait_protocol(&bus->pbus, ZX_PROTOCOL_I2C_IMPL);
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "hikey960_i2c_init: pbus_wait_protocol failed: %d\n", status);
-        return status;
-    }
-
-    return device_get_protocol(bus->parent, ZX_PROTOCOL_I2C_IMPL, &bus->i2c);
+    return ZX_OK;
 }

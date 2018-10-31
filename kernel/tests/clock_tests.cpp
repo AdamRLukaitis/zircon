@@ -18,7 +18,7 @@
 #include <stdio.h>
 #include <zircon/types.h>
 
-void clock_tests(void) {
+int clock_tests(int, const cmd_args*, uint32_t) {
     uint64_t c;
     zx_time_t t2;
 
@@ -37,7 +37,7 @@ void clock_tests(void) {
             t2 = current_time();
             //printf("%llu %llu\n", last, t2);
             if (t2 < last) {
-                printf("WARNING: time ran backwards: %" PRIu64 " < %" PRIu64 "\n", t2, last);
+                printf("WARNING: time ran backwards: %" PRIi64 " < %" PRIi64 "\n", t2, last);
                 last = t2;
                 continue;
             }
@@ -62,8 +62,6 @@ void clock_tests(void) {
         printf("measuring cpu clock against current_time() on cpu %u\n", cpu);
 
         thread_set_cpu_affinity(get_current_thread(), cpu_num_to_mask(cpu));
-        mp_reschedule(cpu_num_to_mask(cpu), 0);
-        thread_yield();
 
         for (int i = 0; i < 3; i++) {
             uint64_t cycles = arch_cycle_count();
@@ -76,6 +74,6 @@ void clock_tests(void) {
     }
 
     thread_set_cpu_affinity(get_current_thread(), old_affinity);
-    mp_reschedule(CPU_MASK_ALL, 0);
-    thread_yield();
+
+    return 0;
 }

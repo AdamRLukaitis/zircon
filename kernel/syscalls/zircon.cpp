@@ -23,7 +23,7 @@
 #include <object/handle.h>
 #include <object/log_dispatcher.h>
 #include <object/process_dispatcher.h>
-#include <object/resources.h>
+#include <object/resource.h>
 #include <object/thread_dispatcher.h>
 
 #include <fbl/alloc_checker.h>
@@ -41,13 +41,16 @@
 constexpr size_t kMaxCPRNGDraw = ZX_CPRNG_DRAW_MAX_LEN;
 constexpr size_t kMaxCPRNGSeed = ZX_CPRNG_ADD_ENTROPY_MAX_LEN;
 
+// zx_status_t zx_nanosleep
 zx_status_t sys_nanosleep(zx_time_t deadline) {
-    LTRACEF("nseconds %" PRIu64 "\n", deadline);
+    LTRACEF("nseconds %" PRIi64 "\n", deadline);
 
-    if (deadline == 0ull) {
+    if (deadline <= 0) {
         thread_yield();
         return ZX_OK;
     }
+
+    ThreadDispatcher::AutoBlocked by(ThreadDispatcher::Blocked::SLEEPING);
 
     // This syscall is declared as "blocking" in syscalls.abigen, so a higher
     // layer will automatically retry if we return ZX_ERR_INTERNAL_INTR_RETRY.
@@ -60,7 +63,7 @@ zx_status_t sys_nanosleep(zx_time_t deadline) {
 // update pvclock too.
 fbl::atomic<int64_t> utc_offset;
 
-uint64_t sys_clock_get(uint32_t clock_id) {
+zx_time_t sys_clock_get(zx_clock_t clock_id) {
     switch (clock_id) {
     case ZX_CLOCK_MONOTONIC:
         return current_time();
@@ -74,7 +77,32 @@ uint64_t sys_clock_get(uint32_t clock_id) {
     }
 }
 
-zx_status_t sys_clock_adjust(zx_handle_t hrsrc, uint32_t clock_id, int64_t offset) {
+// zx_status_t zx_clock_get_new
+zx_status_t sys_clock_get_new(zx_clock_t clock_id, user_out_ptr<zx_time_t> out_time) {
+    zx_time_t time;
+    switch (clock_id) {
+    case ZX_CLOCK_MONOTONIC:
+        time = current_time();
+        break;
+    case ZX_CLOCK_UTC:
+        time = current_time() + utc_offset.load();
+        break;
+    case ZX_CLOCK_THREAD:
+        time = ThreadDispatcher::GetCurrent()->runtime_ns();
+        break;
+    default:
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    return out_time.copy_to_user(time);
+}
+
+zx_time_t sys_clock_get_monotonic() {
+    return current_time();
+}
+
+// zx_status_t zx_clock_adjust
+zx_status_t sys_clock_adjust(zx_handle_t hrsrc, zx_clock_t clock_id, int64_t offset) {
     // TODO(ZX-971): finer grained validation
     zx_status_t status;
     if ((status = validate_resource(hrsrc, ZX_RSRC_KIND_ROOT)) < 0) {
@@ -92,6 +120,7 @@ zx_status_t sys_clock_adjust(zx_handle_t hrsrc, uint32_t clock_id, int64_t offse
     }
 }
 
+// zx_status_t zx_event_create
 zx_status_t sys_event_create(uint32_t options, user_out_handle* event_out) {
     LTRACEF("options 0x%x\n", options);
 
@@ -112,14 +141,15 @@ zx_status_t sys_event_create(uint32_t options, user_out_handle* event_out) {
     return result;
 }
 
+// zx_status_t zx_eventpair_create
 zx_status_t sys_eventpair_create(uint32_t options,
                                  user_out_handle* out0,
                                  user_out_handle* out1) {
-    if (options != 0u)  // No options defined/supported yet.
+    if (options != 0u) // No options defined/supported yet.
         return ZX_ERR_NOT_SUPPORTED;
 
     auto up = ProcessDispatcher::GetCurrent();
-    zx_status_t res = up->QueryPolicy(ZX_POL_NEW_EVPAIR);
+    zx_status_t res = up->QueryPolicy(ZX_POL_NEW_EVENTPAIR);
     if (res != ZX_OK)
         return res;
 
@@ -135,8 +165,18 @@ zx_status_t sys_eventpair_create(uint32_t options,
     return result;
 }
 
-zx_status_t sys_log_create(uint32_t options, user_out_handle* out) {
+// zx_status_t zx_debuglog_create
+zx_status_t sys_debuglog_create(zx_handle_t rsrc, uint32_t options,
+                                user_out_handle* out) {
     LTRACEF("options 0x%x\n", options);
+
+    // TODO(ZX-2184) Require a non-INVALID handle.
+    if (rsrc != ZX_HANDLE_INVALID) {
+        // TODO(ZX-971): finer grained validation
+        zx_status_t status = validate_resource(rsrc, ZX_RSRC_KIND_ROOT);
+        if (status != ZX_OK)
+            return status;
+    }
 
     // create a Log dispatcher
     fbl::RefPtr<Dispatcher> dispatcher;
@@ -155,15 +195,7 @@ zx_status_t sys_log_create(uint32_t options, user_out_handle* out) {
     return out->make(fbl::move(dispatcher), rights);
 }
 
-zx_status_t sys_debuglog_create(zx_handle_t rsrc, uint32_t options,
-                                user_out_handle* out) {
-    zx_status_t status = validate_resource(rsrc, ZX_RSRC_KIND_ROOT);
-    if (status != ZX_OK)
-        return status;
-
-    return sys_log_create(options, out);
-}
-
+// zx_status_t zx_debuglog_write
 zx_status_t sys_debuglog_write(zx_handle_t log_handle, uint32_t options,
                                user_in_ptr<const void> ptr, size_t len) {
     LTRACEF("log handle %x, opt %x, ptr 0x%p, len %zu\n", log_handle, options, ptr.get(), len);
@@ -188,6 +220,7 @@ zx_status_t sys_debuglog_write(zx_handle_t log_handle, uint32_t options,
     return log->Write(options, buf, len);
 }
 
+// zx_status_t zx_debuglog_read
 zx_status_t sys_debuglog_read(zx_handle_t log_handle, uint32_t options,
                               user_out_ptr<void> ptr, size_t len) {
     LTRACEF("log handle %x, opt %x, ptr 0x%p, len %zu\n", log_handle, options, ptr.get(), len);
@@ -213,36 +246,35 @@ zx_status_t sys_debuglog_read(zx_handle_t log_handle, uint32_t options,
     return static_cast<zx_status_t>(actual);
 }
 
+// zx_status_t zx_log_write
 zx_status_t sys_log_write(zx_handle_t log_handle, uint32_t len, user_in_ptr<const void> ptr, uint32_t options) {
     return sys_debuglog_write(log_handle, options, ptr, len);
 }
 
+// zx_status_t zx_log_read
 zx_status_t sys_log_read(zx_handle_t log_handle, uint32_t len, user_out_ptr<void> ptr, uint32_t options) {
     return sys_debuglog_read(log_handle, options, ptr, len);
 }
 
-zx_status_t sys_cprng_draw(user_out_ptr<void> buffer, size_t len, user_out_ptr<size_t> actual) {
+// zx_status_t zx_cprng_draw_once
+zx_status_t sys_cprng_draw_once(user_out_ptr<void> buffer, size_t len) {
     if (len > kMaxCPRNGDraw)
         return ZX_ERR_INVALID_ARGS;
 
     uint8_t kernel_buf[kMaxCPRNGDraw];
-    // Ensure we get rid of the stack copy of the random data as this function
-    // returns.
+    // Ensure we get rid of the stack copy of the random data as this function returns.
     explicit_memory::ZeroDtor<uint8_t> zero_guard(kernel_buf, sizeof(kernel_buf));
 
     auto prng = crypto::GlobalPRNG::GetInstance();
     ASSERT(prng->is_thread_safe());
-    prng->Draw(kernel_buf, static_cast<int>(len));
+    prng->Draw(kernel_buf, len);
 
     if (buffer.copy_array_to_user(kernel_buf, len) != ZX_OK)
         return ZX_ERR_INVALID_ARGS;
-    zx_status_t status = actual.copy_to_user(len);
-    if (status != ZX_OK)
-        return status;
-
     return ZX_OK;
 }
 
+// zx_status_t zx_cprng_add_entropy
 zx_status_t sys_cprng_add_entropy(user_in_ptr<const void> buffer, size_t len) {
     if (len > kMaxCPRNGSeed)
         return ZX_ERR_INVALID_ARGS;
@@ -257,7 +289,7 @@ zx_status_t sys_cprng_add_entropy(user_in_ptr<const void> buffer, size_t len) {
 
     auto prng = crypto::GlobalPRNG::GetInstance();
     ASSERT(prng->is_thread_safe());
-    prng->AddEntropy(kernel_buf, static_cast<int>(len));
+    prng->AddEntropy(kernel_buf, len);
 
     return ZX_OK;
 }

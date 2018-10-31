@@ -7,9 +7,15 @@ Device Hosts, Device Coordinator and the driver and device lifecycles.
 
 ## Directory structure
 
-Zircon drivers are found under [system/dev](../../system/dev). They are
-grouped by a device class. Device classes are defined in
+Zircon drivers are found under [system/dev](../../system/dev).
+They are grouped based on the protocols they implement.
+The driver protocols are defined in
 [ddk/include/ddk/protodefs.h](../../system/ulib/ddk/include/ddk/protodefs.h).
+For example, a USB ethernet driver goes in [system/dev/ethernet](../../system/dev/ethernet)
+rather than [system/dev/usb](../../system/dev/usb) because it implements an ethernet protocol.
+However, drivers that implement the USB stack are in [system/dev/usb](../../system/dev/usb)
+because they implement USB protocols.
+
 In the driver's `rules.mk`, the `MODULE_TYPE` should
 be `driver`. This will install the driver shared lib in `/boot/driver/`.
 
@@ -205,12 +211,14 @@ its parent instead of an ioctl.
 
 ## Isolate devices
 
-Devices that are added with `DEVICE_ADD_MUST_ISOLATE` spawn a new devhost. The
-device exists in both the parent devhost and as the root of the new devhost.
-The driver is provided a channel in `create()` when it creates the proxy
-device, or the “bottom half” that runs in the new devhost. The proxy device
-should cache this channel for when it needs to communicate with the top half,
-for example if it needs to call API on the parent device.
+Devices that are added with `DEVICE_ADD_MUST_ISOLATE` spawn a new proxy devhost.
+The device exists in both the parent devhost and as the root of the new devhost.
+Devmgr attempts to load <driver>.proxy.so into this proxy devhost. For example,
+PCI is supplied by libpci.so so devmgr would look to load libpci.proxy.so. The
+driver is provided a channel in `create()` when it creates the proxy device
+(the “bottom half” that runs in the new devhost). The proxy device should cache
+this channel for when it needs to communicate with the top half (e.g. if
+it needs to call API on the parent device).
 
 `rxrpc()` is invoked on the top half when this channel is written to by the
 bottom half. There is no common wire protocol for this channel. For an

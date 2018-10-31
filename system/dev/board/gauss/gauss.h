@@ -4,13 +4,10 @@
 
 #pragma once
 
-#include <ddk/io-buffer.h>
-#include <ddk/protocol/clk.h>
-#include <ddk/protocol/gpio.h>
-#include <ddk/protocol/i2c.h>
+#include <ddk/mmio-buffer.h>
+#include <ddk/protocol/gpio-impl.h>
 #include <ddk/protocol/iommu.h>
 #include <ddk/protocol/platform-bus.h>
-#include <ddk/protocol/usb-mode-switch.h>
 #include <soc/aml-a113/a113-clocks.h>
 
 #include <threads.h>
@@ -28,18 +25,16 @@ enum {
     BTI_AUDIO_IN,
     BTI_AUDIO_OUT,
     BTI_USB_XHCI,
+    BTI_AML_RAW_NAND,
 };
 
 typedef struct {
-    platform_bus_protocol_t pbus;
     zx_device_t* parent;
-    gpio_protocol_t gpio;
-    i2c_protocol_t i2c;
-    usb_mode_switch_protocol_t usb_mode_switch;
-    clk_protocol_t clk;
+    pbus_protocol_t pbus;
+    gpio_impl_protocol_t gpio;
     iommu_protocol_t iommu;
     zx_handle_t bti_handle;
-    io_buffer_t usb_phy;
+    mmio_buffer_t usb_phy;
     zx_handle_t usb_phy_irq_handle;
     thrd_t phy_irq_thread;
     a113_clk_dev_t *clocks;
@@ -56,10 +51,12 @@ zx_status_t gauss_i2c_init(gauss_bus_t* bus);
 
 // gauss-usb.c
 zx_status_t gauss_usb_init(gauss_bus_t* bus);
-zx_status_t gauss_usb_set_mode(gauss_bus_t* bus, usb_mode_t mode);
 
 // gauss-clk.c
 zx_status_t gauss_clk_init(gauss_bus_t* bus);
 
 // gauss-pcie.c
 zx_status_t gauss_pcie_init(gauss_bus_t* bus);
+
+// gauss-raw_nand.c
+zx_status_t gauss_raw_nand_init(gauss_bus_t* bus);

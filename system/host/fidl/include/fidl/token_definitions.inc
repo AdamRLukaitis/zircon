@@ -10,13 +10,14 @@
 #endif
 
 #if !defined(KEYWORD)
-#define KEYWORD(Name, Spelling) TOKEN(Name)
+#define KEYWORD(Name, Spelling)
 #endif
 
 // Control and whitespace
 TOKEN(NotAToken)
 TOKEN(EndOfFile)
 TOKEN(Comment)
+TOKEN(DocComment)
 
 // Identifiers and constants
 TOKEN(Identifier)
@@ -48,8 +49,6 @@ KEYWORD(As, "as")
 KEYWORD(Library, "library")
 KEYWORD(Using, "using")
 
-KEYWORD(Status, "status")
-
 KEYWORD(Array, "array")
 KEYWORD(Handle, "handle")
 KEYWORD(Request, "request")
@@ -60,6 +59,7 @@ KEYWORD(Const, "const")
 KEYWORD(Enum, "enum")
 KEYWORD(Interface, "interface")
 KEYWORD(Struct, "struct")
+KEYWORD(Table, "table")
 KEYWORD(Union, "union")
 
 KEYWORD(Bool, "bool")
@@ -76,6 +76,8 @@ KEYWORD(Float64, "float64")
 
 KEYWORD(True, "true")
 KEYWORD(False, "false")
+
+KEYWORD(Reserved, "reserved")
 
 #undef KEYWORD
 #undef TOKEN

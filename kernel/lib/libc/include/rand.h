@@ -12,10 +12,9 @@
 
 __BEGIN_CDECLS
 
+#define RAND_MAX (0x7fffffff)
+
 int rand(void);
 void srand(unsigned int seed);
-
-/* non standard extension to add some entropy to the seed */
-void rand_add_entropy(const void *buf, size_t len);
 
 __END_CDECLS

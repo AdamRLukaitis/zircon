@@ -57,6 +57,16 @@ SystemInstruction::SystemInstruction(uint32_t iss) {
     read = BIT(iss, 0);
 }
 
+SgiRegister::SgiRegister(uint64_t sgir) {
+    aff3 = static_cast<uint8_t>(BITS_SHIFT(sgir, 55, 48));
+    aff2 = static_cast<uint8_t>(BITS_SHIFT(sgir, 39, 32));
+    aff1 = static_cast<uint8_t>(BITS_SHIFT(sgir, 23, 16));
+    rs = static_cast<uint8_t>(BITS_SHIFT(sgir, 47, 44));
+    target_list = static_cast<uint8_t>(BITS_SHIFT(sgir, 15, 0));
+    int_id = static_cast<uint8_t>(BITS_SHIFT(sgir, 27, 24));
+    all_but_local = BIT(sgir, 40);
+}
+
 DataAbort::DataAbort(uint32_t iss) {
     valid = BIT_SHIFT(iss, 24);
     access_size = static_cast<uint8_t>(1u << BITS_SHIFT(iss, 23, 22));
@@ -80,9 +90,11 @@ static zx_status_t handle_wfi_wfe_instruction(uint32_t iss, GuestState* guest_st
     next_pc(guest_state);
     const WaitInstruction wi(iss);
     if (wi.is_wfe) {
+        ktrace_vcpu_exit(VCPU_WFE_INSTRUCTION, guest_state->system_state.elr_el2);
         thread_reschedule();
         return ZX_OK;
     }
+    ktrace_vcpu_exit(VCPU_WFI_INSTRUCTION, guest_state->system_state.elr_el2);
 
     bool pending = gich_state->active_interrupts.GetOne(kTimerVector);
     bool enabled = guest_state->cntv_ctl_el0 & TimerControl::ENABLE;
@@ -144,7 +156,8 @@ static void clean_invalidate_cache(zx_paddr_t table, size_t index_shift) {
 }
 
 static zx_status_t handle_system_instruction(uint32_t iss, uint64_t* hcr, GuestState* guest_state,
-                                             hypervisor::GuestPhysicalAddressSpace* gpas) {
+                                             hypervisor::GuestPhysicalAddressSpace* gpas,
+                                             zx_port_packet_t* packet) {
     const SystemInstruction si(iss);
     const uint64_t reg = guest_state->x[si.xt];
 
@@ -172,8 +185,7 @@ static zx_status_t handle_system_instruction(uint32_t iss, uint64_t* hcr, GuestS
             if (sctlr_el1 & SCTLR_ELX_C) {
                 *hcr &= ~HCR_EL2_TVM;
             }
-            const ArchVmAspace& aspace = gpas->aspace()->arch_aspace();
-            clean_invalidate_cache(aspace.arch_table_phys(), MMU_GUEST_TOP_SHIFT);
+            clean_invalidate_cache(gpas->arch_aspace()->arch_table_phys(), MMU_GUEST_TOP_SHIFT);
         }
         guest_state->system_state.sctlr_el1 = sctlr_el1;
 
@@ -188,24 +200,51 @@ static zx_status_t handle_system_instruction(uint32_t iss, uint64_t* hcr, GuestS
         return SET_SYSREG(ttbr0_el1);
     case SystemRegister::TTBR1_EL1:
         return SET_SYSREG(ttbr1_el1);
+    case SystemRegister::OSLAR_EL1:
+    case SystemRegister::OSLSR_EL1:
+    case SystemRegister::OSDLR_EL1:
+    case SystemRegister::DBGPRCR_EL1:
+        next_pc(guest_state);
+        // These registers are RAZ/WI. Their state is dictated by the host.
+        if (si.read) {
+            guest_state->x[si.xt] = 0;
+        }
+        return ZX_OK;
+    case SystemRegister::ICC_SGI1R_EL1: {
+        if (si.read) {
+            // ICC_SGI1R_EL1 is write-only.
+            return ZX_ERR_INVALID_ARGS;
+        }
+        SgiRegister sgi(reg);
+        if (sgi.aff3 != 0 || sgi.aff2 != 0 || sgi.aff1 != 0 || sgi.rs != 0) {
+            return ZX_ERR_NOT_SUPPORTED;
+        }
+
+        memset(packet, 0, sizeof(*packet));
+        packet->type = ZX_PKT_TYPE_GUEST_VCPU;
+        packet->guest_vcpu.type = ZX_PKT_GUEST_VCPU_INTERRUPT;
+        if (sgi.all_but_local) {
+            auto vpid = BITS(guest_state->system_state.vmpidr_el2, 8, 0);
+            packet->guest_vcpu.interrupt.mask = ~(static_cast<uint64_t>(1) << vpid);
+        } else {
+            packet->guest_vcpu.interrupt.mask = sgi.target_list;
+        }
+        packet->guest_vcpu.interrupt.vector = sgi.int_id;
+        next_pc(guest_state);
+        return ZX_ERR_NEXT;
+    }
     }
 
     dprintf(CRITICAL, "Unhandled system register %#x\n", static_cast<uint16_t>(si.sysreg));
     return ZX_ERR_NOT_SUPPORTED;
 }
 
-static zx_status_t handle_page_fault(zx_vaddr_t guest_paddr,
-                                     hypervisor::GuestPhysicalAddressSpace* gpas) {
-    uint pf_flags = VMM_PF_FLAG_HW_FAULT | VMM_PF_FLAG_WRITE | VMM_PF_FLAG_INSTRUCTION;
-    return vmm_guest_page_fault_handler(guest_paddr, pf_flags, gpas->aspace());
-}
-
 static zx_status_t handle_instruction_abort(GuestState* guest_state,
                                             hypervisor::GuestPhysicalAddressSpace* gpas) {
-    zx_status_t status = handle_page_fault(guest_state->hpfar_el2, gpas);
+    const zx_vaddr_t guest_paddr = guest_state->hpfar_el2;
+    zx_status_t status = gpas->PageFault(guest_paddr);
     if (status != ZX_OK) {
-        dprintf(CRITICAL, "Unhandled instruction abort %#lx\n",
-                guest_state->hpfar_el2);
+        dprintf(CRITICAL, "Unhandled instruction abort %#lx\n", guest_paddr);
     }
     return status;
 }
@@ -219,7 +258,7 @@ static zx_status_t handle_data_abort(uint32_t iss, GuestState* guest_state,
     zx_status_t status = traps->FindTrap(ZX_GUEST_TRAP_BELL, guest_paddr, &trap);
     switch (status) {
     case ZX_ERR_NOT_FOUND:
-        status = handle_page_fault(guest_paddr, gpas);
+        status = gpas->PageFault(guest_paddr);
         if (status != ZX_OK) {
             dprintf(CRITICAL, "Unhandled data abort %#lx\n", guest_paddr);
         }
@@ -275,31 +314,46 @@ zx_status_t vmexit_handler(uint64_t* hcr, GuestState* guest_state, GichState* gi
     LTRACEF("guest spsr_el2: %#x\n", guest_state->system_state.spsr_el2);
 
     ExceptionSyndrome syndrome(guest_state->esr_el2);
+    zx_status_t status;
     switch (syndrome.ec) {
     case ExceptionClass::WFI_WFE_INSTRUCTION:
         LTRACEF("handling wfi/wfe instruction, iss %#x\n", syndrome.iss);
-        ktrace_vcpu(TAG_VCPU_EXIT, VCPU_WFI_WFE_INSTRUCTION);
-        return handle_wfi_wfe_instruction(syndrome.iss, guest_state, gich_state);
+        status = handle_wfi_wfe_instruction(syndrome.iss, guest_state, gich_state);
+        break;
     case ExceptionClass::SMC_INSTRUCTION:
         LTRACEF("handling smc instruction, iss %#x func %#lx\n", syndrome.iss, guest_state->x[0]);
-        ktrace_vcpu(TAG_VCPU_EXIT, VCPU_SMC_INSTRUCTION);
-        return handle_smc_instruction(syndrome.iss, guest_state, packet);
+        ktrace_vcpu_exit(VCPU_SMC_INSTRUCTION, guest_state->system_state.elr_el2);
+        status = handle_smc_instruction(syndrome.iss, guest_state, packet);
+        break;
     case ExceptionClass::SYSTEM_INSTRUCTION:
         LTRACEF("handling system instruction\n");
-        ktrace_vcpu(TAG_VCPU_EXIT, VCPU_SYSTEM_INSTRUCTION);
-        return handle_system_instruction(syndrome.iss, hcr, guest_state, gpas);
+        ktrace_vcpu_exit(VCPU_SYSTEM_INSTRUCTION, guest_state->system_state.elr_el2);
+        status = handle_system_instruction(syndrome.iss, hcr, guest_state, gpas, packet);
+        break;
     case ExceptionClass::INSTRUCTION_ABORT:
         LTRACEF("handling instruction abort at %#lx\n", guest_state->hpfar_el2);
-        ktrace_vcpu(TAG_VCPU_EXIT, VCPU_INSTRUCTION_ABORT);
-        return handle_instruction_abort(guest_state, gpas);
+        ktrace_vcpu_exit(VCPU_INSTRUCTION_ABORT, guest_state->system_state.elr_el2);
+        status = handle_instruction_abort(guest_state, gpas);
+        break;
     case ExceptionClass::DATA_ABORT:
         LTRACEF("handling data abort at %#lx\n", guest_state->hpfar_el2);
-        ktrace_vcpu(TAG_VCPU_EXIT, VCPU_DATA_ABORT);
-        return handle_data_abort(syndrome.iss, guest_state, gpas, traps, packet);
+        ktrace_vcpu_exit(VCPU_DATA_ABORT, guest_state->system_state.elr_el2);
+        status = handle_data_abort(syndrome.iss, guest_state, gpas, traps, packet);
+        break;
     default:
         LTRACEF("unhandled exception syndrome, ec %#x iss %#x\n",
                 static_cast<uint32_t>(syndrome.ec), syndrome.iss);
-        ktrace_vcpu(TAG_VCPU_EXIT, VCPU_UNKNOWN);
-        return ZX_ERR_NOT_SUPPORTED;
+        ktrace_vcpu_exit(VCPU_UNKNOWN, guest_state->system_state.elr_el2);
+        status = ZX_ERR_NOT_SUPPORTED;
+        break;
     }
+    if (status != ZX_OK && status != ZX_ERR_NEXT && status != ZX_ERR_CANCELED) {
+        dprintf(CRITICAL, "VM exit handler for %u (%s) to EL%u at %lx returned %d\n",
+                static_cast<uint32_t>(syndrome.ec),
+                exception_class_name(syndrome.ec),
+                BITS_SHIFT(guest_state->system_state.spsr_el2, 3, 2),
+                guest_state->system_state.elr_el2,
+                status);
+    }
+    return status;
 }

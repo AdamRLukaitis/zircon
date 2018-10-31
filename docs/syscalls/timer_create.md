@@ -37,6 +37,10 @@ Passing 0 in options is equivalent to ZX_TIMER_SLACK_CENTER.
 The returned handle has the ZX_RIGHT_DUPLICATE, ZX_RIGHT_TRANSFER,
 ZX_RIGHT_READ and ZX_RIGHT_WRITE right.
 
+## RIGHTS
+
+TODO(ZX-2399)
+
 ## RETURN VALUE
 
 **timer_create**() returns **ZX_OK** on success. In the event
@@ -48,7 +52,9 @@ of failure, a negative error value is returned.
 *options* is not one of the ZX_TIMER_SLACK values or *clock_id* is
 any value other than ZX_CLOCK_MONOTONIC.
 
-**ZX_ERR_NO_MEMORY**  (Temporary) Failure due to lack of memory.
+**ZX_ERR_NO_MEMORY**  Failure due to lack of memory.
+There is no good way for userspace to handle this (unlikely) error.
+In a future build this error will no longer occur.
 
 ## SEE ALSO
 

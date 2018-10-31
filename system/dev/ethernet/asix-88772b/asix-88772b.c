@@ -9,10 +9,10 @@
 #include <ddk/driver.h>
 #include <ddk/binding.h>
 #include <ddk/protocol/ethernet.h>
-#include <ddk/usb-request.h>
-#include <driver/usb.h>
+#include <ddk/protocol/usb.h>
+#include <ddk/usb/usb.h>
+#include <usb/usb-request.h>
 #include <zircon/assert.h>
-#include <zircon/device/ethernet.h>
 #include <zircon/listnode.h>
 
 #include <inttypes.h>
@@ -210,8 +210,8 @@ static zx_status_t ax88772b_send(ax88772b_t* eth, usb_request_t* request, ethmac
     header[2] = lo ^ 0xFF;
     header[3] = hi ^ 0xFF;
 
-    usb_request_copyto(request, header, ETH_HEADER_SIZE, 0);
-    usb_request_copyto(request, netbuf->data, length, ETH_HEADER_SIZE);
+    usb_request_copy_to(request, header, ETH_HEADER_SIZE, 0);
+    usb_request_copy_to(request, netbuf->data, length, ETH_HEADER_SIZE);
     request->header.length = length + ETH_HEADER_SIZE;
 
     zx_nanosleep(zx_deadline_after(ZX_USEC(eth->tx_endpoint_delay)));
@@ -299,7 +299,7 @@ static void ax88772b_interrupt_complete(usb_request_t* request, void* cookie) {
     if (request->response.status == ZX_OK && request->response.actual == sizeof(eth->status)) {
         uint8_t status[INTR_REQ_SIZE];
 
-        usb_request_copyfrom(request, status, sizeof(status), 0);
+        usb_request_copy_from(request, status, sizeof(status), 0);
         if (memcmp(eth->status, status, sizeof(eth->status))) {
             const uint8_t* b = status;
             zxlogf(TRACE, "ax88772b: status changed: %02X %02X %02X %02X %02X %02X %02X %02X\n",
@@ -311,7 +311,7 @@ static void ax88772b_interrupt_complete(usb_request_t* request, void* cookie) {
             eth->online = online;
             if (online && !was_online) {
                 if (eth->ifc) {
-                    eth->ifc->status(eth->cookie, ETH_STATUS_ONLINE);
+                    eth->ifc->status(eth->cookie, ETHMAC_STATUS_ONLINE);
                 }
 
                 // Now that we are online, queue all our read requests
@@ -429,7 +429,7 @@ static zx_status_t ax88772b_start(void* ctx, ethmac_ifc_t* ifc, void* cookie) {
     } else {
         eth->ifc = ifc;
         eth->cookie = cookie;
-        eth->ifc->status(eth->cookie, eth->online ? ETH_STATUS_ONLINE : 0);
+        eth->ifc->status(eth->cookie, eth->online ? ETHMAC_STATUS_ONLINE : 0);
     }
     mtx_unlock(&eth->mutex);
 
@@ -661,7 +661,7 @@ static zx_status_t ax88772b_bind(void* ctx, zx_device_t* device) {
     zx_status_t status = ZX_OK;
     for (int i = 0; i < READ_REQ_COUNT; i++) {
         usb_request_t* req;
-        status = usb_req_alloc(&eth->usb, &req, USB_BUF_IN_SIZE, bulk_in_addr);
+        status = usb_request_alloc(&req, USB_BUF_IN_SIZE, bulk_in_addr, sizeof(usb_request_t));
         if (status != ZX_OK) {
             goto fail;
         }
@@ -671,7 +671,7 @@ static zx_status_t ax88772b_bind(void* ctx, zx_device_t* device) {
     }
     for (int i = 0; i < WRITE_REQ_COUNT; i++) {
         usb_request_t* req;
-        status = usb_req_alloc(&eth->usb, &req, USB_BUF_OUT_SIZE, bulk_out_addr);
+        status = usb_request_alloc(&req, USB_BUF_OUT_SIZE, bulk_out_addr, sizeof(usb_request_t));
         if (status != ZX_OK) {
             goto fail;
         }
@@ -681,7 +681,7 @@ static zx_status_t ax88772b_bind(void* ctx, zx_device_t* device) {
     }
     for (int i = 0; i < INTR_REQ_COUNT; i++) {
         usb_request_t* req;
-        status = usb_req_alloc(&eth->usb, &req, INTR_REQ_SIZE, intr_addr);
+        status = usb_request_alloc(&req, INTR_REQ_SIZE, intr_addr, sizeof(usb_request_t));
         if (status != ZX_OK) {
             goto fail;
         }

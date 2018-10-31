@@ -6,8 +6,8 @@
 #include <fbl/type_support.h>
 #include <fbl/unique_fd.h>
 #include <lib/zx/socket.h>
-#include <syslog/global.h>
-#include <syslog/wire_format.h>
+#include <lib/syslog/global.h>
+#include <lib/syslog/wire_format.h>
 #include <unittest/unittest.h>
 
 #include <errno.h>
@@ -75,7 +75,7 @@ bool output_compare_helper(zx::socket local, fx_log_severity_t severity,
     return true;
 }
 
-bool test_log_simple_write(void) {
+bool TestLogSimpleWrite(void) {
     BEGIN_TEST;
     Cleanup cleanup;
     zx::socket local, remote;
@@ -87,7 +87,7 @@ bool test_log_simple_write(void) {
     END_TEST;
 }
 
-bool test_log_write(void) {
+bool TestLogWrite(void) {
     BEGIN_TEST;
     Cleanup cleanup;
     zx::socket local, remote;
@@ -99,7 +99,7 @@ bool test_log_write(void) {
     END_TEST;
 }
 
-bool test_log_preprocessed_message(void) {
+bool TestLogPreprocessedMessage(void) {
     BEGIN_TEST;
     Cleanup cleanup;
     zx::socket local, remote;
@@ -111,7 +111,7 @@ bool test_log_preprocessed_message(void) {
     END_TEST;
 }
 
-bool test_log_severity(void) {
+bool TestLogSeverity(void) {
     BEGIN_TEST;
     Cleanup cleanup;
     zx::socket local, remote;
@@ -130,7 +130,7 @@ bool test_log_severity(void) {
     END_TEST;
 }
 
-bool test_log_write_with_tag(void) {
+bool TestLogWriteWithTag(void) {
     BEGIN_TEST;
     Cleanup cleanup;
     zx::socket local, remote;
@@ -143,7 +143,7 @@ bool test_log_write_with_tag(void) {
     END_TEST;
 }
 
-bool test_log_write_with_global_tag(void) {
+bool TestLogWriteWithGlobalTag(void) {
     BEGIN_TEST;
     Cleanup cleanup;
     zx::socket local, remote;
@@ -157,7 +157,7 @@ bool test_log_write_with_global_tag(void) {
     END_TEST;
 }
 
-bool test_log_write_with_multi_global_tag(void) {
+bool TestLogWriteWithMultiGlobalTag(void) {
     BEGIN_TEST;
     Cleanup cleanup;
     zx::socket local, remote;
@@ -171,7 +171,7 @@ bool test_log_write_with_multi_global_tag(void) {
     END_TEST;
 }
 
-bool test_log_fallback(void) {
+bool TestLogFallback(void) {
     BEGIN_TEST;
     Cleanup cleanup;
     zx::socket local, remote;
@@ -180,7 +180,7 @@ bool test_log_fallback(void) {
     ASSERT_EQ(ZX_OK, init_helper(remote.release(), gtags, 2));
 
     int pipefd[2];
-    EXPECT_EQ(pipe2(pipefd, O_NONBLOCK), 0, "");
+    EXPECT_EQ(pipe2(pipefd, O_NONBLOCK), 0);
     fbl::unique_fd fd_to_close1(pipefd[0]);
     fbl::unique_fd fd_to_close2(pipefd[1]);
     fx_logger_activate_fallback(fx_log_get_logger(), pipefd[0]);
@@ -189,13 +189,13 @@ bool test_log_fallback(void) {
 
     char buf[256];
     size_t n = read(pipefd[1], buf, sizeof(buf));
-    EXPECT_GT(n, 0u, "");
+    EXPECT_GT(n, 0u);
     buf[n] = 0;
     EXPECT_TRUE(ends_with(buf, "[gtag, gtag2, tag] INFO: 10, just some string\n"), buf);
     END_TEST;
 }
 
-bool test_msg_length_limit(void) {
+bool TestMsgLengthLimit(void) {
     BEGIN_TEST;
     Cleanup cleanup;
     zx::socket local, remote;
@@ -216,7 +216,7 @@ bool test_msg_length_limit(void) {
     END_TEST;
 }
 
-bool test_msg_length_limit_for_preprocessed_msg(void) {
+bool TestMsgLengthLimitForPreprocessedMsg(void) {
     BEGIN_TEST;
     Cleanup cleanup;
     zx::socket local, remote;
@@ -241,7 +241,7 @@ bool test_msg_length_limit_for_preprocessed_msg(void) {
     END_TEST;
 }
 
-bool test_tag_length_limit(void) {
+bool TestTagLengthLimit(void) {
     BEGIN_TEST;
     Cleanup cleanup;
     zx::socket local, remote;
@@ -273,7 +273,7 @@ bool test_tag_length_limit(void) {
     END_TEST;
 }
 
-bool test_vlog_simple_write(void) {
+bool TestVlogSimpleWrite(void) {
     BEGIN_TEST;
     Cleanup cleanup;
     zx::socket local, remote;
@@ -286,7 +286,7 @@ bool test_vlog_simple_write(void) {
     END_TEST;
 }
 
-bool test_vlog_write(void) {
+bool TestVlogWrite(void) {
     BEGIN_TEST;
     Cleanup cleanup;
     zx::socket local, remote;
@@ -299,7 +299,7 @@ bool test_vlog_write(void) {
     END_TEST;
 }
 
-bool test_vlog_write_with_tag(void) {
+bool TestVlogWriteWithTag(void) {
     BEGIN_TEST;
     Cleanup cleanup;
     zx::socket local, remote;
@@ -313,7 +313,7 @@ bool test_vlog_write_with_tag(void) {
     END_TEST;
 }
 
-bool test_log_verbosity(void) {
+bool TestLogVerbosity(void) {
     BEGIN_TEST;
     Cleanup cleanup;
     zx::socket local, remote;
@@ -338,22 +338,22 @@ bool test_log_verbosity(void) {
 }
 
 BEGIN_TEST_CASE(syslog_socket_tests)
-RUN_TEST(test_log_simple_write)
-RUN_TEST(test_log_write)
-RUN_TEST(test_log_preprocessed_message)
-RUN_TEST(test_log_severity)
-RUN_TEST(test_log_write_with_tag)
-RUN_TEST(test_log_write_with_global_tag)
-RUN_TEST(test_log_write_with_multi_global_tag)
-RUN_TEST(test_log_fallback)
-RUN_TEST(test_vlog_simple_write)
-RUN_TEST(test_vlog_write)
-RUN_TEST(test_vlog_write_with_tag)
-RUN_TEST(test_log_verbosity)
+RUN_TEST(TestLogSimpleWrite)
+RUN_TEST(TestLogWrite)
+RUN_TEST(TestLogPreprocessedMessage)
+RUN_TEST(TestLogSeverity)
+RUN_TEST(TestLogWriteWithTag)
+RUN_TEST(TestLogWriteWithGlobalTag)
+RUN_TEST(TestLogWriteWithMultiGlobalTag)
+RUN_TEST(TestLogFallback)
+RUN_TEST(TestVlogSimpleWrite)
+RUN_TEST(TestVlogWrite)
+RUN_TEST(TestVlogWriteWithTag)
+RUN_TEST(TestLogVerbosity)
 END_TEST_CASE(syslog_socket_tests)
 
 BEGIN_TEST_CASE(syslog_socket_tests_edge_cases)
-RUN_TEST(test_msg_length_limit)
-RUN_TEST(test_tag_length_limit)
-RUN_TEST(test_msg_length_limit_for_preprocessed_msg)
+RUN_TEST(TestMsgLengthLimit)
+RUN_TEST(TestTagLengthLimit)
+RUN_TEST(TestMsgLengthLimitForPreprocessedMsg)
 END_TEST_CASE(syslog_socket_tests_edge_cases)

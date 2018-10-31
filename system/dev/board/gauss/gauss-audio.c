@@ -4,7 +4,7 @@
 
 #include <ddk/debug.h>
 #include <ddk/device.h>
-#include <ddk/protocol/platform-defs.h>
+#include <ddk/platform-defs.h>
 #include <hw/reg.h>
 #include <soc/aml-a113/a113-hw.h>
 #include <soc/aml-a113/aml-tdm.h>
@@ -45,11 +45,11 @@ static const pbus_dev_t gauss_audio_in_dev = {
     .vid = PDEV_VID_GOOGLE,
     .pid = PDEV_PID_GAUSS,
     .did = PDEV_DID_GAUSS_AUDIO_IN,
-    .mmios = audio_in_mmios,
+    .mmio_list = audio_in_mmios,
     .mmio_count = countof(audio_in_mmios),
-    .irqs = audio_in_irqs,
+    .irq_list = audio_in_irqs,
     .irq_count = countof(audio_in_irqs),
-    .btis = audio_in_btis,
+    .bti_list = audio_in_btis,
     .bti_count = countof(audio_in_btis),
 };
 
@@ -94,13 +94,13 @@ static const pbus_dev_t gauss_tdm_audio_dev = {
     .vid = PDEV_VID_GOOGLE,
     .pid = PDEV_PID_GAUSS,
     .did = PDEV_DID_GAUSS_AUDIO_OUT,
-    .irqs = tdm_irqs,
+    .irq_list = tdm_irqs,
     .irq_count = countof(tdm_irqs),
-    .mmios = tdm_audio_mmios,
+    .mmio_list = tdm_audio_mmios,
     .mmio_count = countof(tdm_audio_mmios),
-    .i2c_channels = tdm_i2cs,
+    .i2c_channel_list = tdm_i2cs,
     .i2c_channel_count = countof(tdm_i2cs),
-    .btis = tdm_btis,
+    .bti_list = tdm_btis,
     .bti_count = countof(tdm_btis),
 };
 
@@ -110,13 +110,13 @@ zx_status_t gauss_audio_init(gauss_bus_t* bus) {
     zx_status_t status;
 
     // Add audio in and out devices.
-    if ((status = pbus_device_add(&bus->pbus, &gauss_audio_in_dev, 0)) != ZX_OK) {
+    if ((status = pbus_device_add(&bus->pbus, &gauss_audio_in_dev)) != ZX_OK) {
         zxlogf(ERROR, "a113_audio_init could not add gauss_audio_in_dev: %d\n", status);
         return status;
     }
 
     printf("Adding the tdm device\n");
-    if ((status = pbus_device_add(&bus->pbus, &gauss_tdm_audio_dev, 0)) != ZX_OK) {
+    if ((status = pbus_device_add(&bus->pbus, &gauss_tdm_audio_dev)) != ZX_OK) {
         zxlogf(ERROR, "a113_audio_init could not add gauss_tdm_audio_dev: %d\n", status);
     }
 

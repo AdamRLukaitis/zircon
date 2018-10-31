@@ -3,8 +3,8 @@
 // found in the LICENSE file.
 
 #include <fbl/auto_call.h>
-#include <fdio/remoteio.h>
-#include <fdio/watcher.h>
+#include <lib/fdio/remoteio.h>
+#include <lib/fdio/watcher.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -17,9 +17,8 @@
 #include <fs/remote.h>
 #include <threads.h>
 #include <zircon/assert.h>
-#include <zircon/process.h>
-#include <zircon/syscalls.h>
 #include <lib/zx/event.h>
+#include <lib/zx/process.h>
 #endif
 
 #include <fs/trace.h>
@@ -112,21 +111,21 @@ Vfs::Vfs() = default;
 Vfs::~Vfs() = default;
 
 #ifdef __Fuchsia__
-Vfs::Vfs(async_t* async)
-    : async_(async) {}
+Vfs::Vfs(async_dispatcher_t* dispatcher)
+    : dispatcher_(dispatcher) {}
 #endif
 
 zx_status_t Vfs::Open(fbl::RefPtr<Vnode> vndir, fbl::RefPtr<Vnode>* out,
-                      fbl::StringPiece path, fbl::StringPiece* pathout, uint32_t flags,
+                      fbl::StringPiece path, fbl::StringPiece* out_path, uint32_t flags,
                       uint32_t mode) {
 #ifdef __Fuchsia__
     fbl::AutoLock lock(&vfs_lock_);
 #endif
-    return OpenLocked(fbl::move(vndir), out, path, pathout, flags, mode);
+    return OpenLocked(fbl::move(vndir), out, path, out_path, flags, mode);
 }
 
 zx_status_t Vfs::OpenLocked(fbl::RefPtr<Vnode> vndir, fbl::RefPtr<Vnode>* out,
-                            fbl::StringPiece path, fbl::StringPiece* pathout,
+                            fbl::StringPiece path, fbl::StringPiece* out_path,
                             uint32_t flags, uint32_t mode) {
     xprintf("VfsOpen: path='%s' flags=%d\n", path.begin(), flags);
     zx_status_t r;
@@ -140,7 +139,7 @@ zx_status_t Vfs::OpenLocked(fbl::RefPtr<Vnode> vndir, fbl::RefPtr<Vnode>* out,
     if (vndir->IsRemote()) {
         // remote filesystem, return handle and path through to caller
         *out = fbl::move(vndir);
-        *pathout = path;
+        *out_path = path;
         return ZX_OK;
     }
 #endif
@@ -173,7 +172,9 @@ zx_status_t Vfs::OpenLocked(fbl::RefPtr<Vnode> vndir, fbl::RefPtr<Vnode>* out,
             }
             return r;
         }
-        vndir->Notify(path, VFS_WATCH_EVT_ADDED);
+#ifdef __Fuchsia__
+        vndir->Notify(path, fuchsia_io_WATCH_EVENT_ADDED);
+#endif
     } else {
     try_open:
         r = vfs_lookup(fbl::move(vndir), &vn, path);
@@ -183,7 +184,7 @@ zx_status_t Vfs::OpenLocked(fbl::RefPtr<Vnode> vndir, fbl::RefPtr<Vnode>* out,
 #ifdef __Fuchsia__
         if (!(flags & ZX_FS_FLAG_NOREMOTE) && vn->IsRemote()) {
             // Opening a mount point: Traverse across remote.
-            *pathout = ".";
+            *out_path = ".";
             *out = fbl::move(vn);
             return ZX_OK;
         }
@@ -209,7 +210,7 @@ zx_status_t Vfs::OpenLocked(fbl::RefPtr<Vnode> vndir, fbl::RefPtr<Vnode>* out,
         }
     }
     xprintf("VfsOpen: vn=%p\n", vn.get());
-    *pathout = "";
+    *out_path = "";
     *out = vn;
     return ZX_OK;
 }
@@ -238,7 +239,9 @@ zx_status_t Vfs::Unlink(fbl::RefPtr<Vnode> vndir, fbl::StringPiece path) {
     if (r != ZX_OK) {
         return r;
     }
-    vndir->Notify(path, VFS_WATCH_EVT_REMOVED);
+#ifdef __Fuchsia__
+    vndir->Notify(path, fuchsia_io_WATCH_EVENT_REMOVED);
+#endif
     return ZX_OK;
 }
 
@@ -258,7 +261,7 @@ void Vfs::TokenDiscard(zx::event ios_token) {
         //
         // By cleared the token cookie, any remaining handles to the event will
         // be ignored by the filesystem server.
-        ios_token.set_cookie(zx_process_self(), 0);
+        ios_token.set_cookie(*zx::process::self(), 0);
     }
 }
 
@@ -282,7 +285,7 @@ zx_status_t Vfs::VnodeToToken(fbl::RefPtr<Vnode> vn, zx::event* ios_token,
         return r;
     } else if ((r = new_ios_token.duplicate(TOKEN_RIGHTS, &new_token) != ZX_OK)) {
         return r;
-    } else if ((r = new_ios_token.set_cookie(zx_process_self(), vnode_cookie)) != ZX_OK) {
+    } else if ((r = new_ios_token.set_cookie(*zx::process::self(), vnode_cookie)) != ZX_OK) {
         return r;
     }
     *ios_token = fbl::move(new_ios_token);
@@ -293,7 +296,7 @@ zx_status_t Vfs::VnodeToToken(fbl::RefPtr<Vnode> vn, zx::event* ios_token,
 zx_status_t Vfs::TokenToVnode(zx::event token, fbl::RefPtr<Vnode>* out) {
     uint64_t vcookie;
     zx_status_t r;
-    if ((r = token.get_cookie(zx_process_self(), &vcookie)) < 0) {
+    if ((r = token.get_cookie(*zx::process::self(), &vcookie)) < 0) {
         // TODO(smklein): Return a more specific error code for "token not from this server"
         return ZX_ERR_INVALID_ARGS;
     }
@@ -343,8 +346,8 @@ zx_status_t Vfs::Rename(zx::event token, fbl::RefPtr<Vnode> oldparent,
     if (r != ZX_OK) {
         return r;
     }
-    oldparent->Notify(oldStr, VFS_WATCH_EVT_REMOVED);
-    newparent->Notify(newStr, VFS_WATCH_EVT_ADDED);
+    oldparent->Notify(oldStr, fuchsia_io_WATCH_EVENT_REMOVED);
+    newparent->Notify(newStr, fuchsia_io_WATCH_EVENT_ADDED);
     return ZX_OK;
 }
 
@@ -394,7 +397,7 @@ zx_status_t Vfs::Link(zx::event token, fbl::RefPtr<Vnode> oldparent,
     if (r != ZX_OK) {
         return r;
     }
-    newparent->Notify(newStr, VFS_WATCH_EVT_ADDED);
+    newparent->Notify(newStr, fuchsia_io_WATCH_EVENT_ADDED);
     return ZX_OK;
 }
 
@@ -411,7 +414,7 @@ zx_status_t Vfs::ServeConnection(fbl::unique_ptr<Connection> connection) {
 void Vfs::OnConnectionClosedRemotely(Connection* connection) {
     ZX_DEBUG_ASSERT(connection);
 
-    UnregisterAndDestroyConnection(connection);
+    UnregisterConnection(connection);
 }
 
 zx_status_t Vfs::ServeDirectory(fbl::RefPtr<fs::Vnode> vn, zx::channel channel) {
@@ -433,73 +436,7 @@ zx_status_t Vfs::ServeDirectory(fbl::RefPtr<fs::Vnode> vn, zx::channel channel) 
     return vn->Serve(this, fbl::move(channel), ZX_FS_RIGHT_ADMIN);
 }
 
-void Vfs::RegisterConnection(fbl::unique_ptr<Connection> connection) {
-    // The connection will be destroyed by |UnregisterAndDestroyConnection()|
-    __UNUSED auto ptr = connection.release();
-}
-
-void Vfs::UnregisterAndDestroyConnection(Connection* connection) {
-    delete connection;
-}
-
 #endif // ifdef __Fuchsia__
-
-zx_status_t Vfs::Ioctl(fbl::RefPtr<Vnode> vn, uint32_t op, const void* in_buf, size_t in_len,
-                       void* out_buf, size_t out_len, size_t* out_actual) {
-    switch (op) {
-#ifdef __Fuchsia__
-    case IOCTL_VFS_WATCH_DIR: {
-        if (in_len != sizeof(vfs_watch_dir_t)) {
-            return ZX_ERR_INVALID_ARGS;
-        }
-        const vfs_watch_dir_t* request = reinterpret_cast<const vfs_watch_dir_t*>(in_buf);
-        *out_actual = 0;
-        return vn->WatchDir(this, request);
-    }
-    case IOCTL_VFS_MOUNT_FS: {
-        if ((in_len != sizeof(zx_handle_t)) || (out_len != 0)) {
-            return ZX_ERR_INVALID_ARGS;
-        }
-        MountChannel h = MountChannel(*reinterpret_cast<const zx_handle_t*>(in_buf));
-        *out_actual = 0;
-        return Vfs::InstallRemote(vn, fbl::move(h));
-    }
-    case IOCTL_VFS_MOUNT_MKDIR_FS: {
-        size_t namelen = in_len - sizeof(mount_mkdir_config_t);
-        const mount_mkdir_config_t* config = reinterpret_cast<const mount_mkdir_config_t*>(in_buf);
-        fbl::StringPiece name(config->name, namelen - 1);
-        if ((in_len < sizeof(mount_mkdir_config_t)) ||
-            (namelen < 1) || (namelen > PATH_MAX) || (name[namelen - 1] != 0) ||
-            (out_len != 0)) {
-            return ZX_ERR_INVALID_ARGS;
-        }
-
-        *out_actual = 0;
-        return Vfs::MountMkdir(fbl::move(vn), fbl::move(name),
-                               MountChannel(config->fs_root), config->flags);
-    }
-    case IOCTL_VFS_UNMOUNT_NODE: {
-        if ((in_len != 0) || (out_len != sizeof(zx_handle_t))) {
-            return ZX_ERR_INVALID_ARGS;
-        }
-        zx_handle_t* h = (zx_handle_t*)out_buf;
-        zx::channel c;
-        *out_actual = 0;
-        zx_status_t s = Vfs::UninstallRemote(vn, &c);
-        *h = c.release();
-        return s;
-    }
-    case IOCTL_VFS_UNMOUNT_FS: {
-        Vfs::UninstallAll(ZX_TIME_INFINITE);
-        *out_actual = 0;
-        vn->Ioctl(op, in_buf, in_len, out_buf, out_len, out_actual);
-        return ZX_OK;
-    }
-#endif
-    default:
-        return vn->Ioctl(op, in_buf, in_len, out_buf, out_len, out_actual);
-    }
-}
 
 void Vfs::SetReadonly(bool value) {
 #ifdef __Fuchsia__
@@ -508,65 +445,49 @@ void Vfs::SetReadonly(bool value) {
     readonly_ = value;
 }
 
-zx_status_t Vfs::Walk(fbl::RefPtr<Vnode> vn, fbl::RefPtr<Vnode>* out,
-                      fbl::StringPiece pathStr, fbl::StringPiece* pathout) {
+zx_status_t Vfs::Walk(fbl::RefPtr<Vnode> vn, fbl::RefPtr<Vnode>* out_vn,
+                      fbl::StringPiece path, fbl::StringPiece* out_path) {
     zx_status_t r;
-    const char* path = pathStr.data();
-    size_t new_len = pathStr.length();
+    while (!path.empty() && path[path.length() - 1] == '/') {
+        // Discard extra trailing '/' characters.
+        path.set(path.data(), path.length() - 1);
+    }
 
     for (;;) {
-        while (path[0] == '/') {
-            // discard extra leading /s
-            path++;
+        while (!path.empty() && path[0] == '/') {
+            // Discard extra leading '/' characters.
+            path.set(&path[1], path.length() - 1);
         }
-        if (path[0] == 0) {
-            // convert empty initial path of final path segment to "."
-            path = ".";
-            new_len = 1;
-        } else {
-            new_len = pathStr.length() - (path - pathStr.data());
+        if (path.empty()) {
+            // Convert empty initial path of final path segment to ".".
+            path.set(".", 1);
         }
 #ifdef __Fuchsia__
         if (vn->IsRemote()) {
-            // remote filesystem mount, caller must resolve
-            *out = fbl::move(vn);
-            pathout->set(path, new_len);
+            // Remote filesystem mount, caller must resolve.
+            *out_vn = fbl::move(vn);
+            *out_path = fbl::move(path);
             return ZX_OK;
         }
 #endif
 
-        const char* nextpath = strchr(path, '/');
-        bool additional_segment = false;
-        if (nextpath != nullptr) {
-            const char* end = nextpath;
-            while (*end != '\0') {
-                if (*end != '/') {
-                    additional_segment = true;
-                    break;
-                }
-                end++;
-            }
-        }
-        if (additional_segment) {
-            // path has at least one additional segment
-            // traverse to the next segment
-            size_t len = nextpath - path;
-            nextpath++;
-            if ((r = vfs_lookup(fbl::move(vn), &vn, fbl::StringPiece(path, len))) < 0) {
-                return r;
-            }
-            path = nextpath;
-        } else {
-            // final path segment, we're done here
-            *out = vn;
-
-            if (pathStr.length() > 0) {
-                new_len = pathStr.length() - (path - pathStr.data());
-            }
-
-            pathout->set(path, new_len);
+        // Look for the next '/' separated path component.
+        const char* next_path = reinterpret_cast<const char*>(
+                memchr(path.data(), '/', path.length()));
+        if (next_path == nullptr) {
+            // Final path segment.
+            *out_vn = vn;
+            *out_path = fbl::move(path);
             return ZX_OK;
         }
+
+        // Path has at least one additional segment.
+        fbl::StringPiece component(path.data(), next_path - path.data());
+        if ((r = vfs_lookup(fbl::move(vn), &vn, component)) != ZX_OK) {
+            return r;
+        }
+        // Traverse to the next segment.
+        path.set(next_path + 1, path.length() - (component.length() + 1));
     }
 }
 

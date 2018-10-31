@@ -6,6 +6,10 @@
 
 #include "private.h"
 
+#ifdef __x86_64__
+#include <x86intrin.h>
+#endif
+
 zx_ticks_t _zx_ticks_get(void) {
 #if __aarch64__
     // read the virtual counter
@@ -13,10 +17,7 @@ zx_ticks_t _zx_ticks_get(void) {
     __asm__ volatile("mrs %0, cntvct_el0" : "=r" (ticks));
     return ticks;
 #elif __x86_64__
-    uint32_t ticks_low;
-    uint32_t ticks_high;
-    __asm__ volatile("rdtsc" : "=a" (ticks_low), "=d" (ticks_high));
-    return ((zx_ticks_t)ticks_high << 32) | ticks_low;
+    return __rdtsc();
 #else
 #error Unsupported architecture
 #endif
@@ -27,5 +28,5 @@ VDSO_INTERFACE_FUNCTION(zx_ticks_get);
 // At boot time the kernel can decide to redirect the {_,}zx_ticks_get
 // dynamic symbol table entries to point to this instead.  See VDso::VDso.
 VDSO_KERNEL_EXPORT zx_ticks_t CODE_soft_ticks_get(void) {
-    return VDSO_zx_clock_get(ZX_CLOCK_MONOTONIC);
+    return VDSO_zx_clock_get_monotonic();
 }

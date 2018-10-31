@@ -4,6 +4,8 @@
 
 #include <perftest/results.h>
 
+#include <errno.h>
+#include <inttypes.h>
 #include <math.h>
 
 #include <fbl/algorithm.h>
@@ -34,16 +36,47 @@ double StdDev(const fbl::Vector<double>& values, double mean) {
     return sqrt(sum_of_squared_diffs / static_cast<double>(values.size()));
 }
 
+// Comparison function for use with qsort().
+int CompareDoubles(const void* ptr1, const void* ptr2) {
+    double val1 = *reinterpret_cast<const double*>(ptr1);
+    double val2 = *reinterpret_cast<const double*>(ptr2);
+    if (val1 < val2) {
+        return -1;
+    }
+    if (val1 > val2) {
+        return 1;
+    }
+    return 0;
+}
+
+double Median(const fbl::Vector<double>& values) {
+    // Make a sorted copy of the vector.
+    fbl::Vector<double> copy;
+    copy.reserve(values.size());
+    for (double value : values) {
+        copy.push_back(value);
+    }
+    qsort(copy.get(), copy.size(), sizeof(copy[0]), CompareDoubles);
+
+    size_t index = copy.size() / 2;
+    // Interpolate two values if necessary.
+    if (copy.size() % 2 == 0) {
+        return (copy[index - 1] + copy[index]) / 2;
+    }
+    return copy[index];
+}
+
 } // namespace
 
 SummaryStatistics TestCaseResults::GetSummaryStatistics() const {
-    ZX_ASSERT(values_.size() > 0);
-    double mean = Mean(values_);
+    ZX_ASSERT(values.size() > 0);
+    double mean = Mean(values);
     return SummaryStatistics{
-        .min = Min(values_),
-        .max = Max(values_),
+        .min = Min(values),
+        .max = Max(values),
         .mean = mean,
-        .std_dev = StdDev(values_, mean),
+        .std_dev = StdDev(values, mean),
+        .median = Median(values),
     };
 }
 
@@ -82,14 +115,18 @@ void WriteJSONString(FILE* out_file, const char* string) {
 
 void TestCaseResults::WriteJSON(FILE* out_file) const {
     fprintf(out_file, "{\"label\":");
-    WriteJSONString(out_file, label_.c_str());
+    WriteJSONString(out_file, label.c_str());
+    fprintf(out_file, ",\"test_suite\":");
+    WriteJSONString(out_file, test_suite.c_str());
     fprintf(out_file, ",\"unit\":");
-    WriteJSONString(out_file, unit_.c_str());
-    fprintf(out_file, ",\"samples\":[");
-
-    fprintf(out_file, "{\"values\":[");
+    WriteJSONString(out_file, unit.c_str());
+    if (bytes_processed_per_run) {
+        fprintf(out_file, ",\"bytes_processed_per_run\":%" PRIu64,
+                bytes_processed_per_run);
+    }
+    fprintf(out_file, ",\"values\":[");
     bool first = true;
-    for (const auto value : values_) {
+    for (const auto value : values) {
         if (!first) {
             fprintf(out_file, ",");
         }
@@ -97,13 +134,12 @@ void TestCaseResults::WriteJSON(FILE* out_file) const {
         first = false;
     }
     fprintf(out_file, "]}");
-
-    fprintf(out_file, "]}");
 }
 
-TestCaseResults* ResultsSet::AddTestCase(const fbl::String& label,
+TestCaseResults* ResultsSet::AddTestCase(const fbl::String& test_suite,
+                                         const fbl::String& label,
                                          const fbl::String& unit) {
-    TestCaseResults test_case(label, unit);
+    TestCaseResults test_case(test_suite, label, unit);
     results_.push_back(fbl::move(test_case));
     return &results_[results_.size() - 1];
 }
@@ -121,18 +157,42 @@ void ResultsSet::WriteJSON(FILE* out_file) const {
     fprintf(out_file, "]");
 }
 
+bool ResultsSet::WriteJSONFile(const char* output_filename) const {
+    FILE* fh = fopen(output_filename, "w");
+    if (!fh) {
+        fprintf(stderr, "Failed to open output file \"%s\": %s\n",
+                output_filename, strerror(errno));
+        return false;
+    }
+    WriteJSON(fh);
+    fclose(fh);
+    return true;
+}
+
 void ResultsSet::PrintSummaryStatistics(FILE* out_file) const {
     // Print table headings row.
-    fprintf(out_file, "%10s %10s %10s %10s %-12s %s\n",
-           "Mean", "Std dev", "Min", "Max", "Unit", "Test case");
+    fprintf(out_file, "%10s %10s %10s %10s %10s %-12s %15s %s\n",
+            "Mean", "Std dev", "Min", "Max", "Median", "Unit",
+            "Mean Mbytes/sec", "Test case");
     if (results_.size() == 0) {
         fprintf(out_file, "(No test results)\n");
     }
     for (const auto& test : results_) {
         SummaryStatistics stats = test.GetSummaryStatistics();
-        fprintf(out_file, "%10.0f %10.0f %10.0f %10.0f %-12s %s\n",
-                stats.mean, stats.std_dev, stats.min, stats.max,
-                test.unit().c_str(), test.label().c_str());
+        fprintf(out_file, "%10.0f %10.0f %10.0f %10.0f %10.0f %-12s",
+                stats.mean, stats.std_dev, stats.min, stats.max, stats.median,
+                test.unit.c_str());
+        // Output the throughput column.
+        if (test.bytes_processed_per_run != 0 && test.unit == "nanoseconds") {
+            double bytes_per_second =
+                static_cast<double>(test.bytes_processed_per_run)
+                / stats.mean * 1e9;
+            double mbytes_per_second = bytes_per_second / (1024 * 1024);
+            fprintf(out_file, " %15.3f", mbytes_per_second);
+        } else {
+            fprintf(out_file, " %15s", "N/A");
+        }
+        fprintf(out_file, " %s\n", test.label.c_str());
     }
 }
 

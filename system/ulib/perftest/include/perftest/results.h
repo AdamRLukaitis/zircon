@@ -30,23 +30,21 @@ struct SummaryStatistics {
     double max;
     double mean;
     double std_dev;
+    double median;
 };
 
 // This represents the results for a particular test case.  It contains a
 // sequence of values, which are typically the times taken by each run of
 // the test case, in order.
-class TestCaseResults {
-public:
-    TestCaseResults(const fbl::String& label, const fbl::String& unit)
-        : label_(label),
-          unit_(unit) {}
-
-    fbl::String label() const { return label_; }
-    fbl::String unit() const { return unit_; }
-    fbl::Vector<double>* values() { return &values_; }
+struct TestCaseResults {
+    TestCaseResults(const fbl::String& test_suite, const fbl::String& label,
+                    const fbl::String& unit)
+        : test_suite(test_suite),
+          label(label),
+          unit(unit) {}
 
     void AppendValue(double value) {
-        values_.push_back(value);
+        values.push_back(value);
     }
 
     // A caller may check for errors using ferror().
@@ -54,10 +52,11 @@ public:
 
     SummaryStatistics GetSummaryStatistics() const;
 
-private:
-    fbl::String label_;
-    fbl::String unit_;
-    fbl::Vector<double> values_;
+    fbl::String test_suite;
+    fbl::String label;
+    fbl::String unit;
+    fbl::Vector<double> values;
+    uint64_t bytes_processed_per_run = 0;
 };
 
 // This represents the results for a set of test cases.
@@ -69,11 +68,17 @@ class ResultsSet {
 public:
     fbl::Vector<TestCaseResults>* results() { return &results_; }
 
-    TestCaseResults* AddTestCase(const fbl::String& label,
+    TestCaseResults* AddTestCase(const fbl::String& test_suite,
+                                 const fbl::String& label,
                                  const fbl::String& unit);
 
     // A caller may check for errors using ferror().
     void WriteJSON(FILE* out_file) const;
+
+    // Writes the data to a file, in JSON format.  Returns whether this was
+    // successful; prints an error to stderr if this was not successful.
+    bool WriteJSONFile(const char* output_filename) const;
+
     void PrintSummaryStatistics(FILE* out_file) const;
 
 private:

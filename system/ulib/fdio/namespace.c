@@ -14,10 +14,11 @@
 #include <zircon/processargs.h>
 #include <zircon/device/vfs.h>
 
-#include <fdio/namespace.h>
-#include <fdio/remoteio.h>
-#include <fdio/util.h>
-#include <fdio/vfs.h>
+#include <fuchsia/io/c/fidl.h>
+#include <lib/fdio/namespace.h>
+#include <lib/fdio/remoteio.h>
+#include <lib/fdio/util.h>
+#include <lib/fdio/vfs.h>
 
 #include "private.h"
 #include "private-remoteio.h"
@@ -100,17 +101,17 @@ static zx_status_t vn_create_locked(mxvn_t* dir, const char* name, size_t len,
     }
     mxvn_t* vn = vn_lookup_locked(dir, name, len);
     if (vn != NULL) {
-        // if there's already vnode, we do not allow
-        // overlapping a remoted vnode:
-        if (vn->remote != ZX_HANDLE_INVALID) {
-            LOG(1, "VN-CREATE FAILED: SHADOWING REMOTE\n");
-            return ZX_ERR_NOT_SUPPORTED;
-        }
         // And we do not allow replacing a virtual dir node
         // with a real directory node:
         if (remote != ZX_HANDLE_INVALID) {
             LOG(1, "VN-CREATE FAILED: SHADOWING LOCAL\n");
             return ZX_ERR_ALREADY_EXISTS;
+        }
+        // if there's already vnode, we do not allow
+        // overlapping a remoted vnode:
+        if (vn->remote != ZX_HANDLE_INVALID) {
+            LOG(1, "VN-CREATE FAILED: SHADOWING REMOTE\n");
+            return ZX_ERR_NOT_SUPPORTED;
         }
         *out = vn;
         return ZX_OK;
@@ -239,6 +240,7 @@ static zx_status_t ns_walk_locked(mxvn_t** _vn, const char** _path) {
     }
 }
 
+__EXPORT
 zx_status_t fdio_ns_connect(fdio_ns_t* ns, const char* path,
                             uint32_t flags, zx_handle_t h) {
     mxvn_t* vn = &ns->root;
@@ -275,6 +277,7 @@ fail0:
     return r;
 }
 
+__EXPORT
 zx_status_t fdio_ns_open(fdio_ns_t* ns, const char* path, uint32_t flags, zx_handle_t* out) {
     zx_handle_t h;
     if (zx_channel_create(0, &h, out) != ZX_OK) {
@@ -328,17 +331,15 @@ static zx_status_t mxdir_open(fdio_t* io, const char* path,
 
 static zx_status_t fill_dirent(vdirent_t* de, size_t delen,
                                const char* name, size_t len, uint32_t type) {
-    size_t sz = sizeof(vdirent_t) + len + 1;
+    size_t sz = sizeof(vdirent_t) + len;
 
-    // round up to uint32 aligned
-    if (sz & 3)
-        sz = (sz + 3) & (~3);
-    if (sz > delen)
+    if (sz > delen || len > NAME_MAX) {
         return ZX_ERR_INVALID_ARGS;
-    de->size = sz;
+    }
+    de->ino = fuchsia_io_INO_UNKNOWN;
+    de->size = len;
     de->type = type;
     memcpy(de->name, name, len);
-    de->name[len] = 0;
     return sz;
 }
 
@@ -363,43 +364,37 @@ static zx_status_t mxdir_readdir_locked(mxdir_t* dir, void* buf, size_t len) {
     return ptr - buf;
 }
 
-static zx_status_t mxdir_misc(fdio_t* io, uint32_t op, int64_t off,
-                              uint32_t maxreply, void* ptr, size_t len) {
-    mxdir_t* dir = (mxdir_t*) io;
-    zx_status_t r;
-    switch (ZXRIO_OP(op)) {
-    case ZXRIO_READDIR:
-        LOG(6, "READDIR\n");
-        mtx_lock(&dir->ns->lock);
-        int n = atomic_fetch_add(&dir->seq, 1);
-        if (n == 0) {
-            r = mxdir_readdir_locked(dir, ptr, maxreply);
-        } else {
-            r = 0;
-        }
-        mtx_unlock(&dir->ns->lock);
-        return r;
-    case ZXRIO_STAT:
-        LOG(6, "STAT\n");
-        if (maxreply < sizeof(vnattr_t)) {
-            return ZX_ERR_INVALID_ARGS;
-        }
-        vnattr_t* attr = ptr;
-        memset(attr, 0, sizeof(*attr));
-        attr->mode = V_TYPE_DIR | V_IRUSR;
-        attr->inode = 1;
-        attr->nlink = 1;
-        return sizeof(vnattr_t);
-    case ZXRIO_UNLINK:
-        return ZX_ERR_UNAVAILABLE;
-    default:
-        LOG(6, "MISC OP %u\n", op);
-        return ZX_ERR_NOT_SUPPORTED;
-    }
+static zx_status_t mxdir_get_attr(fdio_t* io, vnattr_t* attr) {
+    memset(attr, 0, sizeof(*attr));
+    attr->mode = V_TYPE_DIR | V_IRUSR;
+    attr->inode = fuchsia_io_INO_UNKNOWN;
+    attr->nlink = 1;
+    return ZX_OK;
 }
 
-ssize_t mxdir_ioctl(fdio_t* io, uint32_t op, const void* in_buf,
-                    size_t in_len, void* out_buf, size_t out_len) {
+static zx_status_t mxdir_rewind(fdio_t* io) {
+    return ZX_OK;
+}
+
+static zx_status_t mxdir_readdir(fdio_t* io, void* ptr, size_t max, size_t* actual) {
+    mxdir_t* dir = (mxdir_t*) io;
+    mtx_lock(&dir->ns->lock);
+    int n = atomic_fetch_add(&dir->seq, 1);
+    if (n == 0) {
+        *actual = mxdir_readdir_locked(dir, ptr, max);
+    } else {
+        *actual = 0;
+    }
+    mtx_unlock(&dir->ns->lock);
+    return ZX_OK;
+}
+
+static zx_status_t mxdir_unlink(fdio_t* io, const char* path, size_t len) {
+    return ZX_ERR_UNAVAILABLE;
+}
+
+static ssize_t mxdir_ioctl(fdio_t* io, uint32_t op, const void* in_buf,
+                           size_t in_len, void* out_buf, size_t out_len) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
@@ -408,12 +403,9 @@ static fdio_ops_t dir_ops = {
     .read_at = fdio_default_read_at,
     .write = fdio_default_write,
     .write_at = fdio_default_write_at,
-    .recvfrom = fdio_default_recvfrom,
-    .sendto = fdio_default_sendto,
-    .recvmsg = fdio_default_recvmsg,
-    .sendmsg = fdio_default_sendmsg,
-    .misc = mxdir_misc,
     .seek = fdio_default_seek,
+    .get_attr = mxdir_get_attr,
+    .misc = fdio_default_misc,
     .close = mxdir_close,
     .open = mxdir_open,
     .clone = mxdir_clone,
@@ -421,9 +413,24 @@ static fdio_ops_t dir_ops = {
     .wait_begin = fdio_default_wait_begin,
     .wait_end = fdio_default_wait_end,
     .unwrap = fdio_default_unwrap,
-    .shutdown = fdio_default_shutdown,
     .posix_ioctl = fdio_default_posix_ioctl,
     .get_vmo = fdio_default_get_vmo,
+    .get_token = fdio_default_get_token,
+    .set_attr = fdio_default_set_attr,
+    .sync = fdio_default_sync,
+    .readdir = mxdir_readdir,
+    .rewind = mxdir_rewind,
+    .unlink = mxdir_unlink,
+    .truncate = fdio_default_truncate,
+    .rename = fdio_default_rename,
+    .link = fdio_default_link,
+    .get_flags = fdio_default_get_flags,
+    .set_flags = fdio_default_set_flags,
+    .recvfrom = fdio_default_recvfrom,
+    .sendto = fdio_default_sendto,
+    .recvmsg = fdio_default_recvmsg,
+    .sendmsg = fdio_default_sendmsg,
+    .shutdown = fdio_default_shutdown,
 };
 
 static fdio_t* fdio_dir_create_locked(fdio_ns_t* ns, mxvn_t* vn) {
@@ -440,6 +447,7 @@ static fdio_t* fdio_dir_create_locked(fdio_ns_t* ns, mxvn_t* vn) {
     return &dir->io;
 }
 
+__EXPORT
 zx_status_t fdio_ns_create(fdio_ns_t** out) {
     // +1 is for the "" name
     fdio_ns_t* ns = fdio_alloc(sizeof(fdio_ns_t) + 1);
@@ -451,6 +459,7 @@ zx_status_t fdio_ns_create(fdio_ns_t** out) {
     return ZX_OK;
 }
 
+__EXPORT
 zx_status_t fdio_ns_destroy(fdio_ns_t* ns) {
     mtx_lock(&ns->lock);
     if (ns->refcount != 0) {
@@ -464,6 +473,7 @@ zx_status_t fdio_ns_destroy(fdio_ns_t* ns) {
     }
 }
 
+__EXPORT
 zx_status_t fdio_ns_bind(fdio_ns_t* ns, const char* path, zx_handle_t remote) {
     LOG(1, "BIND '%s' %x\n", path, remote);
     if (remote == ZX_HANDLE_INVALID) {
@@ -479,10 +489,6 @@ zx_status_t fdio_ns_bind(fdio_ns_t* ns, const char* path, zx_handle_t remote) {
     zx_status_t r = ZX_OK;
 
     mtx_lock(&ns->lock);
-    if (ns->refcount != 0) {
-        r = ZX_ERR_BAD_STATE;
-        goto done;
-    }
     mxvn_t* vn = &ns->root;
     if (path[0] == 0) {
         // the path was "/" so we're trying to bind to the root vnode
@@ -540,6 +546,7 @@ done:
     return r;
 }
 
+__EXPORT
 zx_status_t fdio_ns_bind_fd(fdio_ns_t* ns, const char* path, int fd) {
     zx_handle_t handle[FDIO_MAX_HANDLES];
     uint32_t type[FDIO_MAX_HANDLES];
@@ -554,9 +561,7 @@ zx_status_t fdio_ns_bind_fd(fdio_ns_t* ns, const char* path, int fd) {
 
     if (type[0] != PA_FDIO_REMOTE) {
         // wrong type, discard handles
-        for (int n = 0; n < r; n++) {
-            zx_handle_close(handle[n]);
-        }
+        zx_handle_close_many(handle, r);
         return ZX_ERR_WRONG_TYPE;
     }
 
@@ -591,6 +596,7 @@ fdio_t* fdio_ns_open_root(fdio_ns_t* ns) {
     return io;
 }
 
+__EXPORT
 int fdio_ns_opendir(fdio_ns_t* ns) {
     fdio_t* io = fdio_ns_open_root(ns);
     if (io == NULL) {
@@ -605,6 +611,7 @@ int fdio_ns_opendir(fdio_ns_t* ns) {
     return fd;
 }
 
+__EXPORT
 zx_status_t fdio_ns_chdir(fdio_ns_t* ns) {
     fdio_t* io = fdio_ns_open_root(ns);
     if (io == NULL) {
@@ -692,6 +699,7 @@ static zx_status_t ns_export_copy(void* cookie, const char* path,
     return ZX_OK;
 }
 
+__EXPORT
 zx_status_t fdio_ns_export(fdio_ns_t* ns, fdio_flat_namespace_t** out) {
     export_state_t es;
     es.bytes = sizeof(fdio_flat_namespace_t);
@@ -736,6 +744,7 @@ zx_status_t fdio_ns_export(fdio_ns_t* ns, fdio_flat_namespace_t** out) {
     return status;
 }
 
+__EXPORT
 zx_status_t fdio_ns_export_root(fdio_flat_namespace_t** out) {
     zx_status_t status;
     mtx_lock(&fdio_lock);

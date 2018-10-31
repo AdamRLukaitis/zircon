@@ -178,7 +178,7 @@ public:
     void queue_free(vm_page_t* page) TA_NO_THREAD_SAFETY_ANALYSIS {
         DEBUG_ASSERT(pt_->lock_.IsHeld());
 
-        list_add_tail(&to_free_, &page->free.node);
+        list_add_tail(&to_free_, &page->queue_node);
         pt_->pages_--;
     }
 
@@ -295,14 +295,18 @@ void X86PageTableBase::UnmapEntry(ConsistencyManager* cm, PageTableLevel level, 
  * @brief Allocating a new page table
  */
 static volatile pt_entry_t* _map_alloc_page(void) {
-    vm_page_t* p;
-
-    pt_entry_t* page_ptr = static_cast<pt_entry_t*>(pmm_alloc_kpage(nullptr, &p));
-    if (!page_ptr)
+    paddr_t pa;
+    vm_page* p;
+    zx_status_t status = pmm_alloc_page(0, &p, &pa);
+    if (status != ZX_OK) {
         return nullptr;
+    }
+    p->state = VM_PAGE_STATE_MMU;
+
+    pt_entry_t* page_ptr = static_cast<pt_entry_t*>(paddr_to_physmap(pa));
+    DEBUG_ASSERT(page_ptr);
 
     arch_zero_page(page_ptr);
-    p->state = VM_PAGE_STATE_MMU;
 
     return page_ptr;
 }
@@ -513,6 +517,7 @@ bool X86PageTableBase::RemoveMapping(volatile pt_entry_t* table, PageTableLevel 
             DEBUG_ASSERT_MSG(page->state == VM_PAGE_STATE_MMU,
                              "page %p state %u, paddr %#" PRIxPTR "\n", page, page->state,
                              X86_VIRT_TO_PHYS(next_table));
+            DEBUG_ASSERT(!list_in_list(&page->queue_node));
 
             cm->queue_free(page);
             unmapped = true;
@@ -903,7 +908,7 @@ zx_status_t X86PageTableBase::MapPagesContiguous(vaddr_t vaddr, paddr_t paddr,
     LTRACEF("aspace %p, vaddr %#" PRIxPTR " paddr %#" PRIxPTR " count %#zx mmu_flags 0x%x\n",
             this, vaddr, paddr, count, mmu_flags);
 
-    if ((!check_paddr(paddr)))
+    if (!check_paddr(paddr))
         return ZX_ERR_INVALID_ARGS;
     if (!check_vaddr(vaddr))
         return ZX_ERR_INVALID_ARGS;
@@ -1021,24 +1026,28 @@ void X86PageTableBase::Destroy(vaddr_t base, size_t size) {
 
 #if LK_DEBUGLEVEL > 1
     PageTableLevel top = top_level();
-    pt_entry_t* table = static_cast<pt_entry_t*>(virt_);
-    uint start = vaddr_to_index(top, base);
-    uint end = vaddr_to_index(top, base + size - 1);
+    if (virt_) {
+        pt_entry_t* table = static_cast<pt_entry_t*>(virt_);
+        uint start = vaddr_to_index(top, base);
+        uint end = vaddr_to_index(top, base + size - 1);
 
-    // Don't check start if that table is shared with another aspace.
-    if (!page_aligned(top, base)) {
-        start += 1;
-    }
-    // Do check the end if it fills out the table entry.
-    if (page_aligned(top, base + size)) {
-        end += 1;
-    }
+        // Don't check start if that table is shared with another aspace.
+        if (!page_aligned(top, base)) {
+            start += 1;
+        }
+        // Do check the end if it fills out the table entry.
+        if (page_aligned(top, base + size)) {
+            end += 1;
+        }
 
-    for (uint i = start; i < end; ++i) {
-        DEBUG_ASSERT(!IS_PAGE_PRESENT(table[i]));
+        for (uint i = start; i < end; ++i) {
+            DEBUG_ASSERT(!IS_PAGE_PRESENT(table[i]));
+        }
     }
 #endif
 
-    pmm_free_page(paddr_to_vm_page(phys_));
-    phys_ = 0;
+    if (phys_) {
+        pmm_free_page(paddr_to_vm_page(phys_));
+        phys_ = 0;
+    }
 }

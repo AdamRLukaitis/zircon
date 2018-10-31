@@ -36,6 +36,10 @@ If the object is a *Resource*, its (immediate) child *Resources* may be
 obtained by this call.
 
 
+## RIGHTS
+
+TODO(ZX-2399)
+
 ## RETURN VALUE
 
 On success, **ZX_OK** is returned and a handle to the desired child object is returned via *out*.
@@ -52,7 +56,9 @@ rights that are not present on *handle*.
 
 **ZX_ERR_NOT_FOUND**  *handle* does not have a child with the kernel object id *koid*.
 
-**ZX_ERR_NO_MEMORY**  (temporary) out of memory failure.
+**ZX_ERR_NO_MEMORY**  Failure due to lack of memory.
+There is no good way for userspace to handle this (unlikely) error.
+In a future build this error will no longer occur.
 
 **ZX_ERR_INVALID_ARGS**  *out* is an invalid pointer.
 

@@ -15,10 +15,9 @@
 #include <ddk/debug.h>
 #include <ddk/device.h>
 #include <ddk/driver.h>
-#include <ddk/protocol/platform-defs.h>
+#include <ddk/platform-defs.h>
 #include <hw/reg.h>
 
-#include <soc/imx8m/imx8m.h>
 #include <soc/imx8m/imx8m-hw.h>
 #include <soc/imx8m/imx8m-iomux.h>
 
@@ -29,19 +28,70 @@
 
 #include "imx8mevk.h"
 
+static pbus_mmio_t imx8mevk_display_mmios[] = {
+    {
+        .base = IMX8M_AIPS_DC_MST1_BASE,
+        .length = IMX8M_AIPS_LENGTH,
+    },
+};
+
+static const pbus_bti_t imx8mevk_display_btis[] = {
+    {
+        .iommu_index = 0,
+        .bti_id = BTI_DISPLAY,
+    },
+};
+
+static const pbus_dev_t display_dev = {
+    .name = "display",
+    .vid = PDEV_VID_NXP,
+    .pid = PDEV_PID_IMX8MEVK,
+    .did = PDEV_DID_IMX_DISPLAY,
+    .mmio_list = imx8mevk_display_mmios,
+    .mmio_count = countof(imx8mevk_display_mmios),
+    .bti_list = imx8mevk_display_btis,
+    .bti_count = countof(imx8mevk_display_btis),
+};
+
 /* iMX8M EVK Pin Mux Table TODO: Add all supported peripherals on EVK board */
 iomux_cfg_struct imx8mevk_pinmux[] = {
     // UART1 RX
     MAKE_PIN_CFG_UART(0, SW_MUX_CTL_PAD_UART1_RXD,
-                            SW_PAD_CTL_PAD_UART1_RXD,
-                            UART1_RXD_SELECT_INPUT),
+                      SW_PAD_CTL_PAD_UART1_RXD,
+                      UART1_RXD_SELECT_INPUT),
     // UART1 TX
     MAKE_PIN_CFG_UART(0, SW_MUX_CTL_PAD_UART1_TXD,
-                            SW_PAD_CTL_PAD_UART1_TXD,
-                            0x000ULL),
+                      SW_PAD_CTL_PAD_UART1_TXD,
+                      0x000ULL),
 
     // PWR_LED (used for GPIO Driver)
-    MAKE_PIN_CFG_DEFAULT(0,  SW_MUX_CTL_PAD_GPIO1_IO13),
+    MAKE_PIN_CFG_DEFAULT(0, SW_MUX_CTL_PAD_GPIO1_IO13),
+
+    // eMMC (USDHC1) Pinmux
+    MAKE_PIN_CFG_USDHC_CLK(0, SW_MUX_CTL_PAD_SD1_CLK,
+                           SW_PAD_CTL_PAD_SD1_CLK),
+    MAKE_PIN_CFG_USDHC(0, SW_MUX_CTL_PAD_SD1_CMD,
+                       SW_PAD_CTL_PAD_SD1_CMD),
+    MAKE_PIN_CFG_USDHC(0, SW_MUX_CTL_PAD_SD1_DATA0,
+                       SW_PAD_CTL_PAD_SD1_DATA0),
+    MAKE_PIN_CFG_USDHC(0, SW_MUX_CTL_PAD_SD1_DATA1,
+                       SW_PAD_CTL_PAD_SD1_DATA1),
+    MAKE_PIN_CFG_USDHC(0, SW_MUX_CTL_PAD_SD1_DATA2,
+                       SW_PAD_CTL_PAD_SD1_DATA2),
+    MAKE_PIN_CFG_USDHC(0, SW_MUX_CTL_PAD_SD1_DATA3,
+                       SW_PAD_CTL_PAD_SD1_DATA3),
+    MAKE_PIN_CFG_USDHC(0, SW_MUX_CTL_PAD_SD1_DATA4,
+                       SW_PAD_CTL_PAD_SD1_DATA4),
+    MAKE_PIN_CFG_USDHC(0, SW_MUX_CTL_PAD_SD1_DATA5,
+                       SW_PAD_CTL_PAD_SD1_DATA5),
+    MAKE_PIN_CFG_USDHC(0, SW_MUX_CTL_PAD_SD1_DATA6,
+                       SW_PAD_CTL_PAD_SD1_DATA6),
+    MAKE_PIN_CFG_USDHC(0, SW_MUX_CTL_PAD_SD1_DATA7,
+                       SW_PAD_CTL_PAD_SD1_DATA7),
+    MAKE_PIN_CFG_USDHC_CLK(0, SW_MUX_CTL_PAD_SD1_STROBE,
+                           SW_PAD_CTL_PAD_SD1_STROBE),
+
+    MAKE_PIN_CFG_DEFAULT(5, SW_MUX_CTL_PAD_SD1_RESET_B),
 };
 
 static void imx8mevk_bus_release(void* ctx) {
@@ -67,12 +117,32 @@ static int imx8mevk_start_thread(void* arg) {
     }
 
     // Pinmux
-    for (unsigned i = 0; i < sizeof(imx8mevk_pinmux)/sizeof(imx8mevk_pinmux[0]); i++) {
-        gpio_set_alt_function(&bus->gpio, 0, imx8mevk_pinmux[i]);
+    for (unsigned i = 0; i < sizeof(imx8mevk_pinmux) / sizeof(imx8mevk_pinmux[0]); i++) {
+        gpio_impl_set_alt_function(&bus->gpio, 0, imx8mevk_pinmux[i]);
+    }
+
+    if ((status = imx_i2c_init(bus)) != ZX_OK) {
+        zxlogf(ERROR, "%s: failed %d\n", __FUNCTION__, status);
+        goto fail;
     }
 
     if ((status = imx_usb_init(bus)) != ZX_OK) {
         zxlogf(ERROR, "%s: failed %d\n", __FUNCTION__, status);
+        goto fail;
+    }
+
+    if ((status = imx_gpu_init(bus)) != ZX_OK) {
+        zxlogf(ERROR, "%s: imx_gpu_init failed %d\n", __FUNCTION__, status);
+        goto fail;
+    }
+
+    if ((status = imx8m_sdhci_init(bus)) != ZX_OK) {
+        zxlogf(ERROR, "%s: failed %d\n", __FUNCTION__, status);
+        goto fail;
+    }
+
+    if ((status = pbus_device_add(&bus->pbus, &display_dev)) != ZX_OK) {
+        zxlogf(ERROR, "%s could not add display_dev: %d\n", __FUNCTION__, status);
         goto fail;
     }
 
@@ -83,16 +153,14 @@ fail:
     return status;
 }
 
-static zx_status_t imx8mevk_bus_bind(void* ctx, zx_device_t* parent)
-{
-
+static zx_status_t imx8mevk_bus_bind(void* ctx, zx_device_t* parent) {
     imx8mevk_bus_t* bus = calloc(1, sizeof(imx8mevk_bus_t));
     if (!bus) {
         return ZX_ERR_NO_MEMORY;
     }
     bus->parent = parent;
 
-    zx_status_t status = device_get_protocol(parent, ZX_PROTOCOL_PLATFORM_BUS, &bus->pbus);
+    zx_status_t status = device_get_protocol(parent, ZX_PROTOCOL_PBUS, &bus->pbus);
     if (status != ZX_OK) {
         goto fail;
     }
@@ -107,14 +175,6 @@ static zx_status_t imx8mevk_bus_bind(void* ctx, zx_device_t* parent)
     status = iommu_get_bti(&bus->iommu, 0, BTI_BOARD, &bus->bti_handle);
     if (status != ZX_OK) {
         zxlogf(ERROR, "%s: iommu_get_bti failed %d\n", __FUNCTION__, status);
-        goto fail;
-    }
-
-    const char* board_name = pbus_get_board_name(&bus->pbus);
-    if (!strcmp(board_name, "imx8mevk")) {
-        bus->soc_pid = PDEV_VID_NXP;
-    } else {
-        zxlogf(ERROR, "%s: Invalid/Unsupported board (%s)\n", __FUNCTION__, board_name);
         goto fail;
     }
 
@@ -151,8 +211,11 @@ static zx_driver_ops_t imx8mevk_bus_driver_ops = {
     .bind = imx8mevk_bus_bind,
 };
 
-ZIRCON_DRIVER_BEGIN(vim_bus, imx8mevk_bus_driver_ops, "zircon", "0.1", 4)
-    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_PLATFORM_BUS),
-    BI_ABORT_IF(NE, BIND_PLATFORM_DEV_VID, PDEV_VID_NXP),
+ZIRCON_DRIVER_BEGIN(imx8mevk_bus, imx8mevk_bus_driver_ops, "zircon", "0.1", 6)
+    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_PBUS),
+    BI_GOTO_IF(NE, BIND_PLATFORM_DEV_VID, PDEV_VID_NXP, 0),
     BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_PID, PDEV_PID_IMX8MEVK),
-ZIRCON_DRIVER_END(vim_bus)
+    BI_LABEL(0),
+    BI_ABORT_IF(NE, BIND_PLATFORM_DEV_VID, PDEV_VID_GOOGLE),
+    BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_PID, PDEV_PID_MADRONE),
+ZIRCON_DRIVER_END(imx8mevk_bus)

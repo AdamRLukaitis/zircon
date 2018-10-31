@@ -4,14 +4,13 @@
 
 #include <ddk/debug.h>
 #include <ddk/device.h>
+#include <ddk/platform-defs.h>
 #include <ddk/protocol/platform-bus.h>
-#include <ddk/protocol/platform-defs.h>
 
-#include <soc/imx8m/imx8m.h>
+#include <limits.h>
+#include <soc/imx8m/imx8m-gpio.h>
 #include <soc/imx8m/imx8m-hw.h>
 #include <soc/imx8m/imx8m-iomux.h>
-#include <soc/imx8m/imx8m-gpio.h>
-#include <limits.h>
 
 #include "imx8mevk.h"
 
@@ -42,8 +41,7 @@ static const pbus_mmio_t gpio_mmios[] = {
     {
         .base = IMX8M_AIPS_IOMUXC_BASE,
         .length = IMX8M_AIPS_LENGTH,
-    }
-};
+    }};
 
 static const pbus_irq_t gpio_irqs[] = {
     {
@@ -93,26 +91,20 @@ static pbus_dev_t gpio_dev = {
     .vid = PDEV_VID_NXP,
     .pid = PDEV_PID_IMX8MEVK,
     .did = PDEV_DID_IMX_GPIO,
-    .mmios = gpio_mmios,
+    .mmio_list = gpio_mmios,
     .mmio_count = countof(gpio_mmios),
-    .irqs = gpio_irqs,
+    .irq_list = gpio_irqs,
     .irq_count = countof(gpio_irqs),
 };
 
 zx_status_t imx8m_gpio_init(imx8mevk_bus_t* bus) {
-    zx_status_t status = pbus_device_add(&bus->pbus, &gpio_dev, PDEV_ADD_PBUS_DEVHOST);
+    zx_status_t status = pbus_protocol_device_add(&bus->pbus, ZX_PROTOCOL_GPIO_IMPL, &gpio_dev);
     if (status != ZX_OK) {
-        zxlogf(ERROR, "%s: pbus_device_add failed %d\n", __FUNCTION__, status);
+        zxlogf(ERROR, "%s: pbus_protocol_device_add failed %d\n", __FUNCTION__, status);
         return status;
     }
 
-    status = pbus_wait_protocol(&bus->pbus, ZX_PROTOCOL_GPIO);
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "%s: pbus_wait_protocol failed %d\n", __FUNCTION__, status);
-        return status;
-    }
-
-    status = device_get_protocol(bus->parent, ZX_PROTOCOL_GPIO, &bus->gpio);
+    status = device_get_protocol(bus->parent, ZX_PROTOCOL_GPIO_IMPL, &bus->gpio);
     if (status != ZX_OK) {
         zxlogf(ERROR, "%s: device_get_protocol failed %d\n", __FUNCTION__, status);
         return status;
@@ -124,6 +116,10 @@ zx_status_t imx8m_gpio_init(imx8mevk_bus_t* bus) {
             // PWR_LED
             .gpio = IMX_GPIO_PIN(1, 13), // GPIO blocks nums are 1-based
         },
+        {
+            // I2C SDA Pin
+            .gpio = IMX_GPIO_PIN(5, 17),
+        },
     };
 
     const pbus_dev_t gpio_test_dev = {
@@ -131,10 +127,10 @@ zx_status_t imx8m_gpio_init(imx8mevk_bus_t* bus) {
         .vid = PDEV_VID_GENERIC,
         .pid = PDEV_PID_GENERIC,
         .did = PDEV_DID_GPIO_TEST,
-        .gpios = gpio_test_gpios,
+        .gpio_list = gpio_test_gpios,
         .gpio_count = countof(gpio_test_gpios),
     };
-    if ((status = pbus_device_add(&bus->pbus, &gpio_test_dev, 0)) != ZX_OK) {
+    if ((status = pbus_device_add(&bus->pbus, &gpio_test_dev)) != ZX_OK) {
         zxlogf(ERROR, "%s: Could not add gpio_test_dev %d\n", __FUNCTION__, status);
         return status;
     }

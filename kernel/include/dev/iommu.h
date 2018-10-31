@@ -39,9 +39,9 @@ public:
     // |mapped_len| may be more than |size|, in the event that |size| is
     // not page-aligned.  |mapped_len| will always be page-aligned.
     //
-    // The memory in the given range of |vmo| MUST have been pined before
+    // The memory in the given range of |vmo| MUST have been pinned before
     // calling this function, and if this function returns ZX_OK,
-    // MUST NOT be unpined until after Unmap() is called on the returned range.
+    // MUST NOT be unpinned until after Unmap() is called on the returned range.
     //
     // |perms| defines the access permissions, using the IOMMU_FLAG_PERM_*
     // flags.
@@ -60,6 +60,13 @@ public:
                             uint64_t offset, size_t size, uint32_t perms,
                             dev_vaddr_t* vaddr, size_t* mapped_len) = 0;
 
+    // Same as Map, but with additional guarantee that this will never return a
+    // partial mapping.  It will either return a single contiguous mapping or
+    // return a failure.
+    virtual zx_status_t MapContiguous(uint64_t bus_txn_id, const fbl::RefPtr<VmObject>& vmo,
+                                      uint64_t offset, size_t size, uint32_t perms,
+                                      dev_vaddr_t* vaddr, size_t* mapped_len) = 0;
+
     // Revoke access to the range of addresses [vaddr, vaddr + size) for the
     // device identified by |bus_txn_id|.
     //
@@ -76,11 +83,11 @@ public:
     // Returns the number of bytes that Map() can guarantee, upon success, to find
     // a contiguous address range for.  This function is only returns meaningful
     // values if |IsValidBusTxnId(bus_txn_id)|.
-    virtual uint64_t minimum_contiguity(uint64_t bus_txn_id) const = 0;
+    virtual uint64_t minimum_contiguity(uint64_t bus_txn_id) = 0;
 
     // Returns the total size of the space the addresses are mapped into.  This
     // function is only returns meaningful values if |IsValidBusTxnId(bus_txn_id)|.
-    virtual uint64_t aspace_size(uint64_t bus_txn_id) const = 0;
+    virtual uint64_t aspace_size(uint64_t bus_txn_id) = 0;
 
     virtual ~Iommu() { }
 };

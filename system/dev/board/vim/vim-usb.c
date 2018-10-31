@@ -3,7 +3,7 @@
 // found in the LICENSE file.
 
 #include <ddk/debug.h>
-#include <ddk/protocol/platform-defs.h>
+#include <ddk/platform-defs.h>
 #include <hw/reg.h>
 
 #include <soc/aml-common/aml-usb-phy.h>
@@ -41,11 +41,11 @@ static const pbus_dev_t xhci_dev = {
     .vid = PDEV_VID_GENERIC,
     .pid = PDEV_PID_GENERIC,
     .did = PDEV_DID_USB_XHCI,
-    .mmios = xhci_mmios,
+    .mmio_list = xhci_mmios,
     .mmio_count = countof(xhci_mmios),
-    .irqs = xhci_irqs,
+    .irq_list = xhci_irqs,
     .irq_count = countof(xhci_irqs),
-    .btis = xhci_btis,
+    .bti_list = xhci_btis,
     .bti_count = countof(xhci_btis),
 };
 
@@ -103,7 +103,7 @@ zx_status_t vim_usb_init(vim_bus_t* bus) {
     io_buffer_release(&usb_phy);
     zx_handle_close(bti);
 
-    if ((status = pbus_device_add(&bus->pbus, &xhci_dev, 0)) != ZX_OK) {
+    if ((status = pbus_device_add(&bus->pbus, &xhci_dev)) != ZX_OK) {
         zxlogf(ERROR, "vim_usb_init could not add xhci_dev: %d\n", status);
         return status;
     }

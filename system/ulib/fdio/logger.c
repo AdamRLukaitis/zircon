@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include <fdio/io.h>
+#include <lib/fdio/io.h>
 
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -42,7 +42,7 @@ static ssize_t log_write(fdio_t* io, const void* _data, size_t len) {
     while (len-- > 0) {
         char c = *data++;
         if (c == '\n') {
-            zx_log_write(log_io->handle, logbuf->next, logbuf->data, 0);
+            zx_debuglog_write(log_io->handle, 0, logbuf->data, logbuf->next);
             logbuf->next = 0;
             continue;
         }
@@ -51,7 +51,7 @@ static ssize_t log_write(fdio_t* io, const void* _data, size_t len) {
         }
         logbuf->data[logbuf->next++] = c;
         if (logbuf->next == LOGBUF_MAX) {
-            zx_log_write(log_io->handle, logbuf->next, logbuf->data, 0);
+            zx_debuglog_write(log_io->handle, 0, logbuf->data, logbuf->next);
             logbuf->next = 0;
             continue;
         }
@@ -83,10 +83,6 @@ static fdio_ops_t log_io_ops = {
     .read_at = fdio_default_read_at,
     .write = log_write,
     .write_at = fdio_default_write_at,
-    .recvfrom = fdio_default_recvfrom,
-    .sendto = fdio_default_sendto,
-    .recvmsg = fdio_default_recvmsg,
-    .sendmsg = fdio_default_sendmsg,
     .seek = fdio_default_seek,
     .misc = fdio_default_misc,
     .close = log_close,
@@ -96,11 +92,28 @@ static fdio_ops_t log_io_ops = {
     .wait_begin = fdio_default_wait_begin,
     .wait_end = fdio_default_wait_end,
     .unwrap = fdio_default_unwrap,
-    .shutdown = fdio_default_shutdown,
     .posix_ioctl = fdio_default_posix_ioctl,
     .get_vmo = fdio_default_get_vmo,
+    .get_token = fdio_default_get_token,
+    .get_attr = fdio_default_get_attr,
+    .set_attr = fdio_default_set_attr,
+    .sync = fdio_default_sync,
+    .readdir = fdio_default_readdir,
+    .rewind = fdio_default_rewind,
+    .unlink = fdio_default_unlink,
+    .truncate = fdio_default_truncate,
+    .rename = fdio_default_rename,
+    .link = fdio_default_link,
+    .get_flags = fdio_default_get_flags,
+    .set_flags = fdio_default_set_flags,
+    .recvfrom = fdio_default_recvfrom,
+    .sendto = fdio_default_sendto,
+    .recvmsg = fdio_default_recvmsg,
+    .sendmsg = fdio_default_sendmsg,
+    .shutdown = fdio_default_shutdown,
 };
 
+__EXPORT
 fdio_t* fdio_logger_create(zx_handle_t handle) {
     fdio_log_t* log = calloc(1, sizeof(fdio_log_t));
     if (log == NULL) {

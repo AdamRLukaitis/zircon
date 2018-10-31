@@ -8,22 +8,20 @@
 #ifndef __PLATFORM_MULTIBOOT_H
 #define __PLATFORM_MULTIBOOT_H
 
-#include <stdint.h>
-
 /* magic number for multiboot header */
 #define MULTIBOOT_HEADER_MAGIC      0x1BADB002
 
-/* flags for multiboot header */
-#ifdef __ELF__
-#define MULTIBOOT_HEADER_FLAGS      0x00000003
-#else
-#define MULTIBOOT_HEADER_FLAGS      0x00010003
-#endif
+// Flags for multiboot header:
+//   0x00000002: Boot loader should provide memory map.
+//   0x00010000: *_addr fields in multiboot_header_t are used.
+#define MULTIBOOT_HEADER_FLAGS      0x00010002
 
 /* magic number passed by multiboot-compliant boot loaders */
 #define MULTIBOOT_BOOTLOADER_MAGIC  0x2BADB002
 
 #ifndef __ASSEMBLER__
+
+#include <stdint.h>
 
 /* multiboot header */
 typedef struct multiboot_header {
@@ -68,22 +66,25 @@ typedef struct multiboot_info {
     } u;
     uint32_t mmap_length;
     uint32_t mmap_addr;
+    uint32_t drives_length;
+    uint32_t drives_addr;
+    uint32_t config_table;
+    uint32_t boot_loader_name;
+    uint32_t apm_table;
 } multiboot_info_t;
 
-enum {
-    MB_INFO_MEM_SIZE    = 0x001,
-    MB_INFO_BOOT_DEV    = 0x002,
-    MB_INFO_CMD_LINE    = 0x004,
-    MB_INFO_MODS        = 0x008,
-    MB_INFO_SYMS        = 0x010,
-    MB_INFO_SHDR        = 0x020,
-    MB_INFO_MMAP        = 0x040,
-    MB_INFO_DRIVES      = 0x080,
-    MB_INFO_CONFIG      = 0x100,
-    MB_INFO_BOOT_LOADER = 0x200,
-    MB_INFO_APM_TABLE   = 0x400,
-    MB_INFO_VBE         = 0x800,
-};
+#define MB_INFO_MEM_SIZE 0x001
+#define MB_INFO_BOOT_DEV 0x002
+#define MB_INFO_CMD_LINE 0x004
+#define MB_INFO_MODS 0x008
+#define MB_INFO_SYMS 0x010
+#define MB_INFO_SHDR 0x020
+#define MB_INFO_MMAP 0x040
+#define MB_INFO_DRIVES 0x080
+#define MB_INFO_CONFIG 0x100
+#define MB_INFO_BOOT_LOADER 0x200
+#define MB_INFO_APM_TABLE 0x400
+#define MB_INFO_VBE 0x800
 
 /* module structure */
 typedef struct module {
@@ -104,12 +105,10 @@ typedef struct memory_map {
 } memory_map_t;
 
 /* memory map entry types */
-enum {
-    MB_MMAP_TYPE_AVAILABLE      = 0x01,
-    MB_MMAP_TYPE_RESERVED       = 0x02,
-    MB_MMAP_TYPE_ACPI_RECLAIM   = 0x03,
-    MB_MMAP_TYPE_ACPI_NVS       = 0x04,
-};
+#define MB_MMAP_TYPE_AVAILABLE 0x01
+#define MB_MMAP_TYPE_RESERVED 0x02
+#define MB_MMAP_TYPE_ACPI_RECLAIM 0x03
+#define MB_MMAP_TYPE_ACPI_NVS 0x04
 
 #endif
 

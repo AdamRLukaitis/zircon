@@ -9,6 +9,8 @@
 
 namespace zx {
 
+class process;
+
 class job : public task<job> {
 public:
     static constexpr zx_obj_type_t TYPE = ZX_OBJ_TYPE_JOB;
@@ -26,19 +28,33 @@ public:
         return *this;
     }
 
-    static zx_status_t create(zx_handle_t parent_job, uint32_t options, job* result);
+    static zx_status_t create(const zx::job& parent, uint32_t options, job* result);
 
-    zx_status_t set_policy(uint32_t options, uint32_t topic, void* policy, uint32_t count) const {
+    // Provide strongly-typed overloads, in addition to get_child(handle*).
+    using task<job>::get_child;
+    zx_status_t get_child(uint64_t koid, zx_rights_t rights,
+                          job* result) const {
+        // Allow for |result| and |this| aliasing the same container.
+        job h;
+        zx_status_t status = zx_object_get_child(
+            value_, koid, rights, h.reset_and_get_address());
+        result->reset(h.release());
+        return status;
+    }
+    zx_status_t get_child(uint64_t koid, zx_rights_t rights,
+                          process* result) const;
+
+    zx_status_t set_policy(uint32_t options, uint32_t topic, const void* policy, uint32_t count) const {
       return zx_job_set_policy(get(), options, topic, policy, count);
     }
 
     // Ideally this would be called zx::job::default(), but default is a
     // C++ keyword and cannot be used as a function name.
-    static inline const unowned<job> default_job() {
+    static inline unowned<job> default_job() {
         return unowned<job>(zx_job_default());
     }
 };
 
-using unowned_job = const unowned<job>;
+using unowned_job = unowned<job>;
 
 } // namespace zx

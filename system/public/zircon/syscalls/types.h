@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <zircon/compiler.h>
+
 __BEGIN_CDECLS
 
 // forward declarations needed by syscalls.h
@@ -14,5 +16,7 @@ typedef struct zx_pci_init_arg zx_pci_init_arg_t;
 typedef union zx_rrec zx_rrec_t;
 typedef struct zx_system_powerctl_arg zx_system_powerctl_arg_t;
 typedef struct zx_profile_info zx_profile_info_t;
+typedef struct zx_smc_parameters zx_smc_parameters_t;
+typedef struct zx_smc_result zx_smc_result_t;
 
 __END_CDECLS

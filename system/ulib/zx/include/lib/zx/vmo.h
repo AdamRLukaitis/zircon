@@ -44,10 +44,13 @@ public:
         return zx_vmo_set_size(get(), size);
     }
 
-    zx_status_t clone(uint32_t options, uint64_t offset, uint64_t size, vmo* result) const {
-        zx_handle_t h = ZX_HANDLE_INVALID;
-        zx_status_t status = zx_vmo_clone(get(), options, offset, size, &h);
-        result->reset(h);
+    zx_status_t clone(uint32_t options, uint64_t offset, uint64_t size,
+                      vmo* result) const {
+        // Allow for the caller aliasing |result| to |this|.
+        vmo h;
+        zx_status_t status = zx_vmo_clone(
+            get(), options, offset, size, h.reset_and_get_address());
+        result->reset(h.release());
         return status;
     }
 
@@ -59,8 +62,18 @@ public:
     zx_status_t set_cache_policy(uint32_t cache_policy) {
         return zx_vmo_set_cache_policy(get(), cache_policy);
     }
+
+    zx_status_t replace_as_executable(const handle& vmex, vmo* result) {
+        zx_handle_t h = ZX_HANDLE_INVALID;
+        zx_status_t status = zx_vmo_replace_as_executable(value_, vmex.get(), &h);
+        // We store ZX_HANDLE_INVALID to value_ before calling reset on result
+        // in case result == this.
+        value_ = ZX_HANDLE_INVALID;
+        result->reset(h);
+        return status;
+    }
 };
 
-using unowned_vmo = const unowned<vmo>;
+using unowned_vmo = unowned<vmo>;
 
 } // namespace zx

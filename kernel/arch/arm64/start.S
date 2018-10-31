@@ -24,21 +24,24 @@
 tmp                     .req x9
 tmp2                    .req x10
 wtmp2                   .req w10
-page_table              .req x11
 
 cpuid                   .req x19
 page_table0             .req x20
 page_table1             .req x21
+kernel_vaddr            .req x22
 
-.section .text.boot, "a", @progbits
+// This code is purely position-independent and generates no relocations
+// that need boot-time fixup; gen-kaslr-fixup.sh ensures this (and would
+// ignore it if this code were in .text.boot, so don't put it there).
+.text
 FUNCTION(_start)
     /* Save the Boot info for the primary CPU only */
     mrs     cpuid, mpidr_el1
     ubfx    cpuid, cpuid, #0, #15 /* mask Aff0 and Aff1 fields */
     cbnz    cpuid, .Lno_save_bootinfo
-    /* save x0 in bootdata_paddr */
-    adrp    tmp, bootdata_paddr
-    str     x0, [tmp, #:lo12:bootdata_paddr]
+    /* save x0 in zbi_paddr */
+    adrp    tmp, zbi_paddr
+    str     x0, [tmp, #:lo12:zbi_paddr]
     /* save entry point physical address in kernel_entry_paddr */
     adrp    tmp, kernel_entry_paddr
     adr     tmp2, _start
@@ -57,16 +60,23 @@ FUNCTION(_start)
     orr     tmp, tmp, #(1<<2)  /* Enable dcache/ucache */
     msr     sctlr_el1, tmp
 
-    /* load the base of the translation tables */
+    // This can be any arbitrary (page-aligned) address >= KERNEL_ASPACE_BASE.
+    // TODO(SEC-31): Choose it randomly.
+    adr_global  tmp, kernel_relocated_base
+    ldr     kernel_vaddr, [tmp]
+
+    // Load the base of the translation tables.
     adr_global page_table0, tt_trampoline
     adr_global page_table1, arm64_kernel_translation_table
 
-    /* Prepare tt_trampoline page table */
-    /* Calculate pagetable physical addresses */
-    adr_global page_table0, tt_trampoline
-
-    /* send secondary cpus over to a waiting spot for the primary to finish */
+    // Send secondary cpus over to a waiting spot for the primary to finish.
     cbnz    cpuid, .Lmmu_enable_secondary
+
+    // The fixup code appears right after the kernel image (at __data_end in
+    // our view).  Note this code overlaps with the kernel's bss!  It
+    // expects x0 to contain the actual runtime address of __code_start.
+    mov     x0, kernel_vaddr
+    bl      __data_end
 
     /* clear out the kernel's bss using current physical location */
     /* NOTE: Relies on __bss_start and _end being 16 byte aligned */
@@ -117,7 +127,7 @@ FUNCTION(_start)
     /* map the kernel to a fixed address */
     /* note: mapping the kernel here with full rwx, this will get locked down later in vm initialization; */
     mov     x0, page_table1
-    mov     x1, KERNEL_BASE
+    mov     x1, kernel_vaddr
     adr_global x2, __code_start
     adr_global x3, _end
     sub     x3, x3, x2
@@ -192,8 +202,12 @@ FUNCTION(_start)
 .Lmmu_on_pc:
     isb
 
-    /* Jump to virtual code address */
-    movabs  tmp, .Lmmu_on_vaddr
+    // Map our current physical PC to the virtual PC and jump there.
+    // PC = next_PC - __code_start + kernel_vaddr
+    adr     tmp, .Lmmu_on_vaddr
+    adr     tmp2, __code_start
+    sub     tmp, tmp, tmp2
+    add     tmp, tmp, kernel_vaddr
     br      tmp
 
 .Lmmu_on_vaddr:
@@ -258,9 +272,9 @@ END_FUNCTION(_start)
 DATA(arch_boot_el)
     .quad 0xdeadbeef00ff00ff
 END_DATA(arch_boot_el)
-DATA(bootdata_paddr)
+DATA(zbi_paddr)
     .quad -1
-END_DATA(bootdata_paddr)
+END_DATA(zbi_paddr)
 DATA(kernel_entry_paddr)
     .quad -1
 END_DATA(kernel_entry_paddr)
@@ -300,3 +314,11 @@ END_DATA(boot_cpu_unsafe_kstack)
 DATA(tt_trampoline)
     .skip 8 * MMU_PAGE_TABLE_ENTRIES_IDENT
 END_DATA(tt_trampoline)
+
+// This symbol is used by image.S
+.global IMAGE_ELF_ENTRY
+IMAGE_ELF_ENTRY = _start
+
+// This symbol is used by gdb python to know the base of the kernel module
+.global KERNEL_BASE_ADDRESS
+KERNEL_BASE_ADDRESS = KERNEL_BASE

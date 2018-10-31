@@ -50,7 +50,6 @@
 
 char* appname;
 int64_t us_between_packets = DEFAULT_US_BETWEEN_PACKETS;
-bool use_filename_prefix = true;
 
 static bool use_tftp = true;
 static bool use_color = true;
@@ -196,9 +195,13 @@ void usage(void) {
             "             (ignored with --tftp)\n"
             "  -n         only boot device with this nodename\n"
             "  -w <sz>    tftp window size (default=%d, ignored with --netboot)\n"
-            "  --fvm <file>   use the supplied file as a sparse FVM image (up to 4 times)\n"
-            "  --efi <file>   use the supplied file as an EFI image\n"
-            "  --kernc <file> use the supplied file as a KERN-C CrOS image\n"
+            "  --fvm <file>        use the supplied file as a sparse FVM image (up to 4 times)\n"
+            "  --bootloader <file> use the supplied file as a BOOTLOADER image\n"
+            "  --efi <file>        use the supplied file as an EFI image\n"
+            "  --kernc <file>      use the supplied file as a KERN-C CrOS image\n"
+            "  --zircona <file>    use the supplied file as a ZIRCON-A ZBI\n"
+            "  --zirconb <file>    use the supplied file as a ZIRCON-B ZBI\n"
+            "  --zirconr <file>    use the supplied file as a ZIRCON-R ZBI\n"
             "  --netboot    use the netboot protocol\n"
             "  --tftp       use the tftp protocol (default)\n"
             "  --nocolor    disable ANSI color (false)\n",
@@ -236,10 +239,42 @@ int send_boot_command(struct sockaddr_in6* ra) {
     ssize_t send_result = sendto(s, &msg, sizeof(msg), 0, (struct sockaddr*)&target_addr,
                                  sizeof(target_addr));
     if (send_result == sizeof(msg)) {
+        close(s);
         log("Issued boot command to %s\n\n", sockaddr_str(ra));
         return 0;
     }
+    close(s);
     log("failure sending boot command to %s", sockaddr_str(ra));
+    return -1;
+}
+
+int send_reboot_command(struct sockaddr_in6* ra) {
+    // Construct message
+    nbmsg msg;
+    static int cookie = 0;
+    msg.magic = NB_MAGIC;
+    msg.cookie = cookie++;
+    msg.cmd = NB_REBOOT;
+    msg.arg = 0;
+
+    // Send to NB_SERVER_PORT
+    struct sockaddr_in6 target_addr;
+    memcpy(&target_addr, ra, sizeof(struct sockaddr_in6));
+    target_addr.sin6_port = htons(NB_SERVER_PORT);
+    int s = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+    if (s < 0) {
+        log("cannot create socket %d", s);
+        return -1;
+    }
+    ssize_t send_result = sendto(s, &msg, sizeof(msg), 0, (struct sockaddr*)&target_addr,
+                                 sizeof(target_addr));
+    if (send_result == sizeof(msg)) {
+        close(s);
+        log("Issued reboot command to %s\n\n", sockaddr_str(ra));
+        return 0;
+    }
+    close(s);
+    log("failure sending reboot command to %s", sockaddr_str(ra));
     return -1;
 }
 
@@ -250,10 +285,14 @@ int main(int argc, char** argv) {
     char cmdline[4096];
     char* cmdnext = cmdline;
     char* nodename = NULL;
-    int r, s, n = 1;
-    int num_fvms = 0;
+    int s = 1;
+    size_t num_fvms = 0;
+    const char* bootloader_image = NULL;
     const char* efi_image = NULL;
     const char* kernc_image = NULL;
+    const char* zircona_image = NULL;
+    const char* zirconb_image = NULL;
+    const char* zirconr_image = NULL;
     const char* fvm_images[MAX_FVM_IMAGES] = {NULL, NULL, NULL, NULL};
     const char* kernel_fn = NULL;
     const char* ramdisk_fn = NULL;
@@ -280,7 +319,7 @@ int main(int argc, char** argv) {
         } else if (!strcmp(argv[1], "--fvm")) {
             argc--;
             argv++;
-            if (argc <= 2) {
+            if (argc <= 1) {
                 fprintf(stderr, "'--fvm' option requires an argument (FVM image)\n");
                 return -1;
             }
@@ -289,10 +328,18 @@ int main(int argc, char** argv) {
                 return -1;
             }
             fvm_images[num_fvms++] = argv[1];
+        } else if (!strcmp(argv[1], "--bootloader")) {
+            argc--;
+            argv++;
+            if (argc <= 1) {
+                fprintf(stderr, "'--bootloader' option requires an argument (BOOTLOADER image)\n");
+                return -1;
+            }
+            bootloader_image = argv[1];
         } else if (!strcmp(argv[1], "--efi")) {
             argc--;
             argv++;
-            if (argc <= 2) {
+            if (argc <= 1) {
                 fprintf(stderr, "'--efi' option requires an argument (EFI image)\n");
                 return -1;
             }
@@ -300,15 +347,39 @@ int main(int argc, char** argv) {
         } else if (!strcmp(argv[1], "--kernc")) {
             argc--;
             argv++;
-            if (argc <= 2) {
+            if (argc <= 1) {
                 fprintf(stderr, "'--kernc' option requires an argument (KERN-C image)\n");
                 return -1;
             }
             kernc_image = argv[1];
+        } else if (!strcmp(argv[1], "--zircona")) {
+            argc--;
+            argv++;
+            if (argc <= 1) {
+                fprintf(stderr, "'--zircona' option requires an argument (ZIRCON-A image)\n");
+                return -1;
+            }
+            zircona_image = argv[1];
+        } else if (!strcmp(argv[1], "--zirconb")) {
+            argc--;
+            argv++;
+            if (argc <= 1) {
+                fprintf(stderr, "'--zirconb' option requires an argument (ZIRCON-B image)\n");
+                return -1;
+            }
+            zirconb_image = argv[1];
+        } else if (!strcmp(argv[1], "--zirconr")) {
+            argc--;
+            argv++;
+            if (argc <= 1) {
+                fprintf(stderr, "'--zirconr' option requires an argument (ZIRCON-R image)\n");
+                return -1;
+            }
+            zirconr_image = argv[1];
         } else if (!strcmp(argv[1], "-1")) {
             once = 1;
         } else if (!strcmp(argv[1], "-b")) {
-            if (argc <= 2) {
+            if (argc <= 1) {
                 fprintf(stderr, "'-b' option requires an argument (tftp block size)\n");
                 return -1;
             }
@@ -323,7 +394,7 @@ int main(int argc, char** argv) {
             argc--;
             argv++;
         } else if (!strcmp(argv[1], "-w")) {
-            if (argc <= 2) {
+            if (argc <= 1) {
                 fprintf(stderr, "'-w' option requires an argument (tftp window size)\n");
                 return -1;
             }
@@ -338,7 +409,7 @@ int main(int argc, char** argv) {
             argc--;
             argv++;
         } else if (!strcmp(argv[1], "-i")) {
-            if (argc <= 2) {
+            if (argc <= 1) {
                 fprintf(stderr, "'-i' option requires an argument (micros between packets)\n");
                 return -1;
             }
@@ -352,7 +423,7 @@ int main(int argc, char** argv) {
             argc--;
             argv++;
         } else if (!strcmp(argv[1], "-a")) {
-            if (argc <= 2) {
+            if (argc <= 1) {
                 fprintf(stderr, "'-a' option requires a valid ipv6 address\n");
                 return -1;
             }
@@ -363,7 +434,7 @@ int main(int argc, char** argv) {
             argc--;
             argv++;
         } else if (!strcmp(argv[1], "-n")) {
-            if (argc <= 2) {
+            if (argc <= 1) {
                 fprintf(stderr, "'-n' option requires a valid nodename\n");
                 return -1;
             }
@@ -398,7 +469,8 @@ int main(int argc, char** argv) {
         argc--;
         argv++;
     }
-    if (kernel_fn == NULL) {
+    if (!kernel_fn && !bootloader_image && !efi_image && !kernc_image && !zircona_image &&
+        !zirconb_image && !zirconr_image && !fvm_images[0]) {
         usage();
     }
     if (!nodename) {
@@ -406,25 +478,6 @@ int main(int argc, char** argv) {
     }
     if (nodename) {
         fprintf(stderr, "[%s] Will only boot nodename '%s'\n", appname, nodename);
-    }
-
-    // compute the default ramdisk fn to use if
-    // ramdisk is not specified and such a ramdisk
-    // file actually exists
-    char* auto_ramdisk_fn = NULL;
-    if (ramdisk_fn == NULL) {
-        char* bootdata_fn = "bootdata.bin";
-        char* end = strrchr(kernel_fn, '/');
-        if (end == NULL) {
-            auto_ramdisk_fn = bootdata_fn;
-        } else {
-            size_t prefix_len = (end - kernel_fn) + 1;
-            size_t len = prefix_len + strlen(bootdata_fn) + 1;
-            if ((auto_ramdisk_fn = malloc(len)) != NULL) {
-                memcpy(auto_ramdisk_fn, kernel_fn, prefix_len);
-                memcpy(auto_ramdisk_fn + prefix_len, bootdata_fn, strlen(bootdata_fn) + 1);
-            }
-        }
     }
 
     memset(&addr, 0, sizeof(addr));
@@ -436,11 +489,11 @@ int main(int argc, char** argv) {
         log("cannot create socket %d", s);
         return -1;
     }
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &n, sizeof(n));
-    if ((r = bind(s, (void*)&addr, sizeof(addr))) < 0) {
-        log("cannot bind to %s %d: %s\n",
+    if (bind(s, (void*)&addr, sizeof(addr)) < 0) {
+        log("cannot bind to %s %d: %s\nthere may be another bootserver running\n",
             sockaddr_str(&addr),
             errno, strerror(errno));
+        close(s);
         return -1;
     }
 
@@ -452,12 +505,13 @@ int main(int argc, char** argv) {
         char buf[4096];
         nbmsg* msg = (void*)buf;
         rlen = sizeof(ra);
-        r = recvfrom(s, buf, sizeof(buf) - 1, 0, (void*)&ra, &rlen);
+        ssize_t r = recvfrom(s, buf, sizeof(buf) - 1, 0, (void*)&ra, &rlen);
         if (r < 0) {
-            log("socket read error %d", r);
+            log("socket read error %s", strerror(errno));
+            close(s);
             return -1;
         }
-        if (r < sizeof(nbmsg))
+        if ((size_t)r < sizeof(nbmsg))
             continue;
         if (!IN6_IS_ADDR_LINKLOCAL(&ra.sin6_addr)) {
             log("ignoring non-link-local message");
@@ -479,6 +533,7 @@ int main(int argc, char** argv) {
                 "detected from %s, please upgrade your bootloader%s",
                 ANSI(RED), msg->arg, sockaddr_str(&ra), ANSI(RESET));
             if (once) {
+                close(s);
                 return -1;
             }
             continue;
@@ -491,7 +546,7 @@ int main(int argc, char** argv) {
 
         char* save = NULL;
         char* adv_nodename = NULL;
-        char* adv_version = "unknown";
+        const char* adv_version = "unknown";
         for (char* var = strtok_r((char*)msg->data, ";", &save);
              var;
              var = strtok_r(NULL, ";", &save)) {
@@ -514,13 +569,10 @@ int main(int argc, char** argv) {
         }
 
         if (strcmp(BOOTLOADER_VERSION, adv_version)) {
-            log("%sWARNING: Bootserver version '%s' != remote bootloader '%s'. Please Upgrade%s",
+            log("%sWARNING: Bootserver version '%s' != remote bootloader '%s'."
+                " Device will not be serviced. Please Upgrade%s",
                 ANSI(RED), BOOTLOADER_VERSION, adv_version, ANSI(RESET));
-            if (!strcmp(adv_version, "0.5.5")) {
-                use_filename_prefix = false;
-            }
-        } else {
-            use_filename_prefix = true;
+            continue;
         }
 
         if (cmdline[0]) {
@@ -529,41 +581,50 @@ int main(int argc, char** argv) {
             status = 0;
         }
         if (status == 0) {
-            struct stat s;
             if (ramdisk_fn) {
-                status = xfer(&ra, ramdisk_fn,
-                              use_filename_prefix ? NB_RAMDISK_FILENAME : "ramdisk.bin");
-            } else if (auto_ramdisk_fn && (stat(auto_ramdisk_fn, &s) == 0)) {
-                status = xfer(&ra, auto_ramdisk_fn,
-                              use_filename_prefix ? NB_RAMDISK_FILENAME : "ramdisk.bin");
+                status = xfer(&ra, ramdisk_fn, NB_RAMDISK_FILENAME);
             }
         }
-        for(size_t i = 0; i < num_fvms; i++) {
-          if (status == 0 && fvm_images[i]) {
-              status = xfer(&ra, fvm_images[i], use_filename_prefix ? NB_FVM_FILENAME
-                            : NB_FVM_HOST_FILENAME);
-          }
+        for (size_t i = 0; i < num_fvms; i++) {
+            if (status == 0 && fvm_images[i]) {
+                status = xfer(&ra, fvm_images[i], NB_FVM_FILENAME);
+            }
+        }
+        if (status == 0 && bootloader_image) {
+            status = xfer(&ra, bootloader_image, NB_BOOTLOADER_FILENAME);
         }
         if (status == 0 && efi_image) {
-            status = xfer(&ra, efi_image, use_filename_prefix ? NB_EFI_FILENAME
-                          : NB_EFI_HOST_FILENAME);
+            status = xfer(&ra, efi_image, NB_EFI_FILENAME);
         }
         if (status == 0 && kernc_image) {
-            status = xfer(&ra, kernc_image, use_filename_prefix ? NB_KERNC_FILENAME
-                          : NB_KERNC_HOST_FILENAME);
+            status = xfer(&ra, kernc_image, NB_KERNC_FILENAME);
         }
-
+        if (status == 0 && zircona_image) {
+            status = xfer(&ra, zircona_image, NB_ZIRCONA_FILENAME);
+        }
+        if (status == 0 && zirconb_image) {
+            status = xfer(&ra, zirconb_image, NB_ZIRCONB_FILENAME);
+        }
+        if (status == 0 && zirconr_image) {
+            status = xfer(&ra, zirconr_image, NB_ZIRCONR_FILENAME);
+        }
+        if (status == 0 && kernel_fn) {
+            status = xfer(&ra, kernel_fn, NB_KERNEL_FILENAME);
+        }
         if (status == 0) {
-            status = xfer(&ra, kernel_fn, use_filename_prefix ? NB_KERNEL_FILENAME : "kernel.bin");
-            if (status == 0) {
+            if (kernel_fn) {
                 send_boot_command(&ra);
+            } else {
+                send_reboot_command(&ra);
             }
         }
         if (once) {
+            close(s);
             return status == 0 ? 0 : -1;
         }
         drain(s);
     }
 
+    close(s);
     return 0;
 }

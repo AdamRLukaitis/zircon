@@ -49,11 +49,16 @@ public:
         return zx_process_write_memory(get(), vaddr, buffer, len, actual);
     }
 
-    static inline const unowned<process> self() {
+    // Provide strongly-typed overload, in addition to get_child(handle*).
+    using task<process>::get_child;
+    zx_status_t get_child(uint64_t koid, zx_rights_t rights,
+                          thread* result) const;
+
+    static inline unowned<process> self() {
         return unowned<process>(zx_process_self());
     }
 };
 
-using unowned_process = const unowned<process>;
+using unowned_process = unowned<process>;
 
 } // namespace zx

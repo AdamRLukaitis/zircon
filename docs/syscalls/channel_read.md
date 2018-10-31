@@ -54,6 +54,10 @@ When communicating to an untrusted party over a channel, it is recommended
 that the **channel_read_etc**() form is used and each handle type and rights
 are validated against the expected values.
 
+## RIGHTS
+
+*handle* must have **ZX_RIGHT_READ**.
+
 ## RETURN VALUE
 
 Both forms of read returns **ZX_OK** on success, if *actual_bytes*
@@ -75,7 +79,9 @@ and count of handles read.
 
 **ZX_ERR_PEER_CLOSED**  The other side of the channel is closed.
 
-**ZX_ERR_NO_MEMORY**  (Temporary) Failure due to lack of memory.
+**ZX_ERR_NO_MEMORY**  Failure due to lack of memory.
+There is no good way for userspace to handle this (unlikely) error.
+In a future build this error will no longer occur.
 
 **ZX_ERR_BUFFER_TOO_SMALL**  The provided *bytes* or *handles* buffers
 are too small (in which case, the minimum sizes necessary to receive

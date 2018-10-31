@@ -6,6 +6,10 @@
 #include <inttypes.h>
 #include <sys/ioctl.h>
 
+#include <fvm/fvm.h>
+
+#include <lib/fit/defer.h>
+
 #include "fvm/container.h"
 
 #if defined(__APPLE__)
@@ -37,7 +41,7 @@ zx_status_t FvmContainer::Create(const char* path, size_t slice_size, off_t offs
 }
 
 FvmContainer::FvmContainer(const char* path, size_t slice_size, off_t offset, off_t length)
-    : Container(path, slice_size), valid_(false), disk_offset_(offset), disk_size_(length),
+    : Container(path, slice_size, 0), valid_(false), disk_offset_(offset), disk_size_(length),
       vpart_hint_(1), pslice_hint_(1) {
     fd_.reset(open(path, O_RDWR, 0644));
     if (!fd_) {
@@ -78,13 +82,7 @@ FvmContainer::FvmContainer(const char* path, size_t slice_size, off_t offset, of
 
     // Even if disk size is 0, this will default to at least FVM_BLOCK_SIZE
     metadata_size_ = fvm::MetadataSize(disk_size_, slice_size_);
-
-    fbl::AllocChecker ac;
-    metadata_.reset(new (&ac) uint8_t[metadata_size_ * 2]);
-    if (!ac.check()) {
-        fprintf(stderr, "Unable to acquire resources for metadata\n");
-        exit(-1);
-    }
+    metadata_.reset(new uint8_t[metadata_size_ * 2]);
 
     // Clear entire primary copy of metadata
     memset(metadata_.get(), 0, metadata_size_);
@@ -96,25 +94,52 @@ FvmContainer::FvmContainer(const char* path, size_t slice_size, off_t offset, of
             exit(-1);
         }
 
-        ssize_t rd = read(fd_.get(), metadata_.get(), metadata_size_ * 2);
-        if (rd != static_cast<ssize_t>(metadata_size_ * 2)) {
-            fprintf(stderr, "Metadata read failed: expected %ld, actual %ld\n", metadata_size_, rd);
+        // Read superblock first so we can determine if container has a different slice size.
+        ssize_t rd = read(fd_.get(), metadata_.get(), sizeof(fvm::fvm_t));
+        if (rd != static_cast<ssize_t>(sizeof(fvm::fvm_t))) {
+            fprintf(stderr, "Superblock read failed: expected %ld, actual %ld\n",
+                    sizeof(fvm::fvm_t), rd);
             exit(-1);
         }
 
-        const void* backup = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(metadata_.get()) +
-                                                     metadata_size_);
+        // If the image is obviously not an FVM header, bail out early.
+        // Otherwise, we go through the effort of ensuring the header is
+        // valid before using it.
+        if (SuperBlock()->magic != FVM_MAGIC) {
+            return;
+        }
 
-        // For now we always assume that primary metadata is primary
-        if (fvm_validate_header(metadata_.get(), backup, metadata_size_, nullptr) == ZX_OK) {
-            valid_ = true;
+        // Recalculate metadata size.
+        size_t old_slice_size = SuperBlock()->slice_size;
+        size_t old_metadata_size = fvm::MetadataSize(disk_size_, old_slice_size);
+        auto old_metadata = fbl::unique_ptr<uint8_t[]>(new uint8_t[old_metadata_size * 2]);
 
-            // Set the slice size to what is specified on disk.
-            slice_size_ = SuperBlock()->slice_size;
+        if (lseek(fd_.get(), disk_offset_, SEEK_SET) < 0) {
+            fprintf(stderr, "Seek reset failed\n");
+            exit(-1);
+        }
 
-            if (memcmp(metadata_.get(), backup, metadata_size_)) {
-                fprintf(stderr, "Warning: primary and backup metadata do not match\n");
+        // Read remainder of metadata.
+        rd = read(fd_.get(), old_metadata.get(), old_metadata_size * 2);
+        if (rd != static_cast<ssize_t>(old_metadata_size * 2)) {
+            fprintf(stderr, "Metadata read failed: expected %ld, actual %ld\n",
+                    old_metadata_size * 2, rd);
+            exit(-1);
+        }
+
+        const void* backup = reinterpret_cast<void*>(
+            reinterpret_cast<uintptr_t>(old_metadata.get()) + old_metadata_size);
+        const void* primary = nullptr;
+        if (fvm_validate_header(old_metadata.get(), backup, old_metadata_size, &primary) == ZX_OK) {
+            if (primary != old_metadata.get()) {
+                fprintf(stderr, "Can only update FVM with valid primary as first copy\n");
+                exit(-1);
             }
+
+            valid_ = true;
+            slice_size_ = old_slice_size;
+            metadata_size_ = old_metadata_size;
+            metadata_.reset(old_metadata.release());
         }
     }
 }
@@ -122,7 +147,7 @@ FvmContainer::FvmContainer(const char* path, size_t slice_size, off_t offset, of
 FvmContainer::~FvmContainer() = default;
 
 zx_status_t FvmContainer::Init() {
-    // Clear entire primary copy of metadata
+    // Clear entire primary copy of metadata.
     memset(metadata_.get(), 0, metadata_size_);
 
     // Superblock
@@ -201,19 +226,19 @@ zx_status_t FvmContainer::Verify() const {
                 return status;
             }
 
-            if (slice->vpart != vpart_index) {
+            if (slice->Vpart() != vpart_index) {
                 break;
             }
 
             end += slice_size_;
 
-            if (slice->vslice == last_vslice + 1) {
-                extent_lengths[extent_lengths.size()-1] += slice_size_;
+            if (slice->Vslice() == last_vslice + 1) {
+                extent_lengths[extent_lengths.size() - 1] += slice_size_;
             } else {
                 extent_lengths.push_back(slice_size_);
             }
 
-            last_vslice = slice->vslice;
+            last_vslice = slice->Vslice();
         }
 
         disk_format_t part;
@@ -267,7 +292,7 @@ zx_status_t FvmContainer::Extend(size_t disk_size) {
         return ZX_ERR_IO;
     }
 
-    auto cleanup = fbl::MakeAutoCall([path]() {
+    auto cleanup = fit::defer([path]() {
         if (unlink(path) < 0) {
             fprintf(stderr, "Failed to unlink path %s\n", path);
         }
@@ -278,8 +303,6 @@ zx_status_t FvmContainer::Extend(size_t disk_size) {
         return ZX_ERR_IO;
     }
 
-    fvm::fvm_t* sb = SuperBlock();
-
     // Since the size and location of both metadata in an FVM is dependent on the size of
     // the FVM partition, we must relocate any data that already exists within the volume
     // manager.
@@ -289,7 +312,8 @@ zx_status_t FvmContainer::Extend(size_t disk_size) {
     //
     // Then, we update the on-disk metadata to reflect the new size of the disk.
     // To avoid collision between relocated slices, this is done on a temporary file.
-    for (uint32_t index = 1; index <= sb->pslice_count; index++) {
+    uint64_t pslice_count = SuperBlock()->pslice_count;
+    for (uint32_t index = 1; index <= pslice_count; index++) {
         zx_status_t status;
         fvm::slice_entry_t* slice = nullptr;
         if ((status = GetSlice(index, &slice)) != ZX_OK) {
@@ -297,7 +321,7 @@ zx_status_t FvmContainer::Extend(size_t disk_size) {
             return status;
         }
 
-        if (slice->vpart == FVM_SLICE_FREE) {
+        if (slice->Vpart() == FVM_SLICE_ENTRY_FREE) {
             continue;
         }
 
@@ -337,6 +361,7 @@ zx_status_t FvmContainer::Extend(size_t disk_size) {
         return status;
     }
 
+    fvm::fvm_t* sb = SuperBlock();
     sb->pslice_count = fvm::UsableSlicesCount(disk_size, slice_size_);
     sb->fvm_partition_size = disk_size;
     sb->allocation_table_size = fvm::AllocTableLength(disk_size, slice_size_);
@@ -477,7 +502,8 @@ zx_status_t FvmContainer::AddPartition(const char* path, const char* type_name) 
     format->Type(type);
     format->Name(name);
     uint32_t vpart_index;
-    if ((status = AllocatePartition(type, guid, name, 1, &vpart_index)) != ZX_OK) {
+    uint32_t flags = format->Flags();
+    if ((status = AllocatePartition(type, guid, name, 1, flags, &vpart_index)) != ZX_OK) {
         return status;
     }
 
@@ -491,8 +517,7 @@ zx_status_t FvmContainer::AddPartition(const char* path, const char* type_name) 
     }
 
     // If allocated metadata is too small, grow it to an appropriate size
-    size_t required_size = fvm::kAllocTableOffset + (pslice_hint_ + slice_count)
-                           * sizeof(fvm::slice_entry_t);
+    size_t required_size = fvm::kAllocTableOffset + (pslice_hint_ + slice_count) * sizeof(fvm::slice_entry_t);
     if ((status = GrowMetadata(required_size)) != ZX_OK) {
         return status;
     }
@@ -555,9 +580,6 @@ void FvmContainer::CheckValid() const {
 zx_status_t FvmContainer::GrowMetadata(size_t new_size) {
     if (new_size <= metadata_size_) {
         return ZX_OK;
-    } else if (disk_size_ > 0) {
-        fprintf(stderr, "Cannot grow metadata for disk with established size\n");
-        return ZX_ERR_ACCESS_DENIED;
     }
 
     xprintf("Growing metadata from %zu to %zu\n", metadata_size_, new_size);
@@ -571,13 +593,13 @@ zx_status_t FvmContainer::GrowMetadata(size_t new_size) {
     memcpy(new_metadata.get(), metadata_.get(), metadata_size_);
     memset(new_metadata.get() + metadata_size_, 0, new_size - metadata_size_);
 
-    metadata_ = fbl::move(new_metadata);
+    metadata_.reset(new_metadata.release());
     metadata_size_ = new_size;
     return ZX_OK;
 }
 
 zx_status_t FvmContainer::AllocatePartition(uint8_t* type, uint8_t* guid, const char* name,
-                                            uint32_t slices, uint32_t* vpart_index) {
+                                            uint32_t slices, uint32_t flags, uint32_t* vpart_index) {
     CheckValid();
     for (unsigned index = vpart_hint_; index < FVM_MAX_ENTRIES; index++) {
         zx_status_t status;
@@ -589,7 +611,7 @@ zx_status_t FvmContainer::AllocatePartition(uint8_t* type, uint8_t* guid, const 
 
         // Make sure this vpartition has not already been allocated
         if (vpart->slices == 0) {
-            vpart->init(type, guid, slices, name, 0);
+            vpart->init(type, guid, slices, name, flags);
             vpart_hint_ = index + 1;
             dirty_ = true;
             *vpart_index = index;
@@ -613,14 +635,14 @@ zx_status_t FvmContainer::AllocateSlice(uint32_t vpart, uint32_t vslice, uint32_
             return status;
         }
 
-        if (slice->vpart != FVM_SLICE_FREE) {
+        if (slice->Vpart() != FVM_SLICE_ENTRY_FREE) {
             continue;
         }
 
         pslice_hint_ = index + 1;
 
-        slice->vpart = vpart & VPART_MAX;
-        slice->vslice = vslice & VSLICE_MAX;
+        slice->SetVpart(vpart);
+        slice->SetVslice(vslice);
         dirty_ = true;
         *pslice = index;
         return ZX_OK;
@@ -639,7 +661,7 @@ zx_status_t FvmContainer::GetPartition(size_t index, fvm::vpart_entry_t** out) c
 
     uintptr_t metadata_start = reinterpret_cast<uintptr_t>(metadata_.get());
     uintptr_t offset = static_cast<uintptr_t>(fvm::kVPartTableOffset +
-                                                  index * sizeof(fvm::vpart_entry_t));
+                                              index * sizeof(fvm::vpart_entry_t));
     *out = reinterpret_cast<fvm::vpart_entry_t*>(metadata_start + offset);
     return ZX_OK;
 }
@@ -684,7 +706,7 @@ zx_status_t FvmContainer::WritePartition(unsigned part_index) {
 }
 
 zx_status_t FvmContainer::WriteExtent(unsigned extent_index, Format* format, uint32_t* pslice) {
-    vslice_info_t vslice_info;
+    vslice_info_t vslice_info{};
     zx_status_t status;
     if ((status = format->GetVsliceRange(extent_index, &vslice_info)) != ZX_OK) {
         return status;
@@ -700,7 +722,6 @@ zx_status_t FvmContainer::WriteExtent(unsigned extent_index, Format* format, uin
                 if (!vslice_info.zero_fill) {
                     break;
                 }
-
                 format->EmptyBlock();
             } else {
                 if ((status = format->FillBlock(vslice_info.block_offset + current_block)) != ZX_OK) {
@@ -731,8 +752,7 @@ zx_status_t FvmContainer::WriteData(uint32_t pslice, uint32_t block_offset, size
         return ZX_ERR_OUT_OF_RANGE;
     }
 
-    if (lseek(fd_.get(), disk_offset_ + fvm::SliceStart(disk_size_, slice_size_, pslice) +
-                block_offset * block_size, SEEK_SET) < 0) {
+    if (lseek(fd_.get(), disk_offset_ + fvm::SliceStart(disk_size_, slice_size_, pslice) + block_offset * block_size, SEEK_SET) < 0) {
         return ZX_ERR_BAD_STATE;
     }
 

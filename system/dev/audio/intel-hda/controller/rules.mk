@@ -15,9 +15,9 @@ MODULE_SRCS += \
     $(LOCAL_DIR)/intel-hda-codec.cpp \
     $(LOCAL_DIR)/intel-hda-controller.cpp \
     $(LOCAL_DIR)/intel-hda-controller-init.cpp \
+    $(LOCAL_DIR)/intel-hda-dsp.cpp \
+    $(LOCAL_DIR)/intel-hda-irq.cpp \
     $(LOCAL_DIR)/intel-hda-stream.cpp \
-    $(LOCAL_DIR)/irq-thread.cpp \
-    $(LOCAL_DIR)/pinned-vmo.cpp \
     $(LOCAL_DIR)/utils.cpp \
 
 MODULE_LIBS := \
@@ -32,6 +32,8 @@ MODULE_STATIC_LIBS := \
     system/ulib/audio-proto-utils \
     system/ulib/dispatcher-pool \
     system/ulib/fbl \
+    system/ulib/fzl \
+    system/ulib/sync \
     system/ulib/zx \
     system/ulib/zxcpp \
 

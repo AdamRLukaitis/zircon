@@ -10,62 +10,44 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <launchpad/launchpad.h>
-
+#include <fbl/algorithm.h>
+#include <fbl/unique_fd.h>
+#include <fuchsia/io/c/fidl.h>
+#include <lib/fdio/io.h>
+#include <lib/fdio/spawn.h>
+#include <lib/fdio/util.h>
+#include <lib/fdio/watcher.h>
+#include <lib/fzl/fdio.h>
+#include <lib/zx/channel.h>
+#include <port/port.h>
 #include <zircon/device/pty.h>
 #include <zircon/device/vfs.h>
-#include <zircon/device/display.h>
 #include <zircon/listnode.h>
 #include <zircon/process.h>
 #include <zircon/processargs.h>
+#include <zircon/status.h>
 #include <zircon/syscalls.h>
 #include <zircon/syscalls/log.h>
 #include <zircon/syscalls/object.h>
 
-#include <fdio/io.h>
-#include <fdio/util.h>
-#include <fdio/watcher.h>
-
-#include <port/port.h>
-
 #include "vc.h"
 
 port_t port;
-static port_handler_t ownership_ph;
 static port_handler_t log_ph;
 static port_handler_t new_vc_ph;
 static port_handler_t input_ph;
-static port_handler_t fb_ph;
 
 static int input_dir_fd;
-static int fb_dir_fd;
 
 static vc_t* log_vc;
 static zx_koid_t proc_koid;
-
-static int g_fb_fd = -1;
-#define FB_NAME_LEN 32
-static char g_fb_name[FB_NAME_LEN + 1];
-
-static zx_status_t fb_cb(port_handler_t* ph, zx_signals_t signals, uint32_t evt);
-static zx_status_t ownership_ph_cb(port_handler_t* ph, zx_signals_t signals, uint32_t evt);
-
-// remember whether the virtual console controls the display
-bool g_vc_owns_display = true;
-
-void vc_toggle_framebuffer() {
-    if (g_fb_fd != -1) {
-        uint32_t n = g_vc_owns_display ? 1 : 0;
-        ioctl_display_set_owner(g_fb_fd, &n);
-    }
-}
 
 static zx_status_t log_reader_cb(port_handler_t* ph, zx_signals_t signals, uint32_t evt) {
     char buf[ZX_LOG_RECORD_MAX];
     zx_log_record_t* rec = (zx_log_record_t*)buf;
     zx_status_t status;
     for (;;) {
-        if ((status = zx_log_read(ph->handle, ZX_LOG_RECORD_MAX, rec, 0)) < 0) {
+        if ((status = zx_debuglog_read(ph->handle, 0, rec, ZX_LOG_RECORD_MAX)) < 0) {
             if (status == ZX_ERR_SHOULD_WAIT) {
                 // return non-OK to avoid needlessly re-arming the repeating wait
                 return ZX_ERR_NEXT;
@@ -99,21 +81,30 @@ static zx_status_t log_reader_cb(port_handler_t* ph, zx_signals_t signals, uint3
 }
 
 static zx_status_t launch_shell(vc_t* vc, int fd, const char* cmd) {
-    const char* args[] = { "/boot/bin/sh", "-c", cmd };
+    const char* argv[] = { "/boot/bin/sh", nullptr, nullptr, nullptr };
 
-    launchpad_t* lp;
-    launchpad_create(zx_job_default(), "vc:sh", &lp);
-    launchpad_load_from_file(lp, args[0]);
-    launchpad_set_args(lp, cmd ? 3 : 1, args);
-    launchpad_transfer_fd(lp, fd, FDIO_FLAG_USE_FOR_STDIO | 0);
-    launchpad_clone(lp, LP_CLONE_FDIO_NAMESPACE | LP_CLONE_ENVIRON | LP_CLONE_DEFAULT_JOB);
-
-    const char* errmsg;
-    zx_status_t r;
-    if ((r = launchpad_go(lp, &vc->proc, &errmsg)) < 0) {
-        printf("vc: cannot spawn shell: %s: %d\n", errmsg, r);
+    if (cmd) {
+        argv[1] = "-c";
+        argv[2] = cmd;
     }
-    return r;
+
+    fdio_spawn_action_t actions[2] = {};
+    actions[0].action = FDIO_SPAWN_ACTION_SET_NAME;
+    actions[0].name.data = "vc:sh";
+    actions[1].action = FDIO_SPAWN_ACTION_TRANSFER_FD;
+    actions[1].fd = {.local_fd = fd, .target_fd = FDIO_FLAG_USE_FOR_STDIO};
+
+    uint32_t flags = FDIO_SPAWN_CLONE_ALL & ~FDIO_SPAWN_CLONE_STDIO;
+
+    char err_msg[FDIO_SPAWN_ERR_MSG_MAX_LENGTH];
+    zx_status_t status = fdio_spawn_etc(ZX_HANDLE_INVALID, flags, argv[0], argv,
+                                        nullptr, fbl::count_of(actions), actions,
+                                        &vc->proc, err_msg);
+    if (status != ZX_OK) {
+        printf("vc: cannot spawn shell: %s: %d (%s)\n", err_msg, status,
+               zx_status_get_string(status));
+    }
+    return status;
 }
 
 static void session_destroy(vc_t* vc) {
@@ -150,7 +141,7 @@ static zx_status_t session_io_cb(port_fd_handler_t* fh, unsigned pollevt, uint32
                 goto fail;
             }
 
-            if(launch_shell(vc, fd, NULL) < 0) {
+            if (launch_shell(vc, fd, NULL) < 0) {
                 goto fail;
             }
             return ZX_OK;
@@ -249,10 +240,8 @@ static zx_status_t new_vc_cb(port_handler_t* ph, zx_signals_t signals, uint32_t 
     zx_handle_t handles[FDIO_MAX_HANDLES];
     uint32_t types[FDIO_MAX_HANDLES];
     zx_status_t r = fdio_transfer_fd(fd, FDIO_FLAG_USE_FOR_STDIO | 0, handles, types);
-    if ((r != 2) || (zx_channel_write(h, 0, types, 2 * sizeof(uint32_t), handles, 2) < 0)) {
-        for (int n = 0; n < r; n++) {
-            zx_handle_close(handles[n]);
-        }
+    if (zx_channel_write(h, 0, types,
+                         static_cast<uint32_t>(r * sizeof(uint32_t)), handles, r) != ZX_OK) {
         session_destroy(vc);
     } else {
         port_wait(&port, &vc->fh.ph);
@@ -262,120 +251,68 @@ static zx_status_t new_vc_cb(port_handler_t* ph, zx_signals_t signals, uint32_t 
     return ZX_OK;
 }
 
-static void input_dir_event(unsigned evt, const char* name) {
-    if ((evt != VFS_WATCH_EVT_EXISTING) && (evt != VFS_WATCH_EVT_ADDED)) {
-        return;
+static zx_status_t input_dir_event(unsigned evt, const char* name) {
+    if ((evt != fuchsia_io_WATCH_EVENT_EXISTING) && (evt != fuchsia_io_WATCH_EVENT_ADDED)) {
+        return ZX_OK;
     }
 
     printf("vc: new input device /dev/class/input/%s\n", name);
 
     int fd;
     if ((fd = openat(input_dir_fd, name, O_RDONLY)) < 0) {
-        return;
+        return ZX_OK;
     }
 
     new_input_device(fd, handle_key_press);
+    return ZX_OK;
 }
 
 static void setup_dir_watcher(const char* dir,
                               zx_status_t (*cb)(port_handler_t*, zx_signals_t, uint32_t),
                               port_handler_t* ph,
                               int* fd_out) {
-    if ((*fd_out = open(dir, O_DIRECTORY | O_RDONLY)) >= 0) {
-        vfs_watch_dir_t wd;
-        wd.mask = VFS_WATCH_MASK_ALL;
-        wd.options = 0;
-        if (zx_channel_create(0, &wd.channel, &ph->handle) == ZX_OK) {
-            if ((ioctl_vfs_watch_dir(*fd_out, &wd)) == ZX_OK) {
-                ph->waitfor = ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED;
-                ph->func = cb;
-                port_wait(&port, ph);
-            } else {
-                zx_handle_close(wd.channel);
-                zx_handle_close(ph->handle);
-                close(*fd_out);
-                *fd_out = -1;
-            }
-        } else {
-            close(*fd_out);
-            *fd_out = -1;
-        }
+    *fd_out = -1;
+    fbl::unique_fd fd(open(dir, O_DIRECTORY | O_RDONLY));
+    if (!fd) {
+        return;
     }
-}
-
-static void fb_dir_event(unsigned evt, const char* name) {
-    if (strlen(name) > FB_NAME_LEN) {
-        printf("vc: truncating long framebuffer name (\"%s\")\n", name);
-    }
-
-    // If we're already connected to a display, ignore events on other displays
-    if (g_fb_fd != -1 && strncmp(g_fb_name, name, FB_NAME_LEN)) {
+    zx::channel client, server;
+    if (zx::channel::create(0, &client, &server) != ZX_OK) {
         return;
     }
 
-    if (evt == VFS_WATCH_EVT_ADDED || evt == VFS_WATCH_EVT_EXISTING) {
-        strncpy(g_fb_name, name, FB_NAME_LEN);
-        g_fb_name[FB_NAME_LEN] = '\0';
-
-        int fd;
-        char file_name[sizeof("/dev/class/framebuffer//virtcon") + FB_NAME_LEN];
-        snprintf(file_name, sizeof(file_name), "/dev/class/framebuffer/%s/virtcon", g_fb_name);
-        if ((fd = open(file_name, O_RDWR)) < 0) {
-            printf("vc: failed to open display \"%s\": %d\n", file_name, fd);
-            return;
-        }
-
-        if (vc_init_gfx(fd) < 0) {
-            printf("vc: failed to initialize graphics for new display\n");
-            return;
-        }
-
-        g_fb_fd = fd;
-
-        zx_handle_t e = ZX_HANDLE_INVALID;
-        ioctl_display_get_ownership_change_event(fd, &e);
-
-        if (e != ZX_HANDLE_INVALID) {
-            ownership_ph.func = ownership_ph_cb;
-            ownership_ph.handle = e;
-            ownership_ph.waitfor = ZX_USER_SIGNAL_1;
-            port_wait(&port, &ownership_ph);
-        }
-
-        // Only listen for logs when we have somewhere to print them. Also,
-        // use a repeating wait so that we don't add/remove observers for each
-        // log message (which is helpful when tracing the addition/removal of
-        // observers).
-        port_wait_repeating(&port, &log_ph);
-        vc_show_active();
-    } else if (evt == VFS_WATCH_EVT_REMOVED) {
-        close(g_fb_fd);
-        g_fb_fd = -1;
-
-        port_cancel(&port, &log_ph);
-        vc_free_gfx();
-
-        // Remove and re-add the framebuffer watcher to handle the case where
-        // a second display was already attached (with the EXISTING event).
-        port_cancel(&port, &fb_ph);
-        close(fb_dir_fd);
-        setup_dir_watcher("/dev/class/framebuffer", fb_cb, &fb_ph, &fb_dir_fd);
+    fzl::FdioCaller caller(fbl::move(fd));
+    zx_status_t status;
+    zx_status_t io_status = fuchsia_io_DirectoryWatch(caller.borrow_channel(),
+                                                      fuchsia_io_WATCH_MASK_ALL, 0,
+                                                      server.release(),
+                                                      &status);
+    if (io_status != ZX_OK || status != ZX_OK) {
+        return;
     }
+
+    *fd_out = caller.release().release();
+    ph->handle = client.release();
+    ph->waitfor = ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED;
+    ph->func = cb;
+    port_wait(&port, ph);
 }
 
-static bool handle_dir_event(port_handler_t* ph, zx_signals_t signals,
-                             void (*event_handler)(unsigned event, const char* msg)) {
+zx_status_t handle_device_dir_event(port_handler_t* ph, zx_signals_t signals,
+                                    zx_status_t (*event_handler)(unsigned event, const char* msg)) {
     if (!(signals & ZX_CHANNEL_READABLE)) {
-        return false;
+        printf("vc: device directory died\n");
+        return ZX_ERR_STOP;
     }
 
     // Buffer contains events { Opcode, Len, Name[Len] }
     // See zircon/device/vfs.h for more detail
     // extra byte is for temporary NUL
-    uint8_t buf[VFS_WATCH_MSG_MAX + 1];
+    uint8_t buf[fuchsia_io_MAX_BUF + 1];
     uint32_t len;
     if (zx_channel_read(ph->handle, 0, buf, NULL, sizeof(buf) - 1, 0, &len, NULL) < 0) {
-        return false;
+        printf("vc: failed to read from device directory\n");
+        return ZX_ERR_STOP;
     }
 
     uint8_t* msg = buf;
@@ -383,49 +320,33 @@ static bool handle_dir_event(port_handler_t* ph, zx_signals_t signals,
         uint8_t event = *msg++;
         uint8_t namelen = *msg++;
         if (len < (namelen + 2u)) {
-            return false;
+            printf("vc: malformed device directory message\n");
+            return ZX_ERR_STOP;
         }
         // add temporary nul
         uint8_t tmp = msg[namelen];
         msg[namelen] = 0;
-        event_handler(event, (char*) msg);
+        zx_status_t status = event_handler(event, (char*)msg);
+        if (status != ZX_OK) {
+            return status;
+        }
         msg[namelen] = tmp;
         msg += namelen;
         len -= (namelen + 2u);
     }
-    return true;
+    return ZX_OK;
 }
 
 static zx_status_t input_cb(port_handler_t* ph, zx_signals_t signals, uint32_t evt) {
-    if (!handle_dir_event(ph, signals, input_dir_event)) {
-        return ZX_ERR_STOP;
-    }
-    return ZX_OK;
+    return handle_device_dir_event(ph, signals, input_dir_event);
 }
 
-static zx_status_t fb_cb(port_handler_t* ph, zx_signals_t signals, uint32_t evt) {
-    if (!handle_dir_event(ph, signals, fb_dir_event)) {
-        return ZX_ERR_STOP;
-    }
-    return ZX_OK;
-}
-
-static zx_status_t ownership_ph_cb(port_handler_t* ph, zx_signals_t signals, uint32_t evt) {
-    // If we owned it, we've been notified of losing it, or the other way 'round
-    g_vc_owns_display = !g_vc_owns_display;
-
-    // If we've gained it, repaint
-    // In both cases adjust waitfor to wait for the opposite
-    if (g_vc_owns_display) {
-        ph->waitfor = ZX_USER_SIGNAL_1;
-        if (g_active_vc) {
-            vc_flush_all(g_active_vc);
-        }
+void set_log_listener_active(bool active) {
+    if (active) {
+        port_wait_repeating(&port, &log_ph);
     } else {
-        ph->waitfor = ZX_USER_SIGNAL_0;
+        port_cancel(&port, &log_ph);
     }
-
-    return ZX_OK;
 }
 
 int main(int argc, char** argv) {
@@ -435,21 +356,30 @@ int main(int argc, char** argv) {
     const char* value = getenv("virtcon.keep-log-visible");
     if (value == NULL ||
         ((strcmp(value, "0") == 0) ||
-        (strcmp(value, "false") == 0) ||
-        (strcmp(value, "off") == 0))) {
+         (strcmp(value, "false") == 0) ||
+         (strcmp(value, "off") == 0))) {
         keep_log = false;
     } else {
         keep_log = true;
     }
 
     const char* cmd = NULL;
+    int shells = 0;
     while (argc > 1) {
         if (!strcmp(argv[1], "--run")) {
             if (argc > 2) {
                 argc--;
                 argv++;
                 cmd = argv[1];
+                if (shells < 1)
+                    shells = 1;
                 printf("CMD: %s\n", cmd);
+            }
+        } else if (!strcmp(argv[1], "--shells")) {
+            if (argc > 2) {
+                argc--;
+                argv++;
+                shells = atoi(argv[1]);
             }
         }
         argc--;
@@ -475,7 +405,7 @@ int main(int argc, char** argv) {
     }
 
     // TODO: receive from launching process
-    if (zx_log_create(ZX_LOG_FLAG_READABLE, &log_ph.handle) < 0) {
+    if (zx_debuglog_create(ZX_HANDLE_INVALID, ZX_LOG_FLAG_READABLE, &log_ph.handle) < 0) {
         printf("vc log listener: cannot open log\n");
         return -1;
     }
@@ -483,20 +413,26 @@ int main(int argc, char** argv) {
     log_ph.func = log_reader_cb;
     log_ph.waitfor = ZX_LOG_READABLE;
 
-    if ((new_vc_ph.handle = zx_get_startup_handle(PA_HND(PA_USER0, 0))) != ZX_HANDLE_INVALID) {
+    if ((new_vc_ph.handle = zx_take_startup_handle(PA_HND(PA_USER0, 0))) != ZX_HANDLE_INVALID) {
         new_vc_ph.func = new_vc_cb;
         new_vc_ph.waitfor = ZX_CHANNEL_READABLE;
         port_wait(&port, &new_vc_ph);
     }
 
     setup_dir_watcher("/dev/class/input", input_cb, &input_ph, &input_dir_fd);
-    setup_dir_watcher("/dev/class/framebuffer", fb_cb, &fb_ph, &fb_dir_fd);
+
+    if (!vc_display_init()) {
+        return -1;
+    }
 
     setenv("TERM", "xterm", 1);
 
-    start_shell(keep_log ? false : true, cmd);
-    start_shell(false, NULL);
-    start_shell(false, NULL);
+    for (int i = 0; i < shells; ++i) {
+        if (i == 0)
+            start_shell(!keep_log, cmd);
+        else
+            start_shell(false, NULL);
+    }
 
     zx_status_t r = port_dispatch(&port, ZX_TIME_INFINITE, false);
     printf("vc: port failure: %d\n", r);

@@ -35,6 +35,10 @@ static char* program_path;
 // This value appears in |packet.key| in all exception messages.
 static const uint64_t EXCEPTION_PORT_KEY = 0x6b6579; // "key"
 
+// When sending user packets use this key so that read_packet() knows they're
+// legit.
+static const uint64_t USER_PACKET_KEY = 0xee75736572ee; // eeuseree
+
 static const char test_child_name[] = "test-child";
 static const char exit_closing_excp_handle_child_name[] = "exit-closing-excp-handle";
 
@@ -136,7 +140,7 @@ static void resume_thread_from_exception(zx_handle_t process, zx_koid_t tid,
         tu_fatal("zx_object_get_child", status);
 
     zx_info_thread_t info = tu_thread_get_info(thread);
-    EXPECT_EQ(info.state, ZX_THREAD_STATE_BLOCKED, "");
+    EXPECT_EQ(info.state, ZX_THREAD_STATE_BLOCKED_EXCEPTION, "");
     if (excp_port_type != ZX_EXCEPTION_PORT_TYPE_NONE) {
         EXPECT_EQ(info.wait_exception_port_type, excp_port_type, "");
     }
@@ -147,17 +151,20 @@ static void resume_thread_from_exception(zx_handle_t process, zx_koid_t tid,
     zx_handle_close(thread);
 }
 
-// Wait for and receive an exception or signal on |eport|.
+// Wait for and receive a user packet, exception, or signal on |eport|.
 
 static bool read_packet(zx_handle_t eport, zx_port_packet_t* packet)
 {
-    ASSERT_EQ(zx_port_wait(eport, ZX_TIME_INFINITE, packet, 0), ZX_OK, "zx_port_wait failed");
+    ASSERT_EQ(zx_port_wait(eport, ZX_TIME_INFINITE, packet), ZX_OK, "zx_port_wait failed");
     if (ZX_PKT_IS_SIGNAL_REP(packet->type)) {
         unittest_printf("signal received: key %" PRIu64 ", observed 0x%x\n",
                         packet->key, packet->signal.observed);
+    } else if (ZX_PKT_IS_USER(packet->type)) {
+        ASSERT_EQ(packet->key, USER_PACKET_KEY, "");
     } else {
         ASSERT_TRUE(ZX_PKT_IS_EXCEPTION(packet->type), "");
         ASSERT_EQ(packet->key, EXCEPTION_PORT_KEY, "bad report key");
+        ASSERT_EQ(packet->status, ZX_OK, "");
         unittest_printf("exception received: pid %"
                         PRIu64 ", tid %" PRIu64 ", type %d\n",
                         packet->exception.pid, packet->exception.tid, packet->type);
@@ -283,6 +290,8 @@ static bool wait_process_exit_from_debugger(zx_handle_t eport, zx_handle_t proce
             if (packet.key == pid && (packet.signal.observed & ZX_PROCESS_TERMINATED))
                 break;
             ASSERT_TRUE(false, "");
+        } else if (ZX_PKT_IS_USER(packet.type)) {
+            continue;
         }
         if (!verify_exception(&packet, process, ZX_EXCP_THREAD_EXITING))
             return false;
@@ -408,9 +417,9 @@ static int thread_func(void* arg)
 static void __NO_RETURN test_child(void)
 {
     unittest_printf("Test child starting.\n");
-    zx_handle_t channel = zx_get_startup_handle(PA_USER0);
+    zx_handle_t channel = zx_take_startup_handle(PA_USER0);
     if (channel == ZX_HANDLE_INVALID)
-        tu_fatal("zx_get_startup_handle", ZX_ERR_BAD_HANDLE - 1000);
+        tu_fatal("zx_take_startup_handle", ZX_ERR_BAD_HANDLE - 1000);
     msg_loop(channel);
     unittest_printf("Test child exiting.\n");
     exit(0);
@@ -486,7 +495,8 @@ static bool test_set_close_set(zx_handle_t object, bool debugger) {
     // Try binding another exception port to the same object, which should fail.
     zx_handle_t eport2 = tu_io_port_create();
     status = zx_task_bind_exception_port(object, eport, 0, options);
-    ASSERT_NE(status, ZX_OK, "setting exception port errantly succeeded");
+    ASSERT_EQ(status, ZX_ERR_ALREADY_BOUND,
+              "wrong result from setting already bound exception port");
 
     // Close the ports.
     tu_handle_close(eport2);
@@ -805,6 +815,76 @@ static bool job_handler_test(void)
 
     finish_basic_test(child, eport, our_channel, MSG_CRASH, ZX_EXCEPTION_PORT_TYPE_JOB);
     tu_handle_close(job);
+    END_TEST;
+}
+
+bool job_debug_handler_test_helper(zx_handle_t job, zx_handle_t eport_job_handle)
+{
+    zx_handle_t child, our_channel;
+    zx_handle_t eport = tu_io_port_create();
+    tu_set_exception_port(eport_job_handle, eport, EXCEPTION_PORT_KEY, ZX_EXCEPTION_PORT_DEBUGGER);
+    start_test_child(job, test_child_name, &child, &our_channel);
+
+    zx_info_handle_basic_t child_info;
+    tu_handle_get_basic_info(child, &child_info);
+
+    zx_port_packet_t start_packet;
+    ASSERT_TRUE(read_packet(eport, &start_packet), "error reading start exception");
+    ASSERT_TRUE(verify_exception(&start_packet, child, ZX_EXCP_PROCESS_STARTING),
+                "unexpected exception");
+    zx_koid_t packet_pid = start_packet.exception.pid;
+    zx_koid_t packet_tid = start_packet.exception.tid;
+
+    EXPECT_EQ(child_info.koid, packet_pid, "packet pid mismatch");
+
+    // set exception on process
+    zx_handle_t eport_process = tu_io_port_create();
+    tu_set_exception_port(child, eport_process, EXCEPTION_PORT_KEY, ZX_EXCEPTION_PORT_DEBUGGER);
+    tu_object_wait_async(child, eport_process, ZX_PROCESS_TERMINATED);
+
+    // resume thread from job debugger
+    resume_thread_from_exception(child, packet_tid, ZX_EXCEPTION_PORT_TYPE_JOB_DEBUGGER, 0);
+
+    zx_port_packet_t start_packet_process;
+    ASSERT_TRUE(read_packet(eport_process, &start_packet_process), "error reading start exception");
+    ASSERT_TRUE(verify_exception(&start_packet_process, child, ZX_EXCP_THREAD_STARTING),
+                "unexpected exception");
+    packet_pid = start_packet.exception.pid;
+    packet_tid = start_packet.exception.tid;
+
+    EXPECT_EQ(child_info.koid, packet_pid, "packet pid mismatch");
+
+    send_msg(our_channel, MSG_DONE);
+    resume_thread_from_exception(child, packet_tid, ZX_EXCEPTION_PORT_TYPE_DEBUGGER, 0);
+    wait_process_exit_from_debugger(eport_process, child, packet_tid);
+
+    tu_handle_close(child);
+    tu_handle_close(eport);
+    tu_handle_close(our_channel);
+    return true;
+}
+
+static bool nested_job_debug_handler_test(void)
+{
+    BEGIN_TEST;
+
+    zx_handle_t job = tu_job_create(zx_job_default());
+    zx_handle_t nested_job = tu_job_create(job);
+    job_debug_handler_test_helper(nested_job, job);
+    tu_handle_close(nested_job);
+    tu_handle_close(job);
+
+    END_TEST;
+}
+
+static bool job_debug_handler_test(void)
+{
+    BEGIN_TEST;
+
+    zx_handle_t job = tu_job_create(zx_job_default());
+    job_debug_handler_test_helper(job, job);
+    tu_handle_close(job);
+
     END_TEST;
 }
 
@@ -1164,7 +1244,20 @@ static void __NO_RETURN trigger_sse_divide_by_zero(void)
     double a = 1;
     double b = 0;
     __asm__ volatile("divsd %1, %0" : "+x"(a) : "x"(b));
-    trigger_unsupported();
+
+    // QEMU's software emulation of x86 appears to have a bug where it does
+    // not correctly emulate generating division-by-zero exceptions from
+    // SSE instructions.  See https://bugs.launchpad.net/qemu/+bug/1668041.
+    // So we will reach this point on non-KVM QEMU.  In this case, make the
+    // test pass by generating a fault by other means.
+    //
+    // That means this test isn't requiring that "divsd" generates a fault.
+    // It is only requiring that the fault is handled properly
+    // (e.g. doesn't cause a kernel panic) if the instruction does fault
+    // (as on real hardware).
+    printf("trigger_sse_divide_by_zero: divsd did not fault; "
+           "assume we are running under a buggy non-KVM QEMU\n");
+    trigger_integer_divide_by_zero();
 }
 
 static void __NO_RETURN trigger_x87_divide_by_zero(void)
@@ -1513,9 +1606,9 @@ static bool unbind_rebind_while_stopped_test(void)
     // Note that there's no worry of this hanging due to our watchdog.
     zx_info_thread_t info;
     do {
-        zx_nanosleep(0);
+        zx_nanosleep(zx_deadline_after(ZX_MSEC(1)));
         info = tu_thread_get_info(thread);
-    } while (info.state != ZX_THREAD_STATE_BLOCKED);
+    } while (info.state != ZX_THREAD_STATE_BLOCKED_EXCEPTION);
 
     // Unbind the exception port quietly, meaning to leave the thread
     // waiting for an exception response.
@@ -1699,11 +1792,92 @@ static bool exit_closing_excp_handle_test(void)
 
     zx_signals_t signals = ZX_PROCESS_TERMINATED;
     zx_signals_t pending;
-    zx_status_t result = tu_wait(1, &child, &signals, &pending, ZX_TIME_INFINITE);
+    zx_status_t result = tu_wait(1, &child, &signals, &pending);
     EXPECT_EQ(result, ZX_OK, "");
     EXPECT_TRUE(pending & ZX_PROCESS_TERMINATED, "");
 
     EXPECT_EQ(tu_process_get_return_code(child), 0, "");
+
+    END_TEST;
+}
+
+static bool full_queue_sending_exception_packet_test(void)
+{
+    BEGIN_TEST;
+
+    zx_handle_t child, eport, our_channel;
+    start_test_child_with_eport(zx_job_default(), test_child_name,
+                                &child, &eport, &our_channel);
+
+    zx_koid_t initial_tid;
+    ASSERT_TRUE(read_and_verify_exception(eport, child, ZX_EXCP_THREAD_STARTING, &initial_tid), "");
+    resume_thread_from_exception(child, initial_tid,
+                                 ZX_EXCEPTION_PORT_TYPE_DEBUGGER, 0);
+
+    // Tell the subprocess to create a second thread.
+    // We need to observe a thread without the process exiting (process exits
+    // can make thread exceptions vanish).
+    send_msg(our_channel, MSG_CREATE_AUX_THREAD);
+    // Wait for the ZX_EXCP_THREAD_STARTING message about that thread.
+    zx_koid_t tid;
+    ASSERT_TRUE(read_and_verify_exception(eport, child, ZX_EXCP_THREAD_STARTING,
+                                          &tid), "");
+    EXPECT_NE(tid, initial_tid, "");
+    resume_thread_from_exception(child, tid,
+                                 ZX_EXCEPTION_PORT_TYPE_DEBUGGER, 0);
+
+    // Fill the port with packets thus preventing us from receiving the
+    // segfault exception.
+    const zx_port_packet_t pkt = {
+        .key = USER_PACKET_KEY,
+    };
+    zx_status_t status;
+    size_t packet_count = 0;
+    while ((status = zx_port_queue(eport, &pkt)) == ZX_OK) {
+        ++packet_count;
+    }
+    unittest_printf("Queued %zu packets\n", packet_count);
+
+    // Grab a handle to the thread before we cause it to exit.
+    // The kernel will kill the process when it tries to send the exception,
+    // after which we won't be able to get a handle.
+    zx_handle_t thread = tu_process_get_thread(child, tid);
+    ASSERT_NE(thread, ZX_HANDLE_INVALID, "");
+
+    // Alert the user about the kernel message that will get printed.
+    unittest_printf_critical(
+        "\nNote: We're intentionally crashing a thread in a way that cannot be handled.\n"
+        "The kernel will detect this and may print a helpful message,\n"
+        "which can be ignored.\n");
+
+    // Tell the second thread to crash, causing an exception to try to be sent,
+    // which should fail.
+    send_msg(our_channel, MSG_CRASH_AUX_THREAD);
+
+    // Wait for the second thread to be in the exception. Before we start
+    // reading the user packets we stuffed into the port we want to make sure
+    // the kernel tried to send the exception packet.
+    uint32_t state;
+    do {
+        zx_nanosleep(zx_deadline_after(ZX_MSEC(1)));
+        state = tu_thread_get_state(thread);
+    } while (state != ZX_THREAD_STATE_BLOCKED_EXCEPTION &&
+             state != ZX_THREAD_STATE_DEAD);
+
+    zx_port_packet_t out_pkt;
+    for (size_t i = 0; i < packet_count; ++i) {
+        ASSERT_TRUE(read_packet(eport, &out_pkt), "");
+        ASSERT_TRUE(ZX_PKT_IS_USER(out_pkt.type), "");
+    }
+
+    // The process should now be dead, or will be shortly.
+    // TODO(ZX-2853): Or should it?
+    ASSERT_EQ(zx_object_wait_one(child, ZX_PROCESS_TERMINATED,
+                                 ZX_TIME_INFINITE, NULL), ZX_OK, "");
+
+    tu_handle_close(child);
+    tu_handle_close(eport);
+    tu_handle_close(our_channel);
 
     END_TEST;
 }
@@ -1727,6 +1901,8 @@ RUN_TEST_ENABLE_CRASH_HANDLER(grandparent_job_handler_test);
 RUN_TEST_ENABLE_CRASH_HANDLER(process_handler_test);
 RUN_TEST_ENABLE_CRASH_HANDLER(thread_handler_test);
 RUN_TEST(packet_pid_test);
+RUN_TEST(job_debug_handler_test);
+RUN_TEST(nested_job_debug_handler_test);
 RUN_TEST(thread_state_when_starting_or_exiting_test);
 RUN_TEST(process_start_test);
 RUN_TEST(process_exit_notification_test);
@@ -1741,6 +1917,7 @@ RUN_TEST(death_test);
 RUN_TEST_ENABLE_CRASH_HANDLER(self_death_test);
 RUN_TEST_ENABLE_CRASH_HANDLER(multiple_threads_registered_death_test);
 RUN_TEST(exit_closing_excp_handle_test);
+RUN_TEST(full_queue_sending_exception_packet_test);
 END_TEST_CASE(exceptions_tests)
 
 static void scan_argv(int argc, char** argv)
@@ -1749,9 +1926,6 @@ static void scan_argv(int argc, char** argv)
         if (strncmp(argv[i], "v=", 2) == 0) {
             int verbosity = atoi(argv[i] + 2);
             unittest_set_verbosity_level(verbosity);
-        } else if (strncmp(argv[i], "ts=", 3) == 0) {
-            int scale = atoi(argv[i] + 3);
-            tu_set_timeout_scale(scale);
         }
     }
 }
@@ -1788,11 +1962,6 @@ int main(int argc, char **argv)
         }
     }
 
-    tu_watchdog_start();
-
     bool success = unittest_run_all_tests(argc, argv);
-
-    tu_watchdog_cancel();
-
     return success ? 0 : -1;
 }

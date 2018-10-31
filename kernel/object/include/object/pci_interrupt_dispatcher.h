@@ -5,7 +5,7 @@
 // https://opensource.org/licenses/MIT
 
 #pragma once
-#if WITH_DEV_PCIE
+#if WITH_KERNEL_PCIE
 
 #include <fbl/canary.h>
 #include <object/interrupt_dispatcher.h>
@@ -24,26 +24,24 @@ public:
 
     ~PciInterruptDispatcher() final;
 
-    zx_status_t Bind(uint32_t slot, uint32_t vector, uint32_t options) final;
-
 protected:
-    void MaskInterrupt(uint32_t vector) final;
-    void UnmaskInterrupt(uint32_t vector) final;
-    zx_status_t RegisterInterruptHandler(uint32_t vector, void* data) final;
-    void UnregisterInterruptHandler(uint32_t vector) final;
+    void MaskInterrupt() final;
+    void UnmaskInterrupt() final;
+    void UnregisterInterruptHandler() final;
 
 private:
     static pcie_irq_handler_retval_t IrqThunk(const PcieDevice& dev,
                                               uint irq_id,
                                               void* ctx);
-    PciInterruptDispatcher(const fbl::RefPtr<PcieDevice>& device, bool maskable)
-        : device_(device),
-          maskable_(maskable) { }
+    PciInterruptDispatcher(const fbl::RefPtr<PcieDevice>& device, uint32_t vector, bool maskable)
+        : device_(device), vector_(vector), maskable_(maskable) { }
+    zx_status_t RegisterInterruptHandler();
 
     fbl::Canary<fbl::magic("INPD")> canary_;
 
     fbl::RefPtr<PcieDevice> device_;
+    const uint32_t vector_;
     const bool maskable_;
 };
 
-#endif  // if WITH_DEV_PCIE
+#endif  // if WITH_KERNEL_PCIE

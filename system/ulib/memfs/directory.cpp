@@ -13,15 +13,21 @@
 #include <fbl/alloc_checker.h>
 #include <fbl/atomic.h>
 #include <fbl/ref_ptr.h>
+#include <fbl/string_piece.h>
 #include <fbl/unique_ptr.h>
-#include <fdio/vfs.h>
+#include <lib/fdio/vfs.h>
 #include <fs/vfs.h>
-#include <memfs/vnode.h>
+#include <lib/memfs/cpp/vnode.h>
 #include <zircon/device/vfs.h>
 
 #include "dnode.h"
 
 namespace memfs {
+namespace {
+
+constexpr const char kFsName[] = "memfs";
+
+}
 
 VnodeDir::VnodeDir(Vfs* vfs) : VnodeMemfs(vfs) {
     link_count_ = 1; // Implied '.'
@@ -37,8 +43,32 @@ zx_status_t VnodeDir::ValidateFlags(uint32_t flags) {
 
 void VnodeDir::Notify(fbl::StringPiece name, unsigned event) { watcher_.Notify(name, event); }
 
-zx_status_t VnodeDir::WatchDir(fs::Vfs* vfs, const vfs_watch_dir_t* cmd) {
-    return watcher_.WatchDir(vfs, this, cmd);
+zx_status_t VnodeDir::WatchDir(fs::Vfs* vfs, uint32_t mask, uint32_t options, zx::channel watcher) {
+    return watcher_.WatchDir(vfs, this, mask, options, fbl::move(watcher));
+}
+
+zx_status_t VnodeDir::QueryFilesystem(fuchsia_io_FilesystemInfo* info) {
+    static_assert(fbl::constexpr_strlen(kFsName) + 1 < fuchsia_io_MAX_FS_NAME_BUFFER,
+                  "Memfs name too long");
+    memset(info, 0, sizeof(*info));
+    strlcpy(reinterpret_cast<char*>(info->name), kFsName, fuchsia_io_MAX_FS_NAME_BUFFER);
+    info->block_size = kMemfsBlksize;
+    info->max_filename_size = kDnodeNameMax;
+    info->fs_type = VFS_TYPE_MEMFS;
+    info->fs_id = vfs()->GetFsId();
+    size_t total_bytes = 0;
+    if (mul_overflow(vfs()->PagesLimit(), kMemfsBlksize, &total_bytes)) {
+        info->total_bytes = UINT64_MAX;
+    } else {
+        info->total_bytes = total_bytes;
+    }
+    info->used_bytes = vfs()->NumAllocatedPages() * kMemfsBlksize;
+    info->total_nodes = UINT64_MAX;
+    uint64_t deleted_ino_count = GetDeletedInoCounter();
+    uint64_t ino_count = GetInoCounter();
+    ZX_DEBUG_ASSERT(ino_count >= deleted_ino_count);
+    info->used_nodes = ino_count - deleted_ino_count;
+    return ZX_OK;
 }
 
 zx_status_t VnodeDir::GetVmo(int flags, zx_handle_t* out) {
@@ -79,6 +109,12 @@ zx_status_t VnodeDir::Getattr(vnattr_t* attr) {
     attr->nlink = link_count_;
     attr->create_time = create_time_;
     attr->modify_time = modify_time_;
+    return ZX_OK;
+}
+
+zx_status_t VnodeDir::GetHandles(uint32_t flags, zx_handle_t* hnd, uint32_t* type,
+                                 zxrio_node_info_t* extra) {
+    *type = fuchsia_io_NodeInfoTag_directory;
     return ZX_OK;
 }
 
@@ -253,49 +289,11 @@ zx_status_t VnodeDir::Link(fbl::StringPiece name, fbl::RefPtr<fs::Vnode> target)
     return ZX_OK;
 }
 
-zx_status_t VnodeDir::Ioctl(uint32_t op, const void* in_buf, size_t in_len,
-                            void* out_buf, size_t out_len, size_t* out_actual) {
-    switch (op) {
-    case IOCTL_VFS_VMO_CREATE: {
-        const auto* config = reinterpret_cast<const vmo_create_config_t*>(in_buf);
-        size_t namelen = in_len - sizeof(vmo_create_config_t) - 1;
-        fbl::StringPiece name(config->name, namelen);
-        if (in_len <= sizeof(vmo_create_config_t) || (namelen > NAME_MAX) ||
-            (name[namelen] != 0)) {
-            zx_handle_close(config->vmo);
-            return ZX_ERR_INVALID_ARGS;
-        }
-
-        // Ensure this is the last handle to this VMO; otherwise, the size
-        // may change from underneath us.
-        zx_info_handle_count_t info;
-        zx_status_t status = zx_object_get_info(config->vmo, ZX_INFO_HANDLE_COUNT,
-                                                &info, sizeof(info), nullptr, nullptr);
-        if (status != ZX_OK || info.handle_count != 1) {
-            zx_handle_close(config->vmo);
-            return ZX_ERR_INVALID_ARGS;
-        }
-
-        uint64_t size;
-        if ((status = zx_vmo_get_size(config->vmo, &size)) != ZX_OK) {
-            zx_handle_close(config->vmo);
-            return status;
-        }
-
-        bool vmofile = false;
-        *out_actual = 0;
-        return vfs()->CreateFromVmo(this, vmofile, name, config->vmo, 0, size);
-    }
-    default:
-        return VnodeMemfs::Ioctl(op, in_buf, in_len, out_buf, out_len, out_actual);
-    }
-}
-
 void VnodeDir::MountSubtree(fbl::RefPtr<VnodeDir> subtree) {
     Dnode::AddChild(dnode_, subtree->dnode_);
 }
 
-zx_status_t VnodeDir::CreateFromVmo(bool vmofile, fbl::StringPiece name,
+zx_status_t VnodeDir::CreateFromVmo(fbl::StringPiece name,
                                     zx_handle_t vmo, zx_off_t off, zx_off_t len) {
     zx_status_t status;
     if ((status = CanCreate(name)) != ZX_OK) {
@@ -304,11 +302,7 @@ zx_status_t VnodeDir::CreateFromVmo(bool vmofile, fbl::StringPiece name,
 
     fbl::AllocChecker ac;
     fbl::RefPtr<VnodeMemfs> vn;
-    if (vmofile) {
-        vn = fbl::AdoptRef(new (&ac) VnodeVmo(vfs(), vmo, off, len));
-    } else {
-        vn = fbl::AdoptRef(new (&ac) VnodeFile(vfs(), vmo, len));
-    }
+    vn = fbl::AdoptRef(new (&ac) VnodeVmo(vfs(), vmo, off, len));
     if (!ac.check()) {
         return ZX_ERR_NO_MEMORY;
     }

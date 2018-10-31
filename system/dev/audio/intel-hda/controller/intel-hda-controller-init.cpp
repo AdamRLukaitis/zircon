@@ -4,22 +4,26 @@
 
 #include <hw/arch_ops.h>
 #include <limits.h>
+#include <zircon/thread_annotations.h>
 
+#include "binding.h"
 #include "debug-logging.h"
 #include "intel-hda-controller.h"
+#include "intel-hda-dsp.h"
 #include "intel-hda-stream.h"
-#include "thread-annotations.h"
 #include "utils.h"
 
 namespace audio {
 namespace intel_hda {
 
 namespace {
-static constexpr zx_time_t INTEL_HDA_RESET_HOLD_TIME_NSEC        = ZX_USEC(100); // Section 5.5.1.2
-static constexpr zx_time_t INTEL_HDA_RESET_TIMEOUT_NSEC          = ZX_MSEC(1);   // 1mS Arbitrary
-static constexpr zx_time_t INTEL_HDA_RING_BUF_RESET_TIMEOUT_NSEC = ZX_MSEC(1);   // 1mS Arbitrary
-static constexpr zx_time_t INTEL_HDA_RESET_POLL_TIMEOUT_NSEC     = ZX_USEC(10);  // 10uS Arbitrary
-static constexpr zx_time_t INTEL_HDA_CODEC_DISCOVERY_WAIT_NSEC   = ZX_USEC(521); // Section 4.3
+static constexpr zx_duration_t INTEL_HDA_RESET_HOLD_TIME_NSEC        = ZX_USEC(100); // Section 5.5.1.2
+static constexpr zx_duration_t INTEL_HDA_RESET_TIMEOUT_NSEC          = ZX_MSEC(1);   // 1mS Arbitrary
+static constexpr zx_duration_t INTEL_HDA_RING_BUF_RESET_TIMEOUT_NSEC = ZX_MSEC(1);   // 1mS Arbitrary
+static constexpr zx_duration_t INTEL_HDA_RESET_POLL_TIMEOUT_NSEC     = ZX_USEC(10);  // 10uS Arbitrary
+static constexpr zx_duration_t INTEL_HDA_CODEC_DISCOVERY_WAIT_NSEC   = ZX_USEC(521); // Section 4.3
+
+static constexpr unsigned int MAX_CAPS = 10;  // Arbitrary number of capabilities to check
 }  // anon namespace
 
 zx_status_t IntelHDAController::ResetControllerHW() {
@@ -33,7 +37,7 @@ zx_status_t IntelHDAController::ResetControllerHW() {
     // fully removing power (warm reboot == not good enough) to recover from.
     if (REG_RD(&regs()->gctl) & HDA_REG_GCTL_HWINIT) {
         // Explicitly disable all top level interrupt sources.
-        REG_WR(&regs()->intsts, 0u);
+        REG_WR(&regs()->intctl, 0u);
         hw_mb();
 
         // Count the number of streams present in the hardware and
@@ -67,11 +71,9 @@ zx_status_t IntelHDAController::ResetControllerHW() {
 
     res = WaitCondition(INTEL_HDA_RESET_TIMEOUT_NSEC,
                         INTEL_HDA_RESET_POLL_TIMEOUT_NSEC,
-                        [](void* r) -> bool {
-                           auto regs = reinterpret_cast<hda_registers_t*>(r);
-                           return (REG_RD(&regs->gctl) & HDA_REG_GCTL_HWINIT) == 0;
-                        },
-                        regs());
+                        [this]() -> bool {
+                           return (REG_RD(&regs()->gctl) & HDA_REG_GCTL_HWINIT) == 0;
+                        });
 
     if (res != ZX_OK) {
         LOG(ERROR, "Error attempting to enter reset! (res %d)\n", res);
@@ -87,11 +89,9 @@ zx_status_t IntelHDAController::ResetControllerHW() {
 
     res = WaitCondition(INTEL_HDA_RESET_TIMEOUT_NSEC,
                         INTEL_HDA_RESET_POLL_TIMEOUT_NSEC,
-                        [](void* r) -> bool {
-                           auto regs = reinterpret_cast<hda_registers_t*>(r);
-                           return (REG_RD(&regs->gctl) & HDA_REG_GCTL_HWINIT) != 0;
-                        },
-                        regs());
+                        [this]() -> bool {
+                           return (REG_RD(&regs()->gctl) & HDA_REG_GCTL_HWINIT) != 0;
+                        });
 
     if (res != ZX_OK) {
         LOG(ERROR, "Error attempting to leave reset! (res %d)\n", res);
@@ -112,11 +112,9 @@ zx_status_t IntelHDAController::ResetCORBRdPtrLocked() {
 
     if ((res = WaitCondition(INTEL_HDA_RING_BUF_RESET_TIMEOUT_NSEC,
                              INTEL_HDA_RESET_POLL_TIMEOUT_NSEC,
-                             [](void* r) -> bool {
-                                auto regs = reinterpret_cast<hda_registers_t*>(r);
-                                return (REG_RD(&regs->corbrp) & HDA_REG_CORBRP_RST) != 0;
-                             },
-                             regs())) != ZX_OK) {
+                             [this]() -> bool {
+                                return (REG_RD(&regs()->corbrp) & HDA_REG_CORBRP_RST) != 0;
+                             })) != ZX_OK) {
         return res;
     }
 
@@ -126,11 +124,9 @@ zx_status_t IntelHDAController::ResetCORBRdPtrLocked() {
 
     if ((res = WaitCondition(INTEL_HDA_RING_BUF_RESET_TIMEOUT_NSEC,
                              INTEL_HDA_RESET_POLL_TIMEOUT_NSEC,
-                             [](void* r) -> bool {
-                                auto regs = reinterpret_cast<hda_registers_t*>(r);
-                                return (REG_RD(&regs->corbrp) & HDA_REG_CORBRP_RST) == 0;
-                             },
-                             regs())) != ZX_OK) {
+                             [this]() -> bool {
+                                return (REG_RD(&regs()->corbrp) & HDA_REG_CORBRP_RST) == 0;
+                             })) != ZX_OK) {
         return res;
     }
 
@@ -149,7 +145,7 @@ zx_status_t IntelHDAController::SetupPCIDevice(zx_device_t* pci_dev) {
         return ZX_ERR_BAD_STATE;
     }
 
-    ZX_DEBUG_ASSERT(!irq_.is_valid());
+    ZX_DEBUG_ASSERT(irq_ != nullptr);
     ZX_DEBUG_ASSERT(mapped_regs_.start() == nullptr);
     ZX_DEBUG_ASSERT(pci_.ops == nullptr);
 
@@ -201,9 +197,9 @@ zx_status_t IntelHDAController::SetupPCIDevice(zx_device_t* pci_dev) {
         return res;
     }
 
-    if (bar_info.type != PCI_BAR_TYPE_MMIO) {
+    if (bar_info.type != ZX_PCI_BAR_TYPE_MMIO) {
         LOG(ERROR, "Bad register window type (expected %u got %u)\n",
-                PCI_BAR_TYPE_MMIO, bar_info.type);
+                ZX_PCI_BAR_TYPE_MMIO, bar_info.type);
         return ZX_ERR_INTERNAL;
     }
 
@@ -225,7 +221,7 @@ zx_status_t IntelHDAController::SetupPCIDevice(zx_device_t* pci_dev) {
 
     // Map the VMO in, make sure to put it in the same VMAR as the rest of our
     // registers.
-    constexpr uint32_t CPU_MAP_FLAGS = ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE;
+    constexpr uint32_t CPU_MAP_FLAGS = ZX_VM_PERM_READ | ZX_VM_PERM_WRITE;
     res = mapped_regs_.Map(bar_vmo, 0, bar_info.size, CPU_MAP_FLAGS, DriverVmars::registers());
     if (res != ZX_OK) {
         LOG(ERROR, "Error attempting to map registers (res %d)\n", res);
@@ -237,6 +233,10 @@ zx_status_t IntelHDAController::SetupPCIDevice(zx_device_t* pci_dev) {
 
 zx_status_t IntelHDAController::SetupPCIInterrupts() {
     ZX_DEBUG_ASSERT(pci_dev_ != nullptr);
+
+    // Make absolutely sure that IRQs are disabled at the controller level
+    // before proceeding.
+    REG_WR(&regs()->intctl, 0u);
 
     // Configure our IRQ mode and map our IRQ handle.  Try to use MSI, but if
     // that fails, fall back on legacy IRQs.
@@ -251,10 +251,26 @@ zx_status_t IntelHDAController::SetupPCIInterrupts() {
         }
     }
 
-    ZX_DEBUG_ASSERT(!irq_.is_valid());
-    res = pci_map_interrupt(&pci_, 0, irq_.reset_and_get_address());
+    // Retrieve our PCI interrupt, then use it to activate our IRQ dispatcher.
+    zx::interrupt irq;
+    res = pci_map_interrupt(&pci_, 0, irq.reset_and_get_address());
     if (res != ZX_OK) {
         LOG(ERROR, "Failed to map IRQ! (res %d)\n", res);
+        return res;
+    }
+
+    ZX_DEBUG_ASSERT(irq_ != nullptr);
+    auto irq_handler = [controller = fbl::WrapRefPtr(this)]
+                       (const dispatcher::Interrupt* irq, zx_time_t timestamp) -> zx_status_t {
+                           OBTAIN_EXECUTION_DOMAIN_TOKEN(t, controller->default_domain_);
+                           LOG_EX(SPEW, *controller, "Hard IRQ (ts = %lu)\n", timestamp);
+                           return controller->HandleIrq();
+                       };
+
+    res = irq_->Activate(default_domain_, fbl::move(irq), fbl::move(irq_handler));
+
+    if (res != ZX_OK) {
+        LOG(ERROR, "Failed to activate IRQ dispatcher! (res %d)\n", res);
         return res;
     }
 
@@ -346,7 +362,7 @@ zx_status_t IntelHDAController::SetupCommandBuffer() {
     // Allocate our command buffer memory and map it into our address space.
     // Even the largest buffers permissible should fit within a single 4k page.
     zx::vmo cmd_buf_vmo;
-    constexpr uint32_t CPU_MAP_FLAGS = ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE;
+    constexpr uint32_t CPU_MAP_FLAGS = ZX_VM_PERM_READ | ZX_VM_PERM_WRITE;
     static_assert(PAGE_SIZE >= (HDA_CORB_MAX_BYTES + HDA_RIRB_MAX_BYTES),
                   "PAGE_SIZE to small to hold CORB and RIRB buffers!");
     res = cmd_buf_cpu_mem_.CreateAndMap(PAGE_SIZE,
@@ -477,15 +493,95 @@ zx_status_t IntelHDAController::SetupCommandBuffer() {
     return ZX_OK;
 }
 
+void IntelHDAController::ProbeAudioDSP() {
+    // This driver only supports the Audio DSP on Kabylake.
+    if ((pci_dev_info_.vendor_id != INTEL_HDA_PCI_VID) ||
+        (pci_dev_info_.device_id != INTEL_HDA_PCI_DID_KABYLAKE)) {
+        LOG(TRACE, "Audio DSP is not supported for device 0x%04x:0x%04x\n",
+            pci_dev_info_.vendor_id, pci_dev_info_.device_id);
+        return;
+    }
+
+    // Look for the processing pipe capability structure. Existence of this
+    // structure means the Audio DSP is supported by the HW.
+    uint32_t offset = REG_RD(&regs()->llch);
+    if ((offset == 0) || (offset >= mapped_regs_.size())) {
+        LOG(TRACE, "Invalid LLCH offset to capability structures: 0x%08x\n", offset);
+        return;
+    }
+
+    hda_pp_registers_t* pp_regs = nullptr;
+    hda_pp_registers_t* found_regs = nullptr;
+    uint8_t* regs_ptr = nullptr;
+    unsigned int count = 0;
+    uint32_t cap;
+    do {
+        regs_ptr = reinterpret_cast<uint8_t*>(regs()) + offset;
+        pp_regs = reinterpret_cast<hda_pp_registers_t*>(regs_ptr);
+        cap = REG_RD(&pp_regs->ppch);
+        if ((cap & HDA_CAP_ID_MASK) == HDA_CAP_PP_ID) {
+            found_regs = pp_regs;
+            break;
+        }
+        offset = cap & HDA_CAP_PTR_MASK;
+        count += 1;
+    } while ((count < MAX_CAPS) && (offset != 0));
+
+    if (found_regs == nullptr) {
+        LOG(TRACE, "Pipe processing capability structure not found\n");
+        return;
+    }
+
+    dsp_ = IntelHDADSP::Create(*this, pp_regs, pci_bti_);
+}
+
 zx_status_t IntelHDAController::InitInternal(zx_device_t* pci_dev) {
-    default_domain_ = dispatcher::ExecutionDomain::Create();
-    if (default_domain_ == nullptr)
+    // TODO(johngro): see ZX-940; remove this priority boost when we can, and
+    // when there is a better way of handling real time requirements.
+    //
+    // Right now, the interrupt handler runs in the same execution domain as all
+    // of the other event sources managed by the HDA controller.  If it is
+    // configured to run and send DMA ring buffer notifications to the higher
+    // level, the IRQ needs to be running at a boosted priority in order to have
+    // a chance of meeting its real time deadlines.
+    //
+    // There is currently no terribly good way to control this dynamically, or
+    // to apply this priority only to the interrupt event source and not others.
+    // If it ever becomes a serious issue that the channel event handlers in
+    // this system are running at boosted priority, we can come back here and
+    // split the IRQ handler to run its own dedicated exeuction domain instead
+    // of using the default domain.
+    default_domain_ = dispatcher::ExecutionDomain::Create(24 /* HIGH_PRIORITY in LK */);
+    if (default_domain_ == nullptr) {
         return ZX_ERR_NO_MEMORY;
+    }
+
+    irq_ = dispatcher::Interrupt::Create();
+    if (irq_ == nullptr) {
+        return ZX_ERR_NO_MEMORY;
+    }
+
+    irq_wakeup_event_ = dispatcher::WakeupEvent::Create();
+    if (irq_wakeup_event_ == nullptr) {
+        return ZX_ERR_NO_MEMORY;
+    }
 
     zx_status_t res;
-    res = SetupPCIDevice(pci_dev);
-    if (res != ZX_OK)
+    res = irq_wakeup_event_->Activate(
+        default_domain_,
+        [controller = fbl::WrapRefPtr(this)](const dispatcher::WakeupEvent* evt) -> zx_status_t {
+            OBTAIN_EXECUTION_DOMAIN_TOKEN(t, controller->default_domain_);
+            LOG_EX(SPEW, *controller, "SW IRQ Wakeup\n");
+            return controller->HandleIrq();
+        });
+    if (res != ZX_OK) {
         return res;
+    }
+
+    res = SetupPCIDevice(pci_dev);
+    if (res != ZX_OK) {
+        return res;
+    }
 
     // Check our hardware version
     uint8_t major, minor;
@@ -517,55 +613,8 @@ zx_status_t IntelHDAController::InitInternal(zx_device_t* pci_dev) {
     if (res != ZX_OK)
         return res;
 
-    // Start the IRQ thread.
-    // TODO(johngro) : Fix this; C11 does not support thrd_create_with_name but MUSL does.
-    int c11_res;
-#if 0
-    c11_res = thrd_create_with_name(
-            &irq_thread_,
-            [](void* ctx) -> int { return static_cast<IntelHDAController*>(ctx)->IRQThread(); },
-            this,
-            dev_name());
-#else
-    c11_res = thrd_create(
-            &irq_thread_,
-            [](void* ctx) -> int { return static_cast<IntelHDAController*>(ctx)->IRQThread(); },
-            this);
-#endif
-
-    if (c11_res < 0) {
-        LOG(ERROR, "Failed create IRQ thread! (res = %d)\n", c11_res);
-        SetState(State::SHUT_DOWN);
-        return ZX_ERR_INTERNAL;
-    }
-
-    irq_thread_started_ = true;
-
-    // Publish our device.  If something goes wrong, shut down our IRQ thread
-    // immediately.  Otherwise, transition to the OPERATING state and signal the
-    // IRQ thread so it can begin to look for (and publish) codecs.
-    //
-    // TODO(johngro): We are making an assumption here about the threading
-    // behavior of the device driver framework.  In particular, we are assuming
-    // that Unbind will never be called after the device has been published, but
-    // before Bind has unbound all the way up to the framework.  If this *can*
-    // happen, then we have a race condition which would proceed as follows.
-    //
-    // 1) Device is published (device_add below)
-    // 2) Before SetState (below) Unbind is called, which triggers a transition
-    //    to SHUTTING_DOWN and wakes up the IRQ thread..
-    // 3) Before the IRQ thread wakes up and exits, the SetState (below)
-    //    transitions to OPERATING.
-    // 4) The IRQ thread is now operating, but should be shut down.
-    //
-    // At some point, we need to verify the threading assumptions being made
-    // here.  If they are not valid, this needs to be revisited and hardened.
-
-    // Put an unmanaged reference to ourselves in the device node we are about
-    // to publish.  Only perform an manual AddRef if we succeed in publishing
-    // our device.
-
-    // Generate a device name and initialize our device structure
+    // Generate a device name, initialize our device structure, and attempt to
+    // publish our device.
     char dev_name[ZX_DEVICE_NAME_MAX] = { 0 };
     snprintf(dev_name, sizeof(dev_name), "intel-hda-%03u", id());
 
@@ -576,11 +625,56 @@ zx_status_t IntelHDAController::InitInternal(zx_device_t* pci_dev) {
     args.ops = &CONTROLLER_DEVICE_THUNKS;
     args.proto_id = ZX_PROTOCOL_IHDA;
 
+    // Manually add a reference to this object.  If we succeeded in publishing,
+    // the DDK will be holding an unmanaged reference to us in our device's ctx
+    // pointer.  We will re-claim the reference when the DDK eventually calls
+    // our Release hook.
+    this->AddRef();
+
     res = device_add(pci_dev_, &args, &dev_node_);
-    if (res == ZX_OK) {
-        this->AddRef();
+    if (res != ZX_OK) {
+        // We failed to publish our device.  Release the manual reference we
+        // just added.
+        __UNUSED bool should_destruct;
+        should_destruct = this->Release();
+        ZX_DEBUG_ASSERT(!should_destruct);
+    } else {
+        // Flag the fact that we have entered the operating state.
         SetState(State::OPERATING);
-        WakeupIRQThread();
+
+        // Make sure that interrupts are completely disabled before proceeding.
+        // If we have a unmasked, pending IRQ, we need to make sure that it
+        // generates and interrupt once we have finished this interrupt
+        // configuration.
+        REG_WR(&regs()->intctl, 0u);
+
+        // Clear our STATESTS shadow, setup the WAKEEN register to wake us
+        // up if there is any change to the codec enumeration status.  This will
+        // kick off the process of codec enumeration.
+        REG_SET_BITS(&regs()->wakeen, HDA_REG_STATESTS_MASK);
+
+        // Allow unsolicited codec responses
+        REG_SET_BITS(&regs()->gctl, HDA_REG_GCTL_UNSOL);
+
+        // Compute the set of interrupts we may be interested in during
+        // operation, then enable those interrupts.
+        uint32_t interesting_irqs = HDA_REG_INTCTL_GIE | HDA_REG_INTCTL_CIE;
+        for (uint32_t i = 0; i < countof(all_streams_); ++i) {
+            if (all_streams_[i] != nullptr)
+                interesting_irqs |= HDA_REG_INTCTL_SIE(i);
+        }
+        REG_WR(&regs()->intctl, interesting_irqs);
+
+        // Probe for the Audio DSP. This is done after adding the HDA controller
+        // device because the Audio DSP will be added a child to the HDA
+        // controller and ddktl requires the parent device node to be initialized
+        // at construction time.
+
+        // No need to check for return value because the absence of the Audio
+        // DSP is not a failure.
+        // TODO(yky) Come up with a way to warn for the absence of Audio DSP
+        // on platforms that require it.
+        ProbeAudioDSP();
     }
 
     return res;
@@ -589,8 +683,9 @@ zx_status_t IntelHDAController::InitInternal(zx_device_t* pci_dev) {
 zx_status_t IntelHDAController::Init(zx_device_t* pci_dev) {
     zx_status_t res = InitInternal(pci_dev);
 
-    if (res != ZX_OK)
+    if (res != ZX_OK) {
         DeviceShutdown();
+    }
 
     return res;
 }

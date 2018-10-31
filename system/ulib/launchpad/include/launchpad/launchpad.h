@@ -98,6 +98,59 @@ zx_status_t launchpad_create_with_process(zx_handle_t proc,
 // again.
 zx_status_t launchpad_go(launchpad_t* lp, zx_handle_t* proc, const char** errmsg);
 
+// Out parameters for |launchpad_ready_set|.
+//
+// This structure matches fuchsia.process.StartData. Once launchpad is no longer
+// exported in the SDK, we can switch to using that struct directly.
+//
+// When using |launchpad_ready_set|, complete the process launch by passing
+// these parameters to |zx_process_start|.
+typedef struct launchpad_start_data {
+    // The process that was created.
+    zx_handle_t process;
+
+    // The vmar object that was created when the process was created.
+    zx_handle_t root_vmar;
+
+    // The initial thread for the process.
+    zx_handle_t thread;
+
+    // The address of the initial entry point in the process.
+    zx_vaddr_t entry;
+
+    // The stack pointer value for the initial thread of the process.
+    zx_vaddr_t sp;
+
+    // The bootstrap channel to pass to the process on startup.
+    zx_handle_t bootstrap;
+
+    // The base address of the vDSO to pass to the process on startup.
+    zx_vaddr_t vdso_base;
+
+    // The base load address of the the ELF file loaded.
+    zx_vaddr_t base;
+} launchpad_start_data_t;
+
+// If none of the launchpad_*() calls against this launchpad have failed,
+// and launchpad_abort() has not been called, this will attempt to prepare
+// the process to be started.
+//
+// Upon success, you can complete the process launch by calling
+// |zx_process_start| with the data returned via |launchpad_start_data_t|.
+//
+// |data_out| must not be NULL.
+// |errmsg_out| may be NULL.
+//
+// If the call succeeds, the caller owns all the handles returned via
+// |launchpad_start_data_t|.
+//
+// The launchpad is destroyed (via launchpad_destroy()) before this returns,
+// all resources are reclaimed, handles are closed, and may not be accessed
+// again.
+zx_status_t launchpad_ready_set(launchpad_t* lp,
+                                launchpad_start_data_t* data_out,
+                                const char** errmsg_out);
+
 // Clean up a launchpad_t, freeing all resources stored therein.
 // TODO(mcgrathr): Currently this closes the process handle but does
 // not kill a process that hasn't been started yet.
@@ -313,7 +366,7 @@ zx_handle_t launchpad_use_loader_service(launchpad_t* lp, zx_handle_t svc);
 // launchpad_set_vdso_vmo has been called with a valid handle, this
 // just duplicates the handle passed in the last call.  Otherwise,
 // the first time the system vDSO is needed it's fetched with
-// zx_get_startup_handle.
+// zx_take_startup_handle.
 zx_status_t launchpad_get_vdso_vmo(zx_handle_t* out);
 
 // Replace the globally-held VM object handle for the system vDSO.
@@ -321,7 +374,7 @@ zx_status_t launchpad_get_vdso_vmo(zx_handle_t* out);
 // handle, of which the caller takes ownership.  It does not check
 // the handle for validity.  If ZX_HANDLE_INVALID is passed here,
 // then the next time the system vDSO is needed it will be fetched
-// with zx_get_startup_handle as if it were the first time.  If
+// with zx_take_startup_handle as if it were the first time.  If
 // the system vDSO has not been needed before this call, then the
 // return value will be ZX_HANDLE_INVALID.
 zx_handle_t launchpad_set_vdso_vmo(zx_handle_t vmo);
@@ -345,26 +398,5 @@ zx_status_t launchpad_load_vdso(launchpad_t* lp, zx_handle_t vmo);
 // If this is passed zero, then there will be no stack allocated.
 // Otherwise, the size passed is rounded up to a multiple of the page size.
 size_t launchpad_set_stack_size(launchpad_t* lp, size_t new_size);
-
-
-
-
-// Start a new thread in the process, assuming this was a launchpad
-// created with launchpad_create_with_process and the process has
-// already started.  The new thread runs the launchpad's entry point
-// just like the initial thread does in the launchpad_go case.
-// The given handle is to a channel where the bootstrap
-// messages will be written; the caller retains ownership of this
-// handle.  The other end of this channel must already be
-// present in the target process, with the given handle value in the
-// target process's handle space.
-zx_status_t launchpad_start_injected(launchpad_t* lp, const char* thread_name,
-                                     zx_handle_t to_child,
-                                     uintptr_t bootstrap_handle_in_child);
-
-
-
-
-
 
 __END_CDECLS

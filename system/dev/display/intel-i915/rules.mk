@@ -12,7 +12,6 @@ MODULE_TYPE := driver
 
 MODULE_SRCS := \
     $(LOCAL_DIR)/bind.c \
-    $(LOCAL_DIR)/bootloader-display.cpp \
     $(LOCAL_DIR)/display-device.cpp \
     $(LOCAL_DIR)/dp-display.cpp \
     $(LOCAL_DIR)/gtt.cpp \
@@ -20,6 +19,7 @@ MODULE_SRCS := \
     $(LOCAL_DIR)/igd.cpp \
     $(LOCAL_DIR)/intel-i915.cpp \
     $(LOCAL_DIR)/interrupts.cpp \
+    $(LOCAL_DIR)/pipe.cpp \
     $(LOCAL_DIR)/power.cpp \
 
 MODULE_STATIC_LIBS := \
@@ -27,12 +27,15 @@ MODULE_STATIC_LIBS := \
     system/ulib/ddktl \
     system/ulib/edid \
     system/ulib/fbl \
+    system/ulib/fidl \
     system/ulib/hwreg \
     system/ulib/region-alloc \
     system/ulib/zx \
     system/ulib/zxcpp \
 
 MODULE_LIBS := system/ulib/driver system/ulib/zircon system/ulib/c
+
+MODULE_FIDL_LIBS := system/fidl/zircon-backlight
 
 include make/module.mk
 

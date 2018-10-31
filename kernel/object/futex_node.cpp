@@ -5,28 +5,26 @@
 // https://opensource.org/licenses/MIT
 
 #include <object/futex_node.h>
+#include <object/thread_dispatcher.h>
 
 #include <assert.h>
 #include <err.h>
 #include <fbl/mutex.h>
 #include <platform.h>
 #include <trace.h>
+#include <kernel/thread_lock.h>
 #include <zircon/types.h>
 
 #define LOCAL_TRACE 0
 
 FutexNode::FutexNode() {
     LTRACE_ENTRY;
-
-    wait_queue_ = WAIT_QUEUE_INITIAL_VALUE(wait_queue_);
 }
 
 FutexNode::~FutexNode() {
     LTRACE_ENTRY;
 
     DEBUG_ASSERT(!IsInQueue());
-
-    wait_queue_destroy(&wait_queue_);
 }
 
 bool FutexNode::IsInQueue() const {
@@ -78,7 +76,7 @@ FutexNode* FutexNode::RemoveNodeFromList(FutexNode* list_head,
 // RemoveFromHead() is similar, except that it produces a list of removed
 // threads without waking them.
 FutexNode* FutexNode::WakeThreads(FutexNode* node, uint32_t count,
-                                  uintptr_t old_hash_key, bool* out_any_woken) {
+                                  uintptr_t old_hash_key) {
     ASSERT(node);
     ASSERT(count != 0);
 
@@ -92,8 +90,7 @@ FutexNode* FutexNode::WakeThreads(FutexNode* node, uint32_t count,
         FutexNode* next = node->queue_next_;
         // This call can cause |node| to be freed, so we must not
         // dereference |node| after this.
-        if (node->WakeThread())
-            *out_any_woken = true;
+        node->WakeThread();
 
         if (is_last_node) {
             // We have reached the end of the list, so we are removing all
@@ -149,27 +146,30 @@ FutexNode* FutexNode::RemoveFromHead(FutexNode* list_head, uint32_t count,
 // This blocks the current thread.  This releases the given mutex (which
 // must be held when BlockThread() is called).  To reduce contention, it
 // does not reclaim the mutex on return.
-zx_status_t FutexNode::BlockThread(fbl::Mutex* mutex, zx_time_t deadline) TA_NO_THREAD_SAFETY_ANALYSIS {
-    AutoThreadLock lock;
+zx_status_t FutexNode::BlockThread(Guard<fbl::Mutex>&& adopt_guard, zx_time_t deadline) {
+    // Adopt the guarded lock from the caller. This could happen before or after
+    // the following locks because the underlying lock is held from the caller's
+    // frame. The runtime validator state is not affected by the adoption.
+    Guard<fbl::Mutex> guard{AdoptLock, fbl::move(adopt_guard)};
 
-    // We specifically want reschedule=false here, otherwise the
-    // combination of releasing the mutex and enqueuing the current thread
+    Guard<spin_lock_t, IrqSave> thread_lock_guard{ThreadLock::Get()};
+    ThreadDispatcher::AutoBlocked by(ThreadDispatcher::Blocked::FUTEX);
+
+    // We specifically want reschedule=MutexPolicy::NoReschedule here, otherwise
+    // the combination of releasing the mutex and enqueuing the current thread
     // would not be atomic, which would mean that we could miss wakeups.
-    mutex_release_thread_locked(mutex->GetInternal(), /* reschedule= */ false);
+    guard.Release(MutexPolicy::ThreadLockHeld, MutexPolicy::NoReschedule);
 
     thread_t* current_thread = get_current_thread();
     zx_status_t result;
     current_thread->interruptable = true;
-    result = wait_queue_block(&wait_queue_, deadline);
+    result = wait_queue_.Block(deadline);
     current_thread->interruptable = false;
 
     return result;
 }
 
-// This returns whether the thread was woken.  This will usually return
-// true, but can sometimes return false if our wakeup coincides with the
-// thread waking up from a timeout.
-bool FutexNode::WakeThread() {
+void FutexNode::WakeThread() {
     // We must be careful to correctly handle the case where the thread
     // for |this| wakes and exits, deleting |this|.  There are two
     // cases to consider:
@@ -185,15 +185,8 @@ bool FutexNode::WakeThread() {
     // We must do this before we wake the thread, to handle case 2.
     MarkAsNotInQueue();
 
-    // Place the waiting thread in the runnable state, but do not
-    // reschedule yet.  Our caller is currently holding the main
-    // futex_lock, and any threads which get woken by this action are going
-    // to immediately attempt to obtain the main futex_lock.  If we
-    // indicate that the thread was woken during this process, our caller
-    // will release the lock and then arrange for a reschedule operation
-    // (which leads to a smoother transition).
-    AutoThreadLock lock;
-    return wait_queue_wake_one(&wait_queue_, /* reschedule */ false, ZX_OK);
+    Guard<spin_lock_t, IrqSave> thread_lock_guard{ThreadLock::Get()};
+    wait_queue_.WakeOne(/* reschedule */ true, ZX_OK);
 }
 
 // Set |node1| and |node2|'s list pointers so that |node1| is immediately

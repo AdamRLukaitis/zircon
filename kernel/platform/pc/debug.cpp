@@ -5,22 +5,16 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
-#include <stdarg.h>
-#include <reg.h>
+#include <arch/x86.h>
+#include <arch/x86/apic.h>
 #include <bits.h>
-#include <stdio.h>
+#include <dev/interrupt.h>
+#include <kernel/cmdline.h>
 #include <kernel/spinlock.h>
 #include <kernel/thread.h>
 #include <kernel/timer.h>
-#include <vm/physmap.h>
-#include <lk/init.h>
-#include <arch/x86.h>
-#include <arch/x86/apic.h>
-#include <dev/interrupt.h>
-#include <kernel/cmdline.h>
-#include <kernel/thread.h>
-#include <kernel/timer.h>
 #include <lib/cbuf.h>
+#include <lib/debuglog.h>
 #include <lk/init.h>
 #include <platform.h>
 #include <platform/console.h>
@@ -30,9 +24,11 @@
 #include <reg.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <trace.h>
 #include <vm/physmap.h>
+#include <zircon/time.h>
 #include <zircon/types.h>
 
 #include "platform_p.h"
@@ -114,7 +110,8 @@ static void platform_drain_debug_uart_rx(void) {
 
 // for devices where the uart rx interrupt doesn't seem to work
 static void uart_rx_poll(timer_t* t, zx_time_t now, void* arg) {
-    timer_set(t, now + ZX_MSEC(10), TIMER_SLACK_CENTER, ZX_MSEC(1), uart_rx_poll, NULL);
+    zx_time_t deadline = zx_time_add_duration(now, ZX_MSEC(10));
+    timer_set(t, deadline, TIMER_SLACK_CENTER, ZX_MSEC(1), uart_rx_poll, NULL);
     platform_drain_debug_uart_rx();
 }
 
@@ -127,7 +124,7 @@ void platform_debug_start_uart_timer(void) {
     if (!started) {
         started = true;
         timer_init(&uart_rx_poll_timer);
-        timer_set(&uart_rx_poll_timer, current_time() + ZX_MSEC(10),
+        timer_set(&uart_rx_poll_timer, zx_time_add_duration(current_time(), ZX_MSEC(10)),
                   TIMER_SLACK_CENTER, ZX_MSEC(1), uart_rx_poll, NULL);
     }
 }
@@ -145,6 +142,8 @@ static void init_uart() {
     // enable FIFO, rx FIFO reset, tx FIFO reset, 16750 64 byte fifo enable,
     // Rx FIFO irq trigger level at 14-bytes
     uart_write(2, 0xe7);
+    // Drive flow control bits high since we don't actively manage them
+    uart_write(4, 0x3);
 
     /* figure out the fifo depth */
     uint8_t fcr = uart_read(2);
@@ -160,7 +159,7 @@ static void init_uart() {
 }
 
 bool platform_serial_enabled() {
-    return bootloader.uart.type != BOOTDATA_UART_NONE;
+    return bootloader.uart.type != ZBI_UART_NONE;
 }
 
 // This just initializes the default serial console to be disabled.
@@ -168,33 +167,109 @@ bool platform_serial_enabled() {
 // bootloader structure because our C++ compiler doesn't support non-trivial
 // designated initializers.
 void pc_init_debug_default_early() {
-    bootloader.uart.type = BOOTDATA_UART_NONE;
+    bootloader.uart.type = ZBI_UART_NONE;
+}
+
+static void handle_serial_cmdline() {
+    const char* serial_mode = cmdline_get("kernel.serial");
+    if (serial_mode == NULL) {
+        return;
+    }
+    if (!strcmp(serial_mode, "none")) {
+        bootloader.uart.type = ZBI_UART_NONE;
+        return;
+    }
+    if (!strcmp(serial_mode, "legacy")) {
+        bootloader.uart.type = ZBI_UART_PC_PORT;
+        bootloader.uart.base = 0x3f8;
+        bootloader.uart.irq = ISA_IRQ_SERIAL1;
+        return;
+    }
+
+    // type can be "ioport" or "mmio"
+    constexpr size_t kMaxTypeLen = 6 + 1;
+    char type_buf[kMaxTypeLen];
+    // Addr can be up to 32 characters (numeric in any base strtoul will take),
+    // and + 1 for \0
+    constexpr size_t kMaxAddrLen = 32 + 1;
+    char addr_buf[kMaxAddrLen];
+
+    char* endptr;
+    const char* addr_start;
+    const char* irq_start;
+    size_t addr_len, type_len;
+    unsigned long irq_val;
+
+    addr_start = strchr(serial_mode, ',');
+    if (addr_start == nullptr) {
+        goto bail;
+    }
+    addr_start++;
+    irq_start = strchr(addr_start, ',');
+    if (irq_start == nullptr) {
+        goto bail;
+    }
+    irq_start++;
+
+    // Parse out the type part
+    type_len = addr_start - serial_mode - 1;
+    if (type_len + 1 > kMaxTypeLen) {
+        goto bail;
+    }
+    memcpy(type_buf, serial_mode, type_len);
+    type_buf[type_len] = 0;
+    if (!strcmp(type_buf, "ioport")) {
+        bootloader.uart.type = ZBI_UART_PC_PORT;
+    } else if (!strcmp(type_buf, "mmio")) {
+        bootloader.uart.type = ZBI_UART_PC_MMIO;
+    } else {
+        goto bail;
+    }
+
+    // Parse out the address part
+    addr_len = irq_start - addr_start - 1;
+    if (addr_len + 1 > kMaxAddrLen) {
+        goto bail;
+    }
+    memcpy(addr_buf, addr_start, addr_len);
+    addr_buf[addr_len] = 0;
+    bootloader.uart.base = strtoul(addr_buf, &endptr, 0);
+    if (endptr != addr_buf + addr_len) {
+        goto bail;
+    }
+
+    // Parse out the IRQ part
+    irq_val = strtoul(irq_start, &endptr, 0);
+    if (*endptr != '\0' || irq_val > UINT32_MAX) {
+        goto bail;
+    }
+    // For now, we don't support non-ISA IRQs
+    if (irq_val >= NUM_ISA_IRQS) {
+        goto bail;
+    }
+    bootloader.uart.irq = static_cast<uint32_t>(irq_val);
+    return;
+
+bail:
+    bootloader.uart.type = ZBI_UART_NONE;
+    return;
 }
 
 void pc_init_debug_early() {
-    const char* serial_mode = cmdline_get("kernel.serial");
-    if (serial_mode != NULL) {
-        if (!strcmp(serial_mode, "none")) {
-            bootloader.uart.type = BOOTDATA_UART_NONE;
-        } else if (!strcmp(serial_mode, "legacy")) {
-            bootloader.uart.type = BOOTDATA_UART_PC_PORT;
-            bootloader.uart.base = 0x3f8;
-            bootloader.uart.irq = ISA_IRQ_SERIAL1;
-        }
-    }
+    handle_serial_cmdline();
 
     switch (bootloader.uart.type) {
-    case BOOTDATA_UART_PC_PORT:
+    case ZBI_UART_PC_PORT:
         uart_io_port = static_cast<uint32_t>(bootloader.uart.base);
         uart_irq = bootloader.uart.irq;
         break;
-    case BOOTDATA_UART_PC_MMIO:
+    case ZBI_UART_PC_MMIO:
         uart_mem_addr = (uint64_t)paddr_to_physmap(bootloader.uart.base);
         uart_irq = bootloader.uart.irq;
         break;
-    case BOOTDATA_UART_NONE: // fallthrough
+    case ZBI_UART_NONE: // fallthrough
     default:
-        bootloader.uart.type = BOOTDATA_UART_NONE;
+        bootloader.uart.type = ZBI_UART_NONE;
         return;
     }
 
@@ -211,12 +286,13 @@ void pc_init_debug(void) {
     cbuf_initialize(&console_input_buf, 1024);
 
     if (!platform_serial_enabled()) {
-        // Need to bail after initializing the input_buf to prevent unintialized
+        // Need to bail after initializing the input_buf to prevent uninitialized
         // access to it.
         return;
     }
 
-    if ((uart_irq == 0) || cmdline_get_bool("kernel.debug_uart_poll", false)) {
+    if ((uart_irq == 0) || cmdline_get_bool("kernel.debug_uart_poll", false) ||
+        dlog_bypass()) {
         printf("debug-uart: polling enabled\n");
         platform_debug_start_uart_timer();
     } else {
@@ -227,13 +303,11 @@ void pc_init_debug(void) {
 
         uart_write(1, (1<<0)); // enable receive data available interrupt
 
-        // modem control register: Axiliary Output 2 is another IRQ enable bit
+        // modem control register: Auxiliary Output 2 is another IRQ enable bit
         const uint8_t mcr = uart_read(4);
         uart_write(4, mcr | 0x8);
         printf("UART: started IRQ driven RX\n");
-#if !ENABLE_KERNEL_LL_DEBUG
         tx_irq_driven = true;
-#endif
     }
     if (tx_irq_driven) {
         // start up tx driven output
@@ -377,7 +451,7 @@ int platform_dgetc(char* c, bool wait) {
     if (platform_serial_enabled()) {
         return static_cast<int>(cbuf_read_char(&console_input_buf, c, wait));
     }
-    return -1;
+    return ZX_ERR_NOT_SUPPORTED;
 }
 
 // panic time polling IO for the panic shell
@@ -393,7 +467,7 @@ int platform_pgetc(char *c, bool wait) {
     if (platform_serial_enabled()) {
         return debug_uart_getc_poll(c);
     }
-    return -1;
+    return ZX_ERR_NOT_SUPPORTED;
 }
 
 /*

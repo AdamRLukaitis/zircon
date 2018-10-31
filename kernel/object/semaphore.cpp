@@ -7,41 +7,38 @@
 #include <object/semaphore.h>
 
 #include <err.h>
+#include <kernel/thread_lock.h>
 #include <zircon/compiler.h>
 #include <zircon/types.h>
 
 Semaphore::Semaphore(int64_t initial_count) : count_(initial_count) {
-    wait_queue_init(&waitq_);
 }
 
 Semaphore::~Semaphore() {
-    wait_queue_destroy(&waitq_);
 }
 
-int Semaphore::Post() {
+void Semaphore::Post() {
     // If the count is or was negative then a thread is waiting for a resource,
     // otherwise it's safe to just increase the count available with no downsides.
-    AutoThreadLock lock;
+    Guard<spin_lock_t, IrqSave> guard{ThreadLock::Get()};
     if (unlikely(++count_ <= 0))
-        return wait_queue_wake_one(&waitq_, false, ZX_OK);
-    return 0;
+        waitq_.WakeOne(true, ZX_OK);
 }
 
-zx_status_t Semaphore::Wait(zx_time_t deadline, bool* was_blocked) {
+zx_status_t Semaphore::Wait(zx_time_t deadline) {
     thread_t *current_thread = get_current_thread();
 
      // If there are no resources available then we need to
      // sit in the wait queue until sem_post adds some.
     zx_status_t ret = ZX_OK;
-    bool block;
 
     {
-        AutoThreadLock lock;
+        Guard<spin_lock_t, IrqSave> guard{ThreadLock::Get()};
         current_thread->interruptable = true;
-        block = --count_ < 0;
+        bool block = --count_ < 0;
 
         if (unlikely(block)) {
-            ret = wait_queue_block(&waitq_, deadline);
+            ret = waitq_.Block(deadline);
             if (ret < ZX_OK) {
                 if ((ret == ZX_ERR_TIMED_OUT) || (ret == ZX_ERR_INTERNAL_INTR_KILLED))
                     count_++;
@@ -51,7 +48,5 @@ zx_status_t Semaphore::Wait(zx_time_t deadline, bool* was_blocked) {
         current_thread->interruptable = false;
     }
 
-    if (was_blocked != nullptr)
-        *was_blocked = block;
     return ret;
 }

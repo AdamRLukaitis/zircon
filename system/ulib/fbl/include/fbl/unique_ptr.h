@@ -89,11 +89,11 @@ public:
     // Implicit upcasting via construction.
     //
     // We permit implicit casting of a unique_ptr<U> to a unique_ptr<T> as long
-    // as...
+    // as the following conditions both hold:
     //
     // 1) U* is implicitly convertible to a T*
-    // 2) Neither T nor U are a class/struct type, or both T and U are
-    //    class/struct types, and T has a virtual destructor.
+    // 2) T is the same as const U, neither T nor U are a class/struct type, or
+    //    both T and U are class/struct types and T has a virtual destructor.
     //
     // Note: we do this via an implicit converting constructor (instead of a
     // user-defined conversion operator) so that we can demand that we are
@@ -107,10 +107,12 @@ public:
     template <typename U,
               typename = typename enable_if<is_convertible_pointer<U*, T*>::value>::type>
     unique_ptr(unique_ptr<U>&& o) : ptr_(o.release()) {
-        static_assert((is_class<T>::value == is_class<U>::value) &&
-                     (!is_class<T>::value || has_virtual_destructor<T>::value),
-                "Cannot convert unique_ptr<U> to unique_ptr<T> unless neither T "
-                "nor U are class/struct types, or T has a virtual destructor");
+        static_assert(is_same<T, const U>::value ||
+                (is_class<T>::value == is_class<U>::value &&
+                     (!is_class<T>::value || has_virtual_destructor<T>::value)),
+                "Cannot convert unique_ptr<U> to unique_ptr<T> unless T is the same "
+                "as const U, neither T nor U are class/struct types, or T has a "
+                "virtual destructor");
     }
 
 private:
@@ -205,13 +207,37 @@ static inline bool operator!=(decltype(nullptr), const unique_ptr<T>& ptr) {
     return (ptr.get() != nullptr);
 }
 
+namespace internal {
+
+template <typename T>
+struct unique_type {
+    using single = unique_ptr<T>;
+};
+
+template <typename T>
+struct unique_type<T[]> {
+    using incomplete_array = unique_ptr<T[]>;
+};
+
+} // namespace internal
+
 // Constructs a new object and assigns it to a unique_ptr.
 template <typename T, typename... Args>
-unique_ptr<T> make_unique(Args&&... args) {
+typename internal::unique_type<T>::single
+make_unique(Args&&... args) {
     return unique_ptr<T>(new T(fbl::forward<Args>(args)...));
 }
+
 template <typename T, typename... Args>
-unique_ptr<T> make_unique_checked(AllocChecker* ac, Args&&... args) {
+typename internal::unique_type<T>::incomplete_array
+make_unique(size_t size) {
+    using single_type = typename remove_extent<T>::type;
+    return unique_ptr<single_type[]>(new single_type[size]());
+}
+
+template <typename T, typename... Args>
+typename internal::unique_type<T>::single
+make_unique_checked(AllocChecker* ac, Args&&... args) {
     return unique_ptr<T>(new (ac) T(fbl::forward<Args>(args)...));
 }
 

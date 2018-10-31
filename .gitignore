@@ -21,6 +21,7 @@ compile_commands.json
 *_LOCAL_*
 *_BASE_*
 *.sublime-*
+json_generator_tests_*.txt
 /benchmarks/
 /infra/.recipe_deps
 /out*
@@ -29,6 +30,7 @@ compile_commands.json
 /prebuilt/config.mk.bak
 /AnalysisResult/
 /public/config/
+/public/fidl/
 /public/lib/
 /public/sysroot/
 /public/tool/

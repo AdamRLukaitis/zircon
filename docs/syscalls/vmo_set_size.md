@@ -20,6 +20,10 @@ zx_status_t zx_vmo_set_size(zx_handle_t handle, uint64_t size);
 The size will be rounded up to the next page size boundary.
 Subsequent calls to **vmo_get_size**() will return the rounded up size.
 
+## RIGHTS
+
+TODO(ZX-2399)
+
 ## RETURN VALUE
 
 **vmo_set_size**() returns **ZX_OK** on success. In the event
@@ -32,6 +36,8 @@ of failure, a negative error value is returned.
 **ZX_ERR_WRONG_TYPE**  *handle* is not a VMO handle.
 
 **ZX_ERR_ACCESS_DENIED**  *handle* does not have the **ZX_RIGHT_WRITE** right.
+
+**ZX_ERR_UNAVAILABLE** The VMO was created with **ZX_VMO_NON_RESIZABLE** option.
 
 **ZX_ERR_OUT_OF_RANGE**  Requested size is too large.
 

@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef LIB_FIDL_CPP_MESSAGE_H_
+#define LIB_FIDL_CPP_MESSAGE_H_
 
 #include <lib/fidl/coding.h>
 #include <lib/fidl/cpp/message_part.h>
@@ -25,7 +26,8 @@ public:
     // Creates a message whose storage is backed by |bytes| and |handles|.
     //
     // The constructed |Message| object does not take ownership of the given
-    // storage.
+    // storage, although does take ownership of zircon handles contained withing
+    // handles.
     Message(BytePart bytes, HandlePart handles);
 
     ~Message();
@@ -75,6 +77,12 @@ public:
         return BytePart(bytes_.data() + n, bytes_.capacity() - n, bytes_.actual() - n);
     }
 
+    // The message bytes interpreted as the given type.
+    template <typename T>
+    T* GetBytesAs() const {
+        return reinterpret_cast<T*>(bytes_.data());
+    }
+
     // The message payload that follows the header interpreted as the given type.
     //
     // Valid only if has_header().
@@ -86,6 +94,7 @@ public:
     // The storage for the bytes of the message.
     BytePart& bytes() { return bytes_; }
     const BytePart& bytes() const { return bytes_; }
+    void set_bytes(BytePart bytes) { bytes_ = static_cast<BytePart&&>(bytes); }
 
     // The storage for the handles of the message.
     //
@@ -143,7 +152,7 @@ public:
     // If this method returns ZX_OK, handles() will be empty because they were
     // consumed by this operation.
     zx_status_t Call(zx_handle_t channel, uint32_t flags, zx_time_t deadline,
-                     zx_status_t* read_status, Message* response);
+                     Message* response);
 
     // Stop tracking the handles in stored in handles(), without closing them.
     //
@@ -159,3 +168,5 @@ private:
 };
 
 } // namespace fidl
+
+#endif // LIB_FIDL_CPP_MESSAGE_H_

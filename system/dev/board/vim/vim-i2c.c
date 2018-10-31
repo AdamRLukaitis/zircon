@@ -4,7 +4,7 @@
 
 #include <ddk/debug.h>
 #include <ddk/device.h>
-#include <ddk/protocol/platform-defs.h>
+#include <ddk/platform-defs.h>
 #include <soc/aml-s912/s912-gpio.h>
 #include <soc/aml-s912/s912-hw.h>
 
@@ -59,33 +59,27 @@ static const pbus_dev_t i2c_dev = {
     .vid = PDEV_VID_AMLOGIC,
     .pid = PDEV_PID_GENERIC,
     .did = PDEV_DID_AMLOGIC_I2C,
-    .mmios = i2c_mmios,
+    .mmio_list = i2c_mmios,
     .mmio_count = countof(i2c_mmios),
-    .irqs = i2c_irqs,
+    .irq_list = i2c_irqs,
     .irq_count = countof(i2c_irqs),
 };
 
 zx_status_t vim_i2c_init(vim_bus_t* bus) {
     // setup pinmux for our I2C busses
     // I2C_A and I2C_B are exposed on the 40 pin header and I2C_C on the FPC connector
-    gpio_set_alt_function(&bus->gpio, S912_I2C_SDA_A, S912_I2C_SDA_A_FN);
-    gpio_set_alt_function(&bus->gpio, S912_I2C_SCK_A, S912_I2C_SCK_A_FN);
-    gpio_set_alt_function(&bus->gpio, S912_I2C_SDA_B, S912_I2C_SDA_B_FN);
-    gpio_set_alt_function(&bus->gpio, S912_I2C_SCK_B, S912_I2C_SCK_B_FN);
-    gpio_set_alt_function(&bus->gpio, S912_I2C_SDA_C, S912_I2C_SDA_C_FN);
-    gpio_set_alt_function(&bus->gpio, S912_I2C_SCK_C, S912_I2C_SCK_C_FN);
+    gpio_impl_set_alt_function(&bus->gpio, S912_I2C_SDA_A, S912_I2C_SDA_A_FN);
+    gpio_impl_set_alt_function(&bus->gpio, S912_I2C_SCK_A, S912_I2C_SCK_A_FN);
+    gpio_impl_set_alt_function(&bus->gpio, S912_I2C_SDA_B, S912_I2C_SDA_B_FN);
+    gpio_impl_set_alt_function(&bus->gpio, S912_I2C_SCK_B, S912_I2C_SCK_B_FN);
+    gpio_impl_set_alt_function(&bus->gpio, S912_I2C_SDA_C, S912_I2C_SDA_C_FN);
+    gpio_impl_set_alt_function(&bus->gpio, S912_I2C_SCK_C, S912_I2C_SCK_C_FN);
 
-    zx_status_t status = pbus_device_add(&bus->pbus, &i2c_dev, PDEV_ADD_PBUS_DEVHOST);
+    zx_status_t status = pbus_protocol_device_add(&bus->pbus, ZX_PROTOCOL_I2C_IMPL, &i2c_dev);
     if (status != ZX_OK) {
-        zxlogf(ERROR, "vim_i2c_init: pbus_device_add failed: %d\n", status);
+        zxlogf(ERROR, "vim_i2c_init: pbus_protocol_device_add failed: %d\n", status);
         return status;
     }
 
-    status = pbus_wait_protocol(&bus->pbus, ZX_PROTOCOL_I2C_IMPL);
-    if (status != ZX_OK) {
-        zxlogf(ERROR, "vim_i2c_init: pbus_wait_protocol failed: %d\n", status);
-        return status;
-    }
-
-    return device_get_protocol(bus->parent, ZX_PROTOCOL_I2C_IMPL, &bus->i2c);
+    return ZX_OK;
 }

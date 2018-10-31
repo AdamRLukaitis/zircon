@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "dynlink.h"
+#include "relr.h"
 #include "libc.h"
 #include "asan_impl.h"
 #include "zircon_impl.h"
@@ -15,6 +16,7 @@
 #include <zircon/dlfcn.h>
 #include <zircon/process.h>
 #include <zircon/status.h>
+#include <zircon/syscalls/log.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <stdalign.h>
@@ -37,10 +39,10 @@
 #include <runtime/processargs.h>
 #include <runtime/thread.h>
 
+
 static void early_init(void);
 static void error(const char*, ...);
 static void debugmsg(const char*, ...);
-static void log_write(const void* buf, size_t len);
 static zx_status_t get_library_vmo(const char* name, zx_handle_t* vmo);
 static void loader_svc_config(const char* config);
 
@@ -53,17 +55,20 @@ static void loader_svc_config(const char* config);
 #define VMO_NAME_PREFIX_DATA "data:"
 
 struct dso {
+    // Must be first.
     struct link_map l_map;
 
-    union {
-        const struct gnu_note* build_id_note; // Written by map_library.
-        struct iovec build_id_log;      // Written by format_build_id_log.
-    };
+    const struct gnu_note* build_id_note;
+    // TODO(mcgrathr): Remove build_id_log when everything uses markup.
+    struct iovec build_id_log;
     atomic_flag logged;
+
+    // ID of this module for symbolizer markup.
+    unsigned int module_id;
 
     const char* soname;
     Phdr* phdr;
-    int phnum;
+    unsigned int phnum;
     size_t phentsize;
     int refcnt;
     zx_handle_t vmar; // Closed after relocation.
@@ -126,7 +131,7 @@ static jmp_buf* rtld_fail;
 static pthread_rwlock_t lock;
 static struct r_debug debug;
 static struct tls_module* tls_tail;
-static size_t tls_cnt, tls_offset, tls_align = MIN_TLS_ALIGN;
+static size_t tls_cnt, tls_offset = 16, tls_align = MIN_TLS_ALIGN;
 static size_t static_tls_cnt;
 static pthread_mutex_t init_fini_lock = {._m_type = PTHREAD_MUTEX_RECURSIVE};
 
@@ -147,15 +152,6 @@ struct r_debug* _dl_debug_addr = &debug;
 // post-processing the h/w trace.
 static bool trace_maps = false;
 
-__attribute__((__visibility__("hidden"))) void (*const __init_array_start)(void) = 0,
-                                                       (*const __fini_array_start)(void) = 0;
-
-__attribute__((__visibility__("hidden"))) extern void (*const __init_array_end)(void),
-    (*const __fini_array_end)(void);
-
-weak_alias(__init_array_start, __init_array_end);
-weak_alias(__fini_array_start, __fini_array_end);
-
 NO_ASAN static int dl_strcmp(const char* l, const char* r) {
     for (; *l == *r && *l; l++, r++)
         ;
@@ -163,6 +159,20 @@ NO_ASAN static int dl_strcmp(const char* l, const char* r) {
 }
 #define strcmp(l, r) dl_strcmp(l, r)
 
+// Signals a debug breakpoint. It does't use __builtin_trap() because that's
+// actually an "undefined instruction" rather than a debug breakpoint, and
+// __builtin_trap() documented to never return. We don't want the compiler to
+// optimize later code away because it assumes the trap will never be returned
+// from.
+static void debug_break(void) {
+#if defined(__x86_64__)
+    __asm__("int3");
+#elif defined(__aarch64__)
+    __asm__("brk 0");
+#else
+#error
+#endif
+}
 
 // Simple bump allocator for dynamic linker internal data structures.
 // This allocator is single-threaded: it can be used only at startup or
@@ -195,9 +205,9 @@ static void* dl_alloc(size_t size) {
         _zx_object_set_property(vmo, ZX_PROP_NAME,
                                 VMO_NAME_DL_ALLOC, sizeof(VMO_NAME_DL_ALLOC));
         uintptr_t chunk;
-        status = _zx_vmar_map(_zx_vmar_root_self(), 0, vmo, 0, chunk_size,
-                              ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE,
-                              &chunk);
+        status = _zx_vmar_map(_zx_vmar_root_self(),
+                              ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
+                              0, vmo, 0, chunk_size, &chunk);
         _zx_handle_close(vmo);
         if (status != ZX_OK)
             return NULL;
@@ -260,13 +270,22 @@ __NO_SAFESTACK NO_ASAN static inline struct dso* dso_prev(struct dso* p) {
 
 __NO_SAFESTACK NO_ASAN
 static inline void dso_set_next(struct dso* p, struct dso* next) {
-    p->l_map.l_next = &next->l_map;
+    p->l_map.l_next = next ? &next->l_map : NULL;
 }
 
 __NO_SAFESTACK NO_ASAN
 static inline void dso_set_prev(struct dso* p, struct dso* prev) {
-    p->l_map.l_prev = &prev->l_map;
+    p->l_map.l_prev = prev ? &prev->l_map : NULL;
 }
+
+// TODO(mcgrathr): Working around arcane compiler issues; find a better way.
+// The compiler can decide to turn the loop below into a memset call.  Since
+// memset is an exported symbol, calls to that name are PLT calls.  But this
+// code runs before PLT calls are available.  So use the .weakref trick to
+// tell the assembler to rename references (the compiler generates) to memset
+// to __libc_memset.  That's a hidden symbol that won't cause a PLT entry to
+// be generated, so it's safe to use in calls here.
+__asm__(".weakref memset,__libc_memset");
 
 __NO_SAFESTACK NO_ASAN
  static void decode_vec(ElfW(Dyn)* v, size_t* a, size_t cnt) {
@@ -515,7 +534,7 @@ __NO_SAFESTACK NO_ASAN static void do_relocs(struct dso* dso, size_t* rel,
             break;
 #ifdef TLS_ABOVE_TP
         case REL_TPOFF:
-            *reloc_addr = tls_val + def.dso->tls.offset + TPOFF_K + addend;
+            *reloc_addr = tls_val + def.dso->tls.offset + addend;
             break;
 #else
         case REL_TPOFF:
@@ -542,7 +561,7 @@ __NO_SAFESTACK NO_ASAN static void do_relocs(struct dso* dso, size_t* rel,
             } else {
                 reloc_addr[0] = (size_t)__tlsdesc_static;
 #ifdef TLS_ABOVE_TP
-                reloc_addr[1] = tls_val + def.dso->tls.offset + TPOFF_K + addend;
+                reloc_addr[1] = tls_val + def.dso->tls.offset + addend;
 #else
                 reloc_addr[1] = tls_val - def.dso->tls.offset + addend;
 #endif
@@ -568,6 +587,12 @@ __NO_SAFESTACK static void unmap_library(struct dso* dso) {
     }
 }
 
+// app.module_id is always zero, so assignments start with 1.
+__NO_SAFESTACK NO_ASAN static void assign_module_id(struct dso* dso) {
+    static unsigned int last_module_id;
+    dso->module_id = ++last_module_id;
+}
+
 // Locate the build ID note just after mapping the segments in.
 // This is called from dls2, so it cannot use any non-static functions.
 __NO_SAFESTACK NO_ASAN static bool find_buildid_note(struct dso* dso,
@@ -587,6 +612,8 @@ __NO_SAFESTACK NO_ASAN static bool find_buildid_note(struct dso* dso,
     }
     return false;
 }
+
+// TODO(mcgrathr): Remove this all when everything uses markup.
 
 // We pre-format the log line for each DSO early so that we can log it
 // without running any nontrivial code.  We use hand-rolled formatting
@@ -650,6 +677,151 @@ __NO_SAFESTACK static void allocate_and_format_build_id_log(struct dso* dso) {
     format_build_id_log(dso, buffer, name, namelen);
 }
 
+// TODO(mcgrathr): Remove above when everything uses markup.
+
+// Format the markup elements by hand to avoid using large and complex code
+// like the printf engine.
+
+__NO_SAFESTACK static char* format_string(char* p,
+                                          const char* string, size_t len) {
+    return memcpy(p, string, len) + len;
+}
+
+#define FORMAT_HEX_VALUE_SIZE (2 + (sizeof(uint64_t) * 2))
+#define HEXDIGITS "0123456789abcdef"
+
+__NO_SAFESTACK static char* format_hex_value(
+    char buffer[FORMAT_HEX_VALUE_SIZE], uint64_t value) {
+    char* p = buffer;
+    if (value == 0) {
+        // No "0x" prefix on zero.
+        *p++ = '0';
+    } else {
+        *p++ = '0';
+        *p++ = 'x';
+        // Skip the high nybbles that are zero.
+        int shift = 60;
+        while ((value >> shift) == 0) {
+            shift -= 4;
+        }
+        do {
+            *p++ = HEXDIGITS[(value >> shift) & 0xf];
+            shift -= 4;
+        } while (shift >= 0);
+    }
+    return p;
+}
+
+__NO_SAFESTACK static char* format_hex_string(char* p, const uint8_t* string,
+                                             size_t len) {
+    for (size_t i = 0; i < len; ++i) {
+        uint8_t byte = string[i];
+        *p++ = HEXDIGITS[byte >> 4];
+        *p++ = HEXDIGITS[byte & 0xf];
+    }
+    return p;
+}
+
+// The format theoretically does not constrain the size of build ID notes,
+// but there is a reasonable upper bound.
+#define MAX_BUILD_ID_SIZE 64
+
+// Likewise, there's no real limit on the length of module names.
+// But they're only included in the markup output to be informative,
+// so truncating them is OK.
+#define MODULE_NAME_SIZE 64
+
+#define MODULE_ELEMENT_BEGIN "{{{module:"
+#define MODULE_ELEMENT_BUILD_ID_BEGIN ":elf:"
+#define MODULE_ELEMENT_END "}}}\n"
+#define MODULE_ELEMENT_SIZE                                             \
+    (sizeof(MODULE_ELEMENT_BEGIN) - 1 + FORMAT_HEX_VALUE_SIZE +     \
+     1 + MODULE_NAME_SIZE + sizeof(MODULE_ELEMENT_BUILD_ID_BEGIN) - 1 + \
+     (MAX_BUILD_ID_SIZE * 2) + 1 + sizeof(MODULE_ELEMENT_END))
+
+__NO_SAFESTACK static void log_module_element(struct dso* dso) {
+    char buffer[MODULE_ELEMENT_SIZE];
+    char* p = format_string(buffer, MODULE_ELEMENT_BEGIN,
+                            sizeof(MODULE_ELEMENT_BEGIN) - 1);
+    p = format_hex_value(p, dso->module_id);
+    *p++ = ':';
+    const char* name = dso->l_map.l_name;
+    if (name[0] == '\0') {
+        name = dso->soname == NULL ? "<application>" : dso->soname;
+    }
+    size_t namelen = strlen(name);
+    if (namelen > MODULE_NAME_SIZE) {
+        namelen = MODULE_NAME_SIZE;
+    }
+    p = format_string(p, name, namelen);
+    p = format_string(p, MODULE_ELEMENT_BUILD_ID_BEGIN,
+                      sizeof(MODULE_ELEMENT_BUILD_ID_BEGIN) - 1);
+    if (dso->build_id_note) {
+        p = format_hex_string(p, dso->build_id_note->desc,
+                              dso->build_id_note->nhdr.n_descsz);
+    }
+    p = format_string(p, MODULE_ELEMENT_END, sizeof(MODULE_ELEMENT_END) - 1);
+    _dl_log_write(buffer, p - buffer);
+}
+
+#define MMAP_ELEMENT_BEGIN "{{{mmap:"
+#define MMAP_ELEMENT_LOAD_BEGIN ":load:"
+#define MMAP_ELEMENT_END "}}}\n"
+#define MMAP_ELEMENT_SIZE                                               \
+    (sizeof(MMAP_ELEMENT_BEGIN) - 1 +                                   \
+     FORMAT_HEX_VALUE_SIZE + 1 +                                        \
+     FORMAT_HEX_VALUE_SIZE + 1 +                                        \
+     sizeof(MMAP_ELEMENT_LOAD_BEGIN) - 1 + FORMAT_HEX_VALUE_SIZE + 1 +  \
+     3 + 1 + FORMAT_HEX_VALUE_SIZE)
+
+__NO_SAFESTACK static void log_mmap_element(struct dso* dso, const Phdr* ph) {
+    size_t start = ph->p_vaddr & -PAGE_SIZE;
+    size_t end = (ph->p_vaddr + ph->p_memsz + PAGE_SIZE - 1) & -PAGE_SIZE;
+    char buffer[MMAP_ELEMENT_SIZE];
+    char* p = format_string(buffer, MMAP_ELEMENT_BEGIN,
+                            sizeof(MMAP_ELEMENT_BEGIN) - 1);
+    p = format_hex_value(p, saddr(dso, start));
+    *p++ = ':';
+    p = format_hex_value(p, end - start);
+    p = format_string(p, MMAP_ELEMENT_LOAD_BEGIN,
+                      sizeof(MMAP_ELEMENT_LOAD_BEGIN) - 1);
+    p = format_hex_value(p, dso->module_id);
+    *p++ = ':';
+    if (ph->p_flags & PF_R) {
+        *p++ = 'r';
+    }
+    if (ph->p_flags & PF_W) {
+        *p++ = 'w';
+    }
+    if (ph->p_flags & PF_X) {
+        *p++ = 'x';
+    }
+    *p++ = ':';
+    p = format_hex_value(p, start);
+    p = format_string(p, MMAP_ELEMENT_END, sizeof(MMAP_ELEMENT_END) - 1);
+    _dl_log_write(buffer, p - buffer);
+}
+
+// No newline because it's immediately followed by a {{{module:...}}}.
+#define RESET_ELEMENT "{{{reset}}}"
+
+__NO_SAFESTACK static void log_dso(struct dso* dso) {
+    if (dso == head) {
+        // Write the reset element before the first thing listed.
+        _dl_log_write(RESET_ELEMENT, sizeof(RESET_ELEMENT) - 1);
+    }
+    log_module_element(dso);
+    if (dso->phdr) {
+        for (unsigned int i = 0; i < dso->phnum; ++i) {
+            if (dso->phdr[i].p_type == PT_LOAD) {
+                log_mmap_element(dso, &dso->phdr[i]);
+            }
+        }
+    }
+    // TODO(mcgrathr): Remove this when everything uses markup.
+    _dl_log_write(dso->build_id_log.iov_base, dso->build_id_log.iov_len);
+}
+
 __NO_SAFESTACK void _dl_log_unlogged(void) {
     // The first thread to successfully swap in 0 and get an old value
     // for unlogged_tail is responsible for logging all the unlogged
@@ -668,10 +840,12 @@ __NO_SAFESTACK void _dl_log_unlogged(void) {
                                                     memory_order_relaxed));
     for (struct dso* p = head; true; p = dso_next(p)) {
         if (!atomic_flag_test_and_set_explicit(
-                &p->logged, memory_order_relaxed))
-            log_write(p->build_id_log.iov_base, p->build_id_log.iov_len);
-        if ((struct dso*)last_unlogged == p)
+                &p->logged, memory_order_relaxed)) {
+            log_dso(p);
+        }
+        if ((struct dso*)last_unlogged == p) {
             break;
+        }
     }
 }
 
@@ -751,6 +925,15 @@ __NO_SAFESTACK NO_ASAN static zx_status_t map_library(zx_handle_t vmo,
                 first_note = ph;
             last_note = ph;
             break;
+        case PT_GNU_STACK:
+            if (ph->p_flags & PF_X) {
+                error("%s requires executable stack"
+                      " (built with -z execstack?),"
+                      " which Fuchsia will never support",
+                      dso->soname == NULL ? dso->l_map.l_name : dso->soname);
+                goto noexec;
+            }
+            break;
         }
     }
     if (!dyn)
@@ -764,12 +947,12 @@ __NO_SAFESTACK NO_ASAN static zx_status_t map_library(zx_handle_t vmo,
     // the new VMAR's handle until relocation has finished, because
     // we need it to adjust page protections for RELRO.
     uintptr_t vmar_base;
-    status = _zx_vmar_allocate(__zircon_vmar_root_self, 0, map_len,
-                               ZX_VM_FLAG_CAN_MAP_READ |
-                                   ZX_VM_FLAG_CAN_MAP_WRITE |
-                                   ZX_VM_FLAG_CAN_MAP_EXECUTE |
-                                   ZX_VM_FLAG_CAN_MAP_SPECIFIC,
-                               &dso->vmar, &vmar_base);
+    status = _zx_vmar_allocate(__zircon_vmar_root_self,
+                               ZX_VM_CAN_MAP_READ |
+                                   ZX_VM_CAN_MAP_WRITE |
+                                   ZX_VM_CAN_MAP_EXECUTE |
+                                   ZX_VM_CAN_MAP_SPECIFIC,
+                                0, map_len, &dso->vmar, &vmar_base);
     if (status != ZX_OK) {
         error("failed to reserve %zu bytes of address space: %d\n",
               map_len, status);
@@ -801,10 +984,10 @@ __NO_SAFESTACK NO_ASAN static zx_status_t map_library(zx_handle_t vmo,
         this_min = ph->p_vaddr & -PAGE_SIZE;
         this_max = (ph->p_vaddr + ph->p_memsz + PAGE_SIZE - 1) & -PAGE_SIZE;
         size_t off_start = ph->p_offset & -PAGE_SIZE;
-        uint32_t zx_flags = ZX_VM_FLAG_SPECIFIC;
-        zx_flags |= (ph->p_flags & PF_R) ? ZX_VM_FLAG_PERM_READ : 0;
-        zx_flags |= (ph->p_flags & PF_W) ? ZX_VM_FLAG_PERM_WRITE : 0;
-        zx_flags |= (ph->p_flags & PF_X) ? ZX_VM_FLAG_PERM_EXECUTE : 0;
+        zx_vm_option_t zx_options = ZX_VM_SPECIFIC;
+        zx_options |= (ph->p_flags & PF_R) ? ZX_VM_PERM_READ : 0;
+        zx_options |= (ph->p_flags & PF_W) ? ZX_VM_PERM_WRITE : 0;
+        zx_options |= (ph->p_flags & PF_X) ? ZX_VM_PERM_EXECUTE : 0;
         uintptr_t mapaddr = (uintptr_t)base + this_min;
         zx_handle_t map_vmo = vmo;
         size_t map_size = this_max - this_min;
@@ -855,8 +1038,8 @@ __NO_SAFESTACK NO_ASAN static zx_status_t map_library(zx_handle_t vmo,
             goto noexec;
         }
 
-        status = _zx_vmar_map(dso->vmar, mapaddr - vmar_base, map_vmo,
-                              off_start, map_size, zx_flags, &mapaddr);
+        status = _zx_vmar_map(dso->vmar, zx_options, mapaddr - vmar_base, map_vmo,
+                              off_start, map_size, &mapaddr);
         if (map_vmo != vmo)
             _zx_handle_close(map_vmo);
         if (status != ZX_OK)
@@ -896,8 +1079,8 @@ error:
 }
 
 __NO_SAFESTACK NO_ASAN static void decode_dyn(struct dso* p) {
-    size_t dyn[DYN_CNT];
-    decode_vec(p->l_map.l_ld, dyn, DYN_CNT);
+    size_t dyn[DT_NUM];
+    decode_vec(p->l_map.l_ld, dyn, DT_NUM);
     p->syms = laddr(p, dyn[DT_SYMTAB]);
     p->strings = laddr(p, dyn[DT_STRTAB]);
     if (dyn[0] & (1 << DT_SONAME))
@@ -1091,10 +1274,8 @@ __NO_SAFESTACK static void do_tls_layout(struct dso* p,
     p->tls_id = ++tls_cnt;
     tls_align = MAXP2(tls_align, p->tls.align);
 #ifdef TLS_ABOVE_TP
-    p->tls.offset =
-        tls_offset +
-        ((tls_align - 1) & -(tls_offset + (uintptr_t)p->tls.image));
-    tls_offset += p->tls.size;
+    p->tls.offset = (tls_offset + p->tls.align - 1) & -p->tls.align;
+    tls_offset = p->tls.offset + p->tls.size;
 #else
     tls_offset += p->tls.size + p->tls.align - 1;
     tls_offset -= (tls_offset + (uintptr_t)p->tls.image) & (p->tls.align - 1);
@@ -1162,10 +1343,10 @@ __NO_SAFESTACK static zx_status_t load_library_vmo(zx_handle_t vmo,
         } else {
             if (vmo_name[0] == '\0') {
                 snprintf(synthetic_name, sizeof(synthetic_name),
-                         "<VMO:%" PRIu64 ">", info.koid);
+                         "<VMO#%" PRIu64 ">", info.koid);
             } else {
                 snprintf(synthetic_name, sizeof(synthetic_name),
-                         "<VMO:%" PRIu64 ":%s>", info.koid, vmo_name);
+                         "<VMO#%" PRIu64 "=%s>", info.koid, vmo_name);
             }
             name = synthetic_name;
         }
@@ -1206,6 +1387,7 @@ __NO_SAFESTACK static zx_status_t load_library_vmo(zx_handle_t vmo,
     p->l_map.l_name = (void*)&p->buf[ndeps];
     memcpy(p->l_map.l_name, name, namelen);
     p->l_map.l_name[namelen] = '\0';
+    assign_module_id(p);
     format_build_id_log(p, p->l_map.l_name + namelen + 1, p->l_map.l_name, namelen);
     if (runtime)
         do_tls_layout(p, p->l_map.l_name + namelen + 1 + build_id_log_len, n_th);
@@ -1262,28 +1444,17 @@ __NO_SAFESTACK static void load_deps(struct dso* p) {
     }
 }
 
-__NO_SAFESTACK static void load_preload(char* s) {
-    int tmp;
-    char* z;
-    for (z = s; *z; s = z) {
-        for (; *s && (isspace(*s) || *s == ':'); s++)
-            ;
-        for (z = s; *z && !isspace(*z) && *z != ':'; z++)
-            ;
-        tmp = *z;
-        *z = 0;
-        struct dso *p;
-        load_library(s, 0, NULL, &p);
-        *z = tmp;
-    }
-}
-
 __NO_SAFESTACK NO_ASAN static void reloc_all(struct dso* p) {
-    size_t dyn[DYN_CNT];
+    size_t dyn[DT_NUM];
     for (; p; p = dso_next(p)) {
         if (p->relocated)
             continue;
-        decode_vec(p->l_map.l_ld, dyn, DYN_CNT);
+        decode_vec(p->l_map.l_ld, dyn, DT_NUM);
+        // _dl_start did apply_relr already.
+        if (p != &ldso) {
+            apply_relr(p->l_map.l_addr,
+                       laddr(p, dyn[DT_RELR]), dyn[DT_RELRSZ]);
+        }
         do_relocs(p, laddr(p, dyn[DT_JMPREL]), dyn[DT_PLTRELSZ], 2 + (dyn[DT_PLTREL] == DT_RELA));
         do_relocs(p, laddr(p, dyn[DT_REL]), dyn[DT_RELSZ], 2);
         do_relocs(p, laddr(p, dyn[DT_RELA]), dyn[DT_RELASZ], 3);
@@ -1291,9 +1462,9 @@ __NO_SAFESTACK NO_ASAN static void reloc_all(struct dso* p) {
         if (head != &ldso && p->relro_start != p->relro_end) {
             zx_status_t status =
                 _zx_vmar_protect(p->vmar,
+                                 ZX_VM_PERM_READ,
                                  saddr(p, p->relro_start),
-                                 p->relro_end - p->relro_start,
-                                 ZX_VM_FLAG_PERM_READ);
+                                 p->relro_end - p->relro_start);
             if (status == ZX_ERR_BAD_HANDLE &&
                 p == &ldso && p->vmar == ZX_HANDLE_INVALID) {
                 debugmsg("No VMAR_LOADED handle received;"
@@ -1350,15 +1521,16 @@ __NO_SAFESTACK NO_ASAN static void kernel_mapped_dso(struct dso* p) {
     max_addr = (max_addr + PAGE_SIZE - 1) & -PAGE_SIZE;
     p->map = laddr(p, min_addr);
     p->map_len = max_addr - min_addr;
+    assign_module_id(p);
 }
 
 void __libc_exit_fini(void) {
     struct dso* p;
-    size_t dyn[DYN_CNT];
+    size_t dyn[DT_NUM];
     for (p = fini_head; p; p = p->fini_next) {
         if (!p->constructed)
             continue;
-        decode_vec(p->l_map.l_ld, dyn, DYN_CNT);
+        decode_vec(p->l_map.l_ld, dyn, DT_NUM);
         if (dyn[0] & (1 << DT_FINI_ARRAY)) {
             size_t n = dyn[DT_FINI_ARRAYSZ] / sizeof(size_t);
             size_t* fn = (size_t*)laddr(p, dyn[DT_FINI_ARRAY]) + n;
@@ -1373,7 +1545,7 @@ void __libc_exit_fini(void) {
 }
 
 static void do_init_fini(struct dso* p) {
-    size_t dyn[DYN_CNT];
+    size_t dyn[DT_NUM];
     /* Allow recursive calls that arise when a library calls
      * dlopen from one of its constructors, but block any
      * other threads until all ctors have finished. */
@@ -1382,7 +1554,7 @@ static void do_init_fini(struct dso* p) {
         if (p->constructed)
             continue;
         p->constructed = 1;
-        decode_vec(p->l_map.l_ld, dyn, DYN_CNT);
+        decode_vec(p->l_map.l_ld, dyn, DT_NUM);
         if (dyn[0] & ((1 << DT_FINI) | (1 << DT_FINI_ARRAY))) {
             p->fini_next = fini_head;
             fini_head = p;
@@ -1402,6 +1574,23 @@ static void do_init_fini(struct dso* p) {
 }
 
 void __libc_start_init(void) {
+    // If a preinit hook spawns a thread that calls dlopen, that thread will
+    // get to do_init_fini and block on the lock.  Now the main thread finishes
+    // preinit hooks and releases the lock.  Then it's a race for which thread
+    // gets the lock and actually runs all the normal constructors.  This is
+    // expected, but to avoid such races preinit hooks should be very careful
+    // about what they do and rely on.
+    pthread_mutex_lock(&init_fini_lock);
+    size_t dyn[DT_NUM];
+    decode_vec(head->l_map.l_ld, dyn, DT_NUM);
+    if (dyn[0] & (1ul << DT_PREINIT_ARRAY)) {
+        size_t n = dyn[DT_PREINIT_ARRAYSZ] / sizeof(size_t);
+        size_t* fn = laddr(head, dyn[DT_PREINIT_ARRAY]);
+        while (n--)
+            ((void (*)(void)) * fn++)();
+    }
+    pthread_mutex_unlock(&init_fini_lock);
+
     do_init_fini(tail);
 }
 
@@ -1455,7 +1644,7 @@ __NO_SAFESTACK struct pthread* __init_main_thread(zx_handle_t thread_self) {
     if (_zx_object_get_property(thread_self, ZX_PROP_NAME, thread_self_name,
                                 sizeof(thread_self_name)) != ZX_OK)
         strcpy(thread_self_name, "(initial-thread)");
-    pthread_t td = __allocate_thread(&attr, thread_self_name, NULL);
+    thrd_t td = __allocate_thread(attr._a_guardsize, attr._a_stacksize, thread_self_name, NULL);
     if (td == NULL) {
         debugmsg("No memory for %zu bytes thread-local storage.\n",
                  libc.tls_size);
@@ -1538,8 +1727,8 @@ dl_start_return_t __dls2(
      * can be reused in stage 3. There should be very few. If
      * something goes wrong and there are a huge number, abort
      * instead of risking stack overflow. */
-    size_t dyn[DYN_CNT];
-    decode_vec(ldso.l_map.l_ld, dyn, DYN_CNT);
+    size_t dyn[DT_NUM];
+    decode_vec(ldso.l_map.l_ld, dyn, DT_NUM);
     size_t* rel = laddr(&ldso, dyn[DT_REL]);
     size_t rel_size = dyn[DT_RELSZ];
     size_t symbolic_rel_cnt = 0;
@@ -1595,7 +1784,6 @@ __NO_SAFESTACK static void* dls3(zx_handle_t exec_vmo, int argc, char** argv) {
 
     libc.page_size = PAGE_SIZE;
 
-    char* ld_preload = getenv("LD_PRELOAD");
     const char* ld_debug = getenv("LD_DEBUG");
     if (ld_debug != NULL && ld_debug[0] != '\0')
         log_libs = true;
@@ -1622,9 +1810,8 @@ __NO_SAFESTACK static void* dls3(zx_handle_t exec_vmo, int argc, char** argv) {
         libc.tls_head = tls_tail = &app.tls;
         app.tls_id = tls_cnt = 1;
 #ifdef TLS_ABOVE_TP
-        app.tls.offset = 0;
-        tls_offset =
-            app.tls.size + (-((uintptr_t)app.tls.image + app.tls.size) & (app.tls.align - 1));
+        app.tls.offset = (tls_offset + app.tls.align - 1) & -app.tls.align;
+        tls_offset = app.tls.offset + app.tls.size;
 #else
         tls_offset = app.tls.offset =
             app.tls.size + (-((uintptr_t)app.tls.image + app.tls.size) & (app.tls.align - 1));
@@ -1654,8 +1841,6 @@ __NO_SAFESTACK static void* dls3(zx_handle_t exec_vmo, int argc, char** argv) {
     // some libraries (sanitizer runtime) before that, so we don't do
     // each library's TLS setup directly in load_library_vmo.
 
-    if (ld_preload)
-        load_preload(ld_preload);
     load_deps(&app);
 
     app.global = 1;
@@ -1699,6 +1884,18 @@ __NO_SAFESTACK static void* dls3(zx_handle_t exec_vmo, int argc, char** argv) {
     debug.r_ldbase = ldso.l_map.l_addr;
     debug.r_state = 0;
 
+    // The ZX_PROP_PROCESS_DEBUG_ADDR being set to 1 on startup is a signal
+    // to issue a debug breakpoint after setting the property to signal to a
+    // debugger that the property is now valid.
+    intptr_t existing_debug_addr = 0;
+    status = _zx_object_get_property(__zircon_process_self,
+                                    ZX_PROP_PROCESS_DEBUG_ADDR,
+                                    &existing_debug_addr,
+                                    sizeof(existing_debug_addr));
+    bool break_after_set =
+        (status == ZX_OK) &&
+        (existing_debug_addr == ZX_PROCESS_DEBUG_ADDR_BREAK_ON_SET);
+
     status = _zx_object_set_property(__zircon_process_self,
                                      ZX_PROP_PROCESS_DEBUG_ADDR,
                                      &_dl_debug_addr, sizeof(_dl_debug_addr));
@@ -1708,6 +1905,9 @@ __NO_SAFESTACK static void* dls3(zx_handle_t exec_vmo, int argc, char** argv) {
         // TODO(dje): Is there a way to detect we're here because of being
         // an injected process (launchpad_start_injected)? IWBN to print a
         // warning here but launchpad_start_injected can trigger this.
+    }
+    if (break_after_set) {
+        debug_break();
     }
 
     _dl_debug_state();
@@ -1770,7 +1970,7 @@ __NO_SAFESTACK NO_ASAN static dl_start_return_t __dls3(void* start_arg) {
     zx_handle_t exec_vmo = ZX_HANDLE_INVALID;
     for (int i = 0; i < nhandles; ++i) {
         switch (PA_HND_TYPE(handle_info[i])) {
-        case PA_SVC_LOADER:
+        case PA_LDSVC_LOADER:
             if (loader_svc != ZX_HANDLE_INVALID ||
                 handles[i] == ZX_HANDLE_INVALID) {
                 error("bootstrap message bad LOADER_SVC %#x vs %#x",
@@ -1812,6 +2012,12 @@ __NO_SAFESTACK NO_ASAN static dl_start_return_t __dls3(void* start_arg) {
             _zx_handle_close(handles[i]);
             break;
         }
+    }
+
+    // TODO(mcgrathr): For now, always use a kernel log channel.
+    // This needs to be replaced by a proper unprivileged logging scheme ASAP.
+    if (logger == ZX_HANDLE_INVALID) {
+        _zx_debuglog_create(ZX_HANDLE_INVALID, 0, &logger);
     }
 
     if (__zircon_process_self == ZX_HANDLE_INVALID)
@@ -1872,9 +2078,13 @@ __NO_SAFESTACK NO_ASAN static void early_init(void) {
 }
 
 static void set_global(struct dso* p, int global) {
-    if (p->global > 0)
+    if (p->global > 0) {
         // Short-circuit if it's already fully global.  Its deps will be too.
         return;
+    } else if (p->global == global) {
+        // This catches circular references as well as other redundant walks.
+        return;
+    }
     p->global = global;
     if (p->deps != NULL) {
         for (struct dso **dep = p->deps; *dep != NULL; ++dep) {
@@ -2162,10 +2372,6 @@ __attribute__((__visibility__("hidden"))) void __dl_vseterr(const char*, va_list
 
 #define LOADER_SVC_MSG_MAX 1024
 
-// This detects recursion via the error function.
-static bool loader_svc_rpc_in_progress;
-static atomic_uint_fast32_t loader_svc_txid;
-
 __NO_SAFESTACK static zx_status_t loader_svc_rpc(uint32_t ordinal,
                                                  const void* data, size_t len,
                                                  zx_handle_t request_handle,
@@ -2174,8 +2380,6 @@ __NO_SAFESTACK static zx_status_t loader_svc_rpc(uint32_t ordinal,
     // the stack size too much.  Calls to this function are always
     // serialized anyway, so there is no danger of collision.
     ldmsg_req_t req;
-
-    loader_svc_rpc_in_progress = true;
 
     memset(&req.header, 0, sizeof(req.header));
     req.header.ordinal = ordinal;
@@ -2186,10 +2390,9 @@ __NO_SAFESTACK static zx_status_t loader_svc_rpc(uint32_t ordinal,
         _zx_handle_close(request_handle);
         error("message of %zu bytes too large for loader service protocol",
               len);
-        goto out;
+        return status;
     }
 
-    req.header.txid = atomic_fetch_add(&loader_svc_txid, 1);
     if (result != NULL) {
       // Don't return an uninitialized value if the channel call
       // succeeds but doesn't provide any handles.
@@ -2212,20 +2415,12 @@ __NO_SAFESTACK static zx_status_t loader_svc_rpc(uint32_t ordinal,
 
     uint32_t reply_size;
     uint32_t handle_count;
-    zx_status_t read_status = ZX_OK;
     status = _zx_channel_call(loader_svc, 0, ZX_TIME_INFINITE,
-                              &call, &reply_size, &handle_count,
-                              &read_status);
+                              &call, &reply_size, &handle_count);
     if (status != ZX_OK) {
-        error("_zx_channel_call of %u bytes to loader service: "
-              "%d (%s), read %d (%s)",
-              call.wr_num_bytes, status, _zx_status_get_string(status),
-              read_status, _zx_status_get_string(read_status));
-        if (status != ZX_ERR_CALL_FAILED)
-            _zx_handle_close(request_handle);
-        else if (read_status != ZX_OK)
-            status = read_status;
-        goto out;
+        error("_zx_channel_call of %u bytes to loader service: %d (%s)",
+              call.wr_num_bytes, status, _zx_status_get_string(status));
+        return status;
     }
 
     size_t expected_reply_size = ldmsg_rsp_get_size(&rsp);
@@ -2252,15 +2447,13 @@ __NO_SAFESTACK static zx_status_t loader_svc_rpc(uint32_t ordinal,
         }
         status = rsp.rv;
     }
-    goto out;
+    return status;
 
 err:
     if (handle_count > 0) {
         _zx_handle_close(*result);
         *result = ZX_HANDLE_INVALID;
     }
-out:
-    loader_svc_rpc_in_progress = false;
     return status;
 }
 
@@ -2297,7 +2490,6 @@ __NO_SAFESTACK zx_status_t dl_clone_loader_service(zx_handle_t* out) {
         ldmsg_clone_t clone;
     } req = {
         .header = {
-            .txid = atomic_fetch_add(&loader_svc_txid, 1),
             .ordinal = LDMSG_OP_CLONE,
         },
         .clone = {
@@ -2320,14 +2512,9 @@ __NO_SAFESTACK zx_status_t dl_clone_loader_service(zx_handle_t* out) {
     };
     uint32_t reply_size;
     uint32_t handle_count;
-    zx_status_t read_status = ZX_OK;
     if ((status = _zx_channel_call(loader_svc, 0, ZX_TIME_INFINITE,
-                                   &call, &reply_size, &handle_count,
-                                   &read_status)) != ZX_OK) {
-        if (status != ZX_ERR_CALL_FAILED)
-            _zx_handle_close(h1);
-        else if (read_status != ZX_OK)
-            status = read_status;
+                                   &call, &reply_size, &handle_count)) != ZX_OK) {
+        // Do nothing.
     } else if ((reply_size != ldmsg_rsp_get_size(&rsp)) ||
                (rsp.header.ordinal != LDMSG_OP_CLONE)) {
         status = ZX_ERR_INVALID_ARGS;
@@ -2343,33 +2530,42 @@ __NO_SAFESTACK zx_status_t dl_clone_loader_service(zx_handle_t* out) {
     return status;
 }
 
-__NO_SAFESTACK static void log_write(const void* buf, size_t len) {
-    // The loader service prints "header: %s\n" when we send %s,
-    // so strip a trailing newline.
-    if (((const char*)buf)[len - 1] == '\n')
-        --len;
-
-    zx_status_t status;
-    if (logger != ZX_HANDLE_INVALID)
-        status = _zx_log_write(logger, len, buf, 0);
-    else if (!loader_svc_rpc_in_progress && loader_svc != ZX_HANDLE_INVALID)
-        status = loader_svc_rpc(LDMSG_OP_DEBUG_PRINT, buf, len,
-                                ZX_HANDLE_INVALID, NULL);
-    else {
-        int n = _zx_debug_write(buf, len);
-        status = n < 0 ? n : ZX_OK;
+__NO_SAFESTACK __attribute__((__visibility__("hidden"))) void _dl_log_write(
+    const char* buffer, size_t len) {
+    if (logger != ZX_HANDLE_INVALID) {
+        const size_t kLogWriteMax =
+            (ZX_LOG_RECORD_MAX - offsetof(zx_log_record_t, data));
+        while (len > 0) {
+            size_t chunk = len < kLogWriteMax ? len : kLogWriteMax;
+            // Write only a single line at a time so each line gets tagged.
+            const char* nl = memchr(buffer, '\n', chunk);
+            if (nl != NULL) {
+                chunk = nl + 1 - buffer;
+            }
+            zx_status_t status = _zx_debuglog_write(logger, 0, buffer, chunk);
+            if (status != ZX_OK) {
+                __builtin_trap();
+            }
+            buffer += chunk;
+            len -= chunk;
+        }
+    } else {
+        zx_status_t status = _zx_debug_write(buffer, len);
+        if (status != ZX_OK) {
+            __builtin_trap();
+        }
     }
-    if (status != ZX_OK)
-        __builtin_trap();
 }
 
 __NO_SAFESTACK static size_t errormsg_write(FILE* f, const unsigned char* buf,
                                             size_t len) {
-    if (f != NULL && f->wpos > f->wbase)
-        log_write(f->wbase, f->wpos - f->wbase);
+    if (f != NULL && f->wpos > f->wbase) {
+        _dl_log_write((const char*)f->wbase, f->wpos - f->wbase);
+    }
 
-    if (len > 0)
-        log_write(buf, len);
+    if (len > 0) {
+        _dl_log_write((const char*)buf, len);
+    }
 
     if (f != NULL) {
         f->wend = f->buf + f->buf_size;

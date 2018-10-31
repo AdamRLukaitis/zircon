@@ -15,6 +15,7 @@
 #include <debug.h>
 #include <inttypes.h>
 
+#include <kernel/interrupt.h>
 #include <kernel/thread.h>
 
 #include <platform.h>
@@ -24,6 +25,7 @@
 #include <vm/vm.h>
 
 #include <lib/counters.h>
+#include <lib/crashlog.h>
 
 #include <zircon/syscalls/exception.h>
 #include <zircon/types.h>
@@ -38,7 +40,7 @@ static void dump_iframe(const struct arm64_iframe_long* iframe) {
     printf("x4  %#18" PRIx64 " x5  %#18" PRIx64 " x6  %#18" PRIx64 " x7  %#18" PRIx64 "\n", iframe->r[4], iframe->r[5], iframe->r[6], iframe->r[7]);
     printf("x8  %#18" PRIx64 " x9  %#18" PRIx64 " x10 %#18" PRIx64 " x11 %#18" PRIx64 "\n", iframe->r[8], iframe->r[9], iframe->r[10], iframe->r[11]);
     printf("x12 %#18" PRIx64 " x13 %#18" PRIx64 " x14 %#18" PRIx64 " x15 %#18" PRIx64 "\n", iframe->r[12], iframe->r[13], iframe->r[14], iframe->r[15]);
-    printf("x16 %#18" PRIx64 " x17 %#18" PRIx64 " x18 %#18" PRIx64 " x19 %#18" PRIx64 "\n", iframe->r[18], iframe->r[17], iframe->r[18], iframe->r[19]);
+    printf("x16 %#18" PRIx64 " x17 %#18" PRIx64 " x18 %#18" PRIx64 " x19 %#18" PRIx64 "\n", iframe->r[16], iframe->r[17], iframe->r[18], iframe->r[19]);
     printf("x20 %#18" PRIx64 " x21 %#18" PRIx64 " x22 %#18" PRIx64 " x23 %#18" PRIx64 "\n", iframe->r[20], iframe->r[21], iframe->r[22], iframe->r[23]);
     printf("x24 %#18" PRIx64 " x25 %#18" PRIx64 " x26 %#18" PRIx64 " x27 %#18" PRIx64 "\n", iframe->r[24], iframe->r[25], iframe->r[26], iframe->r[27]);
     printf("x28 %#18" PRIx64 " x29 %#18" PRIx64 " lr  %#18" PRIx64 " usp %#18" PRIx64 "\n", iframe->r[28], iframe->r[29], iframe->lr, iframe->usp);
@@ -88,6 +90,7 @@ __NO_RETURN static void exception_die(struct arm64_iframe_long* iframe, uint32_t
     /* fatal exception, die here */
     printf("ESR 0x%x: ec 0x%x, il 0x%x, iss 0x%x\n", esr, ec, il, iss);
     dump_iframe(iframe);
+    crashlog.iframe = iframe;
 
     platform_halt(HALT_ACTION_HALT, HALT_REASON_SW_PANIC);
 }
@@ -154,7 +157,8 @@ static void arm64_instruction_abort_handler(struct arm64_iframe_long* iframe, ui
             iframe->elr, is_user, far, esr, iss);
 
     arch_enable_ints();
-    kcounter_add(exceptions_page, 1u);
+    kcounter_add(exceptions_page, 1);
+    CPU_STATS_INC(page_faults);
     zx_status_t err = vmm_page_fault_handler(far, pf_flags);
     arch_disable_ints();
     if (err >= 0)
@@ -163,7 +167,7 @@ static void arm64_instruction_abort_handler(struct arm64_iframe_long* iframe, ui
     // If this is from user space, let the user exception handler
     // get a shot at it.
     if (is_user) {
-        kcounter_add(exceptions_user, 1u);
+        kcounter_add(exceptions_user, 1);
         if (try_dispatch_user_data_fault_exception(ZX_EXCP_FATAL_PAGE_FAULT, iframe, esr, far) == ZX_OK)
             return;
     }
@@ -199,7 +203,7 @@ static void arm64_data_abort_handler(struct arm64_iframe_long* iframe, uint exce
     uint32_t dfsc = BITS(iss, 5, 0);
     if (likely(dfsc != DFSC_ALIGNMENT_FAULT)) {
         arch_enable_ints();
-        kcounter_add(exceptions_page, 1u);
+        kcounter_add(exceptions_page, 1);
         zx_status_t err = vmm_page_fault_handler(far, pf_flags);
         arch_disable_ints();
         if (err >= 0) {
@@ -218,7 +222,7 @@ static void arm64_data_abort_handler(struct arm64_iframe_long* iframe, uint exce
     // If this is from user space, let the user exception handler
     // get a shot at it.
     if (is_user) {
-        kcounter_add(exceptions_user, 1u);
+        kcounter_add(exceptions_user, 1);
         zx_excp_type_t excp_type = ZX_EXCP_FATAL_PAGE_FAULT;
         if (unlikely(dfsc == DFSC_ALIGNMENT_FAULT)) {
             excp_type = ZX_EXCP_UNALIGNED_ACCESS;
@@ -257,16 +261,16 @@ extern "C" void arm64_sync_exception(
 
     switch (ec) {
     case 0b000000: /* unknown reason */
-        kcounter_add(exceptions_unknown, 1u);
+        kcounter_add(exceptions_unknown, 1);
         arm64_unknown_handler(iframe, exception_flags, esr);
         break;
     case 0b111000: /* BRK from arm32 */
     case 0b111100: /* BRK from arm64 */
-        kcounter_add(exceptions_brkpt, 1u);
+        kcounter_add(exceptions_brkpt, 1);
         arm64_brk_handler(iframe, exception_flags, esr);
         break;
     case 0b000111: /* floating point */
-        kcounter_add(exceptions_fpu, 1u);
+        kcounter_add(exceptions_fpu, 1);
         arm64_fpu_handler(iframe, exception_flags, esr);
         break;
     case 0b010001: /* syscall from arm32 */
@@ -294,7 +298,7 @@ extern "C" void arm64_sync_exception(
             exception_die(iframe, esr);
         }
         /* let the user exception handler get a shot at it */
-        kcounter_add(exceptions_unhandled, 1u);
+        kcounter_add(exceptions_unhandled, 1);
         if (try_dispatch_user_exception(ZX_EXCP_GENERAL, iframe, esr) == ZX_OK)
             break;
         printf("unhandled synchronous exception\n");
@@ -325,34 +329,26 @@ extern "C" uint32_t arm64_irq(struct arm64_iframe_short* iframe, uint exception_
 
     LTRACEF("iframe %p, flags 0x%x\n", iframe, exception_flags);
 
-    arch_set_in_int_handler(true);
-    thread_preempt_disable();
+    int_handler_saved_state_t state;
+    int_handler_start(&state);
 
-    kcounter_add(exceptions_irq, 1u);
+    kcounter_add(exceptions_irq, 1);
     platform_irq(iframe);
 
-    bool preempt_pending = false;
-    /* This logic is similar to thread_preempt_reenable() except that we
-     * call thread_preempt() below instead of thread_reschedule(). */
-    thread_t* current_thread = get_current_thread();
-    DEBUG_ASSERT(current_thread->preempt_disable > 0);
-    if (--current_thread->preempt_disable == 0) {
-        preempt_pending = current_thread->preempt_pending;
-    }
-    arch_set_in_int_handler(false);
+    bool do_preempt = int_handler_finish(&state);
 
     /* if we came from user space, check to see if we have any signals to handle */
     if (unlikely(exception_flags & ARM64_EXCEPTION_FLAG_LOWER_EL)) {
         uint32_t exit_flags = 0;
         if (thread_is_signaled(get_current_thread()))
             exit_flags |= ARM64_IRQ_EXIT_THREAD_SIGNALED;
-        if (preempt_pending)
+        if (do_preempt)
             exit_flags |= ARM64_IRQ_EXIT_RESCHEDULE;
         return exit_flags;
     }
 
     /* preempt the thread if the interrupt has signaled it */
-    if (preempt_pending)
+    if (do_preempt)
         thread_preempt();
 
     /* if we're returning to kernel space, make sure we restore the correct x18 */

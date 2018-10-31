@@ -8,16 +8,8 @@
 
 namespace zx {
 
-zx_status_t log::create(log* result, uint32_t flags) {
-    zx_status_t status;
-    zx_handle_t h;
-    if ((status = zx_log_create(flags, &h)) < 0) {
-        result->reset(ZX_HANDLE_INVALID);
-        return status;
-    } else {
-        result->reset(h);
-        return ZX_OK;
-    }
+zx_status_t log::create(uint32_t flags, log* result) {
+    return zx_debuglog_create(ZX_HANDLE_INVALID, flags, result->reset_and_get_address());
 }
 
 } // namespace zx

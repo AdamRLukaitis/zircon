@@ -42,7 +42,7 @@ If the buffer is insufficiently large, *avail* will be larger than *actual*.
 
 *buffer* type: **n/a**
 
-Returns **ZX_OK** if *handle* is valid, a negative status otherwise. No
+Returns **ZX_OK** if *handle* is valid, or **ZX_ERR_BAD_HANDLE** otherwise. No
 records are returned and *buffer* may be NULL.
 
 ### ZX_INFO_HANDLE_BASIC
@@ -65,8 +65,11 @@ typedef struct zx_info_handle_basic {
     // The object type: channel, event, socket, etc.
     uint32_t type;                // zx_obj_type_t;
 
-    // The koid of the logical counterpart or parent object of the
-    // object referenced by the handle. Otherwise this value is zero.
+    // If the object referenced by the handle is related to another (such
+    // as the other end of a channel, or the parent of a job) then
+    // |related_koid| is the koid of that object, otherwise it is zero.
+    // This relationship is immutable: an object's |related_koid| does
+    // not change even if the related object no longer exists.
     zx_koid_t related_koid;
 
     // Set to ZX_OBJ_PROP_WAITABLE if the object referenced by the
@@ -87,12 +90,11 @@ typedef struct zx_info_handle_count {
     uint32_t handle_count;
 } zx_info_handle_count_t;
 ```
-
-The *handle_count* is only meaningful if the number is equal to the number
-of handles to the object controlled by the caller process. For example,
-if the caller has one handle and the *handle_count* is equal to 2 it
-means that another process has a reference to this object which can be
-duplicated at any time.
+The *handle_count* should only be used as a debugging aid. Do not use it
+to check that an untrusted processes cannot modify a kernel object. Due to
+asynchronous nature of the system scheduler, there might be a time window
+during which it is possible for an object to be modified by a previous handle
+owner even as the last handle is transferred from one process to another.
 
 ### ZX_INFO_PROCESS_HANDLE_STATS
 
@@ -117,7 +119,7 @@ typedef struct zx_info_process_handle_stats {
 typedef struct zx_info_process {
     // The process's return code; only valid if |exited| is true.
     // Guaranteed to be non-zero if the process was killed by |zx_task_kill|.
-    int return_code;
+    int64_t return_code;
 
     // True if the process has ever left the initial creation state,
     // even if it has exited as well.
@@ -158,11 +160,10 @@ typedef struct zx_info_thread {
     // One of ZX_THREAD_STATE_* values.
     uint32_t state;
 
-    // If nonzero, the thread has gotten an exception and is waiting for
-    // the exception to be handled by the specified port.
+    // If |state| is ZX_THREAD_STATE_BLOCKED_EXCEPTION, the thread has gotten
+    // an exception and is waiting for the exception to be handled by the
+    // specified port.
     // The value is one of ZX_EXCEPTION_PORT_TYPE_*.
-    // Note: If the thread is waiting for an exception response then |state|
-    // will have the value ZX_THREAD_STATE_BLOCKED.
     uint32_t wait_exception_port_type;
 } zx_info_thread_t;
 ```
@@ -176,12 +177,27 @@ The **ZX_THREAD_STATE_\*** values are defined by
 #include <zircon/syscalls/object.h>
 ```
 
-*   *ZX_THREAD_STATE_NEW*
-*   *ZX_THREAD_STATE_RUNNING*
-*   *ZX_THREAD_STATE_SUSPENDED*
-*   *ZX_THREAD_STATE_BLOCKED*
-*   *ZX_THREAD_STATE_DYING*
-*   *ZX_THREAD_STATE_DEAD*
+*   *ZX_THREAD_STATE_NEW*: The thread has been created but it has not started running yet.
+*   *ZX_THREAD_STATE_RUNNING*: The thread is running user code normally.
+*   *ZX_THREAD_STATE_SUSPENDED*: Stopped due to [zx_task_suspend](task_suspend.md).
+*   *ZX_THREAD_STATE_BLOCKED*: In a syscall or handling an exception.
+    This value is never returned by itself.
+	See **ZX_THREAD_STATE_BLOCKED_\*** below.
+*   *ZX_THREAD_STATE_DYING*: The thread is in the process of being terminated,
+    but it has not been stopped yet.
+*   *ZX_THREAD_STATE_DEAD*: The thread has stopped running.
+
+When a thread is stopped inside a blocking syscall, or stopped in an
+exception, the value returned in **state** is one of the following:
+
+*   *ZX_THREAD_STATE_BLOCKED_EXCEPTION*: The thread is stopped in an exception.
+*   *ZX_THREAD_STATE_BLOCKED_SLEEPING*: The thread is stopped in [zx_nanosleep](nanosleep.md).
+*   *ZX_THREAD_STATE_BLOCKED_FUTEX*: The thread is stopped in [zx_futex_wait](futex_wait.md).
+*   *ZX_THREAD_STATE_BLOCKED_PORT*: The thread is stopped in [zx_port_wait](port_wait.md).
+*   *ZX_THREAD_STATE_BLOCKED_CHANNEL*: The thread is stopped in [zx_channel_call](channel_call.md).
+*   *ZX_THREAD_STATE_BLOCKED_WAIT_ONE*: The thread is stopped in [zx_object_wait_one](object_wait_one.md).
+*   *ZX_THREAD_STATE_BLOCKED_WAIT_MANY*: The thread is stopped in [zx_object_wait_many](object_wait_many.md).
+*   *ZX_THREAD_STATE_BLOCKED_INTERRUPT*: The thread is stopped in [zx_interrupt_wait](interrupt_wait.md).
 
 The **ZX_EXCEPTION_PORT_TYPE_\*** values are defined by
 
@@ -193,7 +209,8 @@ The **ZX_EXCEPTION_PORT_TYPE_\*** values are defined by
 *   *ZX_EXCEPTION_PORT_TYPE_DEBUGGER*
 *   *ZX_EXCEPTION_PORT_TYPE_THREAD*
 *   *ZX_EXCEPTION_PORT_TYPE_PROCESS*
-*   *ZX_EXCEPTION_PORT_TYPE_SYSTEM*
+*   *ZX_EXCEPTION_PORT_TYPE_JOB*
+*   *ZX_EXCEPTION_PORT_TYPE_JOB_DEBUGGER*
 
 ### ZX_INFO_THREAD_EXCEPTION_REPORT
 
@@ -263,7 +280,6 @@ typedef struct zx_info_cpu_stats {
 } zx_info_cpu_stats_t;
 ```
 
-
 ### ZX_INFO_VMAR
 
 *handle* type: **VM Address Region**
@@ -278,6 +294,92 @@ typedef struct zx_info_vmar {
     // Length of the region, in bytes.
     size_t len;
 } zx_info_vmar_t;
+```
+
+This returns a single *zx_info_vmar_t* that describes the range of address
+space that the VMAR occupies.
+
+### ZX_INFO_VMO
+
+*handle* type: **VM Object**
+
+*buffer* type: **zx_info_vmo_t[1]**
+
+```
+typedef struct zx_info_vmo {
+    // The koid of this VMO.
+    zx_koid_t koid;
+
+    // The name of this VMO.
+    char name[ZX_MAX_NAME_LEN];
+
+    // The size of this VMO.
+    uint64_t size_bytes;
+
+    // If this VMO is a clone, the koid of its parent. Otherwise, zero.
+    zx_koid_t parent_koid;
+
+    // The number of clones of this VMO, if any.
+    size_t num_children;
+
+    // The number of times this VMO is currently mapped into VMARs.
+    size_t num_mappings;
+
+    // An estimate of the number of unique address spaces that
+    // this VMO is mapped into.
+    size_t share_count;
+
+    // Bitwise OR of ZX_INFO_VMO_* values.
+    uint32_t flags;
+
+    // If |ZX_INFO_VMO_TYPE(flags) == ZX_INFO_VMO_TYPE_PAGED|, the amount of
+    // memory currently allocated to this VMO.
+    uint64_t committed_bytes;
+
+    // If |flags & ZX_INFO_VMO_VIA_HANDLE|, the handle rights.
+    // Undefined otherwise.
+    zx_rights_t handle_rights;
+
+    // VMO creation options. This is a bitmask of
+    // kResizable    = (1u << 0);
+    // kContiguous   = (1u << 1);
+    uint32_t create_options;
+
+    // VMO mapping cache policy. One of ZX_CACHE_POLICY_*
+    uint32_t cache_policy;
+} zx_info_vmo_t;
+```
+
+This returns a single *zx_info_vmo_t* that describes various attributes of
+the VMO.
+
+### ZX_INFO_SOCKET
+
+*handle* type: **Socket**
+
+*buffer* type: **zx_info_socket_t[1]**
+
+```
+typedef struct zx_info_socket {
+    // The options passed to zx_socket_create().
+    uint32_t options;
+
+    // The value of ZX_PROP_SOCKET_RX_BUF_MAX.
+    size_t rx_buf_max;
+
+    // The value of ZX_PROP_SOCKET_RX_BUF_SIZE.
+    size_t rx_buf_size;
+
+    // The value of ZX_PROP_SOCKET_TX_BUF_MAX.
+    //
+    // Will be zero if the peer endpoint is closed.
+    size_t tx_buf_max;
+
+    // The value of ZX_PROP_SOCKET_TX_BUF_SIZE.
+    //
+    // Will be zero if the peer endpoint is closed.
+    size_t tx_buf_size;
+} zx_info_socket_t;
 ```
 
 ### ZX_INFO_JOB_CHILDREN
@@ -336,7 +438,7 @@ typedef struct zx_info_task_stats {
 
 Additional errors:
 
-*   **ZX_ERR_BAD_STATE**: If the target process is not currently running.
+*   **ZX_ERR_BAD_STATE**: If the target process has terminated
 
 ### ZX_INFO_PROCESS_MAPS
 
@@ -345,7 +447,8 @@ Additional errors:
 *buffer* type: **zx_info_maps_t[n]**
 
 The *zx_info_maps_t* array is a depth-first pre-order walk of the target
-process's Aspace/VMAR/Mapping tree.
+process's Aspace/VMAR/Mapping tree. As per the pre-order traversal base
+addresses will be in ascending order.
 
 ```
 typedef struct zx_info_maps {
@@ -387,8 +490,8 @@ Additional errors:
     examine yourself: *buffer* will live inside the Aspace being examined, and
     the kernel can't safely fault in pages of the buffer while walking the
     Aspace.
-*   **ZX_ERR_BAD_STATE**: If the target process is not currently running, or if
-    its address space has been destroyed.
+*   **ZX_ERR_BAD_STATE**: If the target process has terminated, or if its
+    address space has been destroyed
 
 ### ZX_INFO_PROCESS_VMOS
 
@@ -525,6 +628,9 @@ The resource kind is one of
 *   *ZX_RSRC_KIND_MMIO*
 *   *ZX_RSRC_KIND_IOPORT*
 *   *ZX_RSRC_KIND_IRQ*
+*   *ZX_RSRC_KIND_HYPERVISOR*
+*   *ZX_RSRC_KIND_VMEX*
+*   *ZX_RSRC_KIND_SMC*
 
 ### ZX_INFO_BTI
 
@@ -534,7 +640,7 @@ The resource kind is one of
 
 ```
 typedef struct zx_info_bti {
-    // zx_bti_pin will always be able to return addreses that are contiguous for at
+    // zx_bti_pin will always be able to return addresses that are contiguous for at
     // least this many bytes.  E.g. if this returns 1MB, then a call to
     // zx_bti_pin() with a size of 2MB will return at most two physically-contiguous runs.
     // If the size were 2.5MB, it will return at most three physically-contiguous runs.
@@ -544,6 +650,10 @@ typedef struct zx_info_bti {
     uint64_t aspace_size;
 } zx_info_bti_t;
 ```
+
+## RIGHTS
+
+TODO(ZX-2399)
 
 ## RETURN VALUE
 
@@ -561,7 +671,9 @@ operation.
 
 **ZX_ERR_INVALID_ARGS** *buffer*, *actual*, or *avail* are invalid pointers.
 
-**ZX_ERR_NO_MEMORY** Temporary out of memory failure.
+**ZX_ERR_NO_MEMORY**  Failure due to lack of memory.
+There is no good way for userspace to handle this (unlikely) error.
+In a future build this error will no longer occur.
 
 **ZX_ERR_BUFFER_TOO_SMALL** The *topic* returns a fixed number of records, but the
 provided buffer is not large enough for these records.

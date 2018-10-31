@@ -8,6 +8,7 @@
 #include <fbl/auto_lock.h>
 #include <fbl/mutex.h>
 #include <fbl/vector.h>
+#include <lib/fzl/mapped-vmo.h>
 #include <lib/zx/vmo.h>
 #endif
 
@@ -18,7 +19,6 @@
 #include <fbl/ref_ptr.h>
 #include <fbl/unique_ptr.h>
 #include <fs/block-txn.h>
-#include <fs/mapped-vmo.h>
 #include <fs/vfs.h>
 
 #include "minfs-private.h"
@@ -30,7 +30,7 @@ namespace minfs {
 
 void WriteTxn::Enqueue(zx_handle_t vmo, uint64_t vmo_offset, uint64_t dev_offset,
                        uint64_t nblocks) {
-    validate_vmo_size(vmo, static_cast<blk_t>(vmo_offset));
+    ValidateVmoSize(vmo, static_cast<blk_t>(vmo_offset));
     for (size_t i = 0; i < requests_.size(); i++) {
         if (requests_[i].vmo != vmo) {
             continue;
@@ -49,7 +49,7 @@ void WriteTxn::Enqueue(zx_handle_t vmo, uint64_t vmo_offset, uint64_t dev_offset
         }
     }
 
-    write_request_t request;
+    WriteRequest request;
     request.vmo = vmo;
     // NOTE: It's easier to compare everything when dealing
     // with blocks (not offsets!) so the following are described in
@@ -67,18 +67,21 @@ zx_status_t WriteTxn::Flush(zx_handle_t vmo, vmoid_t vmoid) {
     // Update all the outgoing transactions to be in "disk blocks",
     // not "Minfs blocks".
     block_fifo_request_t blk_reqs[requests_.size()];
-    const uint32_t kDiskBlocksPerMinfsBlock = kMinfsBlockSize / bc_->BlockSize();
+    const uint32_t kDiskBlocksPerMinfsBlock = kMinfsBlockSize / bc_->DeviceBlockSize();
     for (size_t i = 0; i < requests_.size(); i++) {
-        blk_reqs[i].txnid = bc_->TxnId();
+        blk_reqs[i].group = bc_->BlockGroupID();
         blk_reqs[i].vmoid = vmoid;
         blk_reqs[i].opcode = BLOCKIO_WRITE;
         blk_reqs[i].vmo_offset = requests_[i].vmo_offset * kDiskBlocksPerMinfsBlock;
         blk_reqs[i].dev_offset = requests_[i].dev_offset * kDiskBlocksPerMinfsBlock;
-        blk_reqs[i].length = requests_[i].length * kDiskBlocksPerMinfsBlock;
+        // TODO(ZX-2253): Remove this assertion.
+        uint64_t length = requests_[i].length * kDiskBlocksPerMinfsBlock;
+        ZX_ASSERT_MSG(length < UINT32_MAX, "Too many blocks");
+        blk_reqs[i].length = static_cast<uint32_t>(length);
     }
 
     // Actually send the operations to the underlying block device.
-    zx_status_t status = bc_->Txn(blk_reqs, requests_.size());
+    zx_status_t status = bc_->Transaction(blk_reqs, requests_.size());
 
     requests_.reset();
     return status;
@@ -94,15 +97,15 @@ size_t WriteTxn::BlkCount() const {
 
 #endif  // __Fuchsia__
 
-WritebackWork::WritebackWork(Bcache* bc) :
+WritebackWork::WritebackWork(Bcache* bc) : WriteTxn(bc),
 #ifdef __Fuchsia__
     closure_(nullptr),
 #endif
-    txn_(bc), node_count_(0) {}
+    node_count_(0) {}
 
 void WritebackWork::Reset() {
 #ifdef __Fuchsia__
-    ZX_DEBUG_ASSERT(txn_.Requests().size() == 0);
+    ZX_DEBUG_ASSERT(Requests().size() == 0);
     closure_ = nullptr;
 #endif
     while (0 < node_count_) {
@@ -114,8 +117,8 @@ void WritebackWork::Reset() {
 // Returns the number of blocks of the writeback buffer that have been
 // consumed
 size_t WritebackWork::Complete(zx_handle_t vmo, vmoid_t vmoid) {
-    size_t blk_count = txn_.BlkCount();
-    zx_status_t status = txn_.Flush(vmo, vmoid);
+    size_t blk_count = BlkCount();
+    zx_status_t status = Flush(vmo, vmoid);
     if (closure_) {
         closure_(status);
     }
@@ -129,7 +132,7 @@ void WritebackWork::SetClosure(SyncCallback closure) {
 }
 #else
 void WritebackWork::Complete() {
-    txn_.Flush();
+    Transact();
     Reset();
 }
 #endif  // __Fuchsia__
@@ -149,7 +152,7 @@ void WritebackWork::PinVnode(fbl::RefPtr<VnodeMinfs> vn) {
 
 #ifdef __Fuchsia__
 
-zx_status_t WritebackBuffer::Create(Bcache* bc, fbl::unique_ptr<MappedVmo> buffer,
+zx_status_t WritebackBuffer::Create(Bcache* bc, fbl::unique_ptr<fzl::MappedVmo> buffer,
                                     fbl::unique_ptr<WritebackBuffer>* out) {
     fbl::unique_ptr<WritebackBuffer> wb(new WritebackBuffer(bc, fbl::move(buffer)));
     if (wb->buffer_->GetSize() % kMinfsBlockSize != 0) {
@@ -172,7 +175,7 @@ zx_status_t WritebackBuffer::Create(Bcache* bc, fbl::unique_ptr<MappedVmo> buffe
     return ZX_OK;
 }
 
-WritebackBuffer::WritebackBuffer(Bcache* bc, fbl::unique_ptr<MappedVmo> buffer) :
+WritebackBuffer::WritebackBuffer(Bcache* bc, fbl::unique_ptr<fzl::MappedVmo> buffer) :
     bc_(bc), unmounting_(false), buffer_(fbl::move(buffer)),
     cap_(buffer_->GetSize() / kMinfsBlockSize) {}
 
@@ -188,10 +191,10 @@ WritebackBuffer::~WritebackBuffer() {
 
     if (buffer_vmoid_ != VMOID_INVALID) {
         block_fifo_request_t request;
-        request.txnid = bc_->TxnId();
+        request.group = bc_->BlockGroupID();
         request.vmoid = buffer_vmoid_;
         request.opcode = BLOCKIO_CLOSE_VMO;
-        bc_->Txn(&request, 1);
+        bc_->Transaction(&request, 1);
     }
 }
 
@@ -241,7 +244,7 @@ void WritebackBuffer::CopyToBufferLocked(WriteTxn* txn) {
                       wb_len * kMinfsBlockSize)) == ZX_OK, "VMO Read Fail: %d", status);
         len_ += wb_len;
 
-        // Update the write_request to transfer from the writeback buffer
+        // Update the WriteRequest to transfer from the writeback buffer
         // out to disk, rather than the supplied VMO
         reqs[i].vmo_offset = wb_offset;
         reqs[i].length = wb_len;
@@ -258,11 +261,11 @@ void WritebackBuffer::CopyToBufferLocked(WriteTxn* txn) {
             len_ += wb_len;
 
             // Shift down all following write requests
-            static_assert(fbl::is_pod<write_request_t>::value, "Can't memmove non-POD");
+            static_assert(fbl::is_pod<WriteRequest>::value, "Can't memmove non-POD");
 
             // Insert the "new" request, which is the latter half of
             // the request we wrote out earlier
-            write_request_t request;
+            WriteRequest request;
             request.vmo = reqs[i].vmo;
             request.vmo_offset = 0;
             request.dev_offset = dev_offset;
@@ -280,7 +283,7 @@ void WritebackBuffer::Enqueue(fbl::unique_ptr<WritebackWork> work) {
 
     {
         TRACE_DURATION("minfs", "Allocating Writeback space");
-        size_t blocks = work->txn()->BlkCount();
+        size_t blocks = work->BlkCount();
         // TODO(smklein): Experimentally, all filesystem operations cause between
         // 0 and 10 blocks to be updated, though the writeback buffer has space
         // for thousands of blocks.
@@ -300,7 +303,7 @@ void WritebackBuffer::Enqueue(fbl::unique_ptr<WritebackWork> work) {
 
     {
         TRACE_DURATION("minfs", "Copying to Writeback buffer");
-        CopyToBufferLocked(work->txn());
+        CopyToBufferLocked(work.get());
     }
 
     work_queue_.push(fbl::move(work));
@@ -336,7 +339,6 @@ int WritebackBuffer::WritebackThread(void* arg) {
         // Before waiting, we should check if we're unmounting.
         if (b->unmounting_) {
             b->writeback_lock_.Release();
-            b->bc_->FreeTxnId();
             return 0;
         }
         cnd_wait(&b->consumer_cvar_, b->writeback_lock_.GetInternal());

@@ -18,7 +18,10 @@
 
 #include <debug.h>
 
+#include <kernel/interrupt.h>
 #include <kernel/thread.h>
+
+#include <lib/crashlog.h>
 
 #include <platform.h>
 #include <trace.h>
@@ -83,6 +86,7 @@ __NO_RETURN static void exception_die(x86_iframe_t* frame, const char* msg) {
     printf("vector %lu\n", (ulong)frame->vector);
     dprintf(CRITICAL, "%s", msg);
     dump_fault_frame(frame);
+    crashlog.iframe = frame;
 
     // try to dump the user stack
     if (is_user_address(frame->user_sp)) {
@@ -109,13 +113,13 @@ static zx_status_t call_dispatch_user_exception(uint kind,
 static bool try_dispatch_user_exception(x86_iframe_t* frame, uint kind) {
     if (is_from_user(frame)) {
         struct arch_exception_context context = {false, frame, 0};
-        get_current_thread()->preempt_disable--;
-        arch_set_in_int_handler(false);
+        thread_preempt_reenable_no_resched();
+        arch_set_blocking_disallowed(false);
         arch_enable_ints();
         zx_status_t erc = call_dispatch_user_exception(kind, &context, frame);
         arch_disable_ints();
-        arch_set_in_int_handler(true);
-        get_current_thread()->preempt_disable++;
+        arch_set_blocking_disallowed(true);
+        thread_preempt_disable();
         if (erc == ZX_OK)
             return true;
     }
@@ -124,6 +128,20 @@ static bool try_dispatch_user_exception(x86_iframe_t* frame, uint kind) {
 }
 
 static void x86_debug_handler(x86_iframe_t* frame) {
+    // We now need to keep track of the debug registers.
+    thread_t* thread = get_current_thread();
+
+    // Not all debug exceptions are due to debug registers, as single-step also gets routed to
+    // this exception. In that case, we only need to track the status register so that we don't
+    // leak debug registers from another thread.
+    if (likely(!thread->arch.track_debug_state)) {
+        // Only track the status section of the debug state.
+        x86_read_debug_status(&thread->arch.debug_state);
+    } else {
+        // We are tracking the debug state, we copy all the debug state.
+        x86_read_hw_debug_regs(&thread->arch.debug_state);
+    }
+
     if (try_dispatch_user_exception(frame, ZX_EXCP_HW_BREAKPOINT))
         return;
 
@@ -247,15 +265,15 @@ static zx_status_t x86_pfe_handler(x86_iframe_t* frame) {
     vaddr_t va = x86_get_cr2();
 
     /* reenable interrupts */
-    get_current_thread()->preempt_disable--;
-    arch_set_in_int_handler(false);
+    thread_preempt_reenable_no_resched();
+    arch_set_blocking_disallowed(false);
     arch_enable_ints();
 
     /* make sure we put interrupts back as we exit */
     auto ac = fbl::MakeAutoCall([]() {
         arch_disable_ints();
-        arch_set_in_int_handler(true);
-        get_current_thread()->preempt_disable++;
+        arch_set_blocking_disallowed(true);
+        thread_preempt_disable();
     });
 
     /* check for flags we're not prepared to handle */
@@ -300,7 +318,7 @@ static zx_status_t x86_pfe_handler(x86_iframe_t* frame) {
 
     /* let high level code deal with this */
     if (is_from_user(frame)) {
-        kcounter_add(exceptions_user, 1u);
+        kcounter_add(exceptions_user, 1);
         struct arch_exception_context context = {true, frame, va};
         return call_dispatch_user_exception(ZX_EXCP_FATAL_PAGE_FAULT,
                                             &context, frame);
@@ -322,25 +340,25 @@ static void x86_iframe_process_pending_signals(x86_iframe_t* frame) {
 static void handle_exception_types(x86_iframe_t* frame) {
     switch (frame->vector) {
     case X86_INT_DEBUG:
-        kcounter_add(exceptions_debug, 1u);
+        kcounter_add(exceptions_debug, 1);
         x86_debug_handler(frame);
         break;
     case X86_INT_NMI:
-        kcounter_add(exceptions_nmi, 1u);
+        kcounter_add(exceptions_nmi, 1);
         x86_nmi_handler(frame);
         break;
     case X86_INT_BREAKPOINT:
-        kcounter_add(exceptions_brkpt, 1u);
+        kcounter_add(exceptions_brkpt, 1);
         x86_breakpoint_handler(frame);
         break;
 
     case X86_INT_INVALID_OP:
-        kcounter_add(exceptions_invop, 1u);
+        kcounter_add(exceptions_invop, 1);
         x86_invop_handler(frame);
         break;
 
     case X86_INT_DEVICE_NA:
-        kcounter_add(exceptions_dev_na, 1u);
+        kcounter_add(exceptions_dev_na, 1);
         exception_die(frame, "device na fault\n");
         break;
 
@@ -348,20 +366,21 @@ static void handle_exception_types(x86_iframe_t* frame) {
         x86_df_handler(frame);
         break;
     case X86_INT_FPU_FP_ERROR:
-        kcounter_add(exceptions_fpu, 1u);
+        kcounter_add(exceptions_fpu, 1);
         x86_unhandled_exception(frame);
         break;
     case X86_INT_SIMD_FP_ERROR:
-        kcounter_add(exceptions_simd, 1u);
+        kcounter_add(exceptions_simd, 1);
         x86_unhandled_exception(frame);
         break;
     case X86_INT_GP_FAULT:
-        kcounter_add(exceptions_gpf, 1u);
+        kcounter_add(exceptions_gpf, 1);
         x86_gpf_handler(frame);
         break;
 
     case X86_INT_PAGE_FAULT:
-        kcounter_add(exceptions_page, 1u);
+        kcounter_add(exceptions_page, 1);
+        CPU_STATS_INC(page_faults);
         if (x86_pfe_handler(frame) != ZX_OK)
             x86_fatal_pfe_handler(frame, x86_get_cr2());
         break;
@@ -370,7 +389,7 @@ static void handle_exception_types(x86_iframe_t* frame) {
     case X86_INT_APIC_SPURIOUS:
         break;
     case X86_INT_APIC_ERROR: {
-        kcounter_add(exceptions_apic_err, 1u);
+        kcounter_add(exceptions_apic_err, 1);
         apic_error_interrupt_handler();
         apic_issue_eoi();
         break;
@@ -381,17 +400,22 @@ static void handle_exception_types(x86_iframe_t* frame) {
         break;
     }
     case X86_INT_IPI_GENERIC: {
-        x86_ipi_generic_handler();
+        mp_mbx_generic_irq(nullptr);
         apic_issue_eoi();
         break;
     }
     case X86_INT_IPI_RESCHEDULE: {
-        x86_ipi_reschedule_handler();
+        mp_mbx_reschedule_irq(nullptr);
+        apic_issue_eoi();
+        break;
+    }
+    case X86_INT_IPI_INTERRUPT: {
+        mp_mbx_interrupt_irq(nullptr);
         apic_issue_eoi();
         break;
     }
     case X86_INT_IPI_HALT: {
-        x86_ipi_halt_handler();
+        x86_ipi_halt_handler(nullptr);
         /* no return */
         break;
     }
@@ -401,8 +425,8 @@ static void handle_exception_types(x86_iframe_t* frame) {
         break;
     }
     /* pass all other non-Intel defined irq vectors to the platform */
-    case X86_INT_PLATFORM_BASE... X86_INT_PLATFORM_MAX: {
-        kcounter_add(exceptions_irq, 1u);
+    case X86_INT_PLATFORM_BASE ... X86_INT_PLATFORM_MAX: {
+        kcounter_add(exceptions_irq, 1);
         platform_irq(frame);
         break;
     }
@@ -419,7 +443,7 @@ static void handle_exception_types(x86_iframe_t* frame) {
     case X86_INT_STACK_FAULT:
     /* Misaligned memory access when AC=1 in flags */
     case X86_INT_ALIGNMENT_CHECK:
-        kcounter_add(exceptions_unhandled, 1u);
+        kcounter_add(exceptions_unhandled, 1);
         x86_unhandled_exception(frame);
         break;
 
@@ -432,12 +456,12 @@ static void handle_exception_types(x86_iframe_t* frame) {
 /* top level x86 exception handler for most exceptions and irqs */
 void x86_exception_handler(x86_iframe_t* frame) {
     // are we recursing?
-    if (unlikely(arch_in_int_handler()) && frame->vector != X86_INT_NMI) {
+    if (unlikely(arch_blocking_disallowed()) && frame->vector != X86_INT_NMI) {
         exception_die(frame, "recursion in interrupt handler\n");
     }
 
-    arch_set_in_int_handler(true);
-    thread_preempt_disable();
+    int_handler_saved_state_t state;
+    int_handler_start(&state);
 
     // did we come from user or kernel space?
     bool from_user = is_from_user(frame);
@@ -447,16 +471,7 @@ void x86_exception_handler(x86_iframe_t* frame) {
 
     handle_exception_types(frame);
 
-    /* at this point we're able to be rescheduled, so we're 'outside' of the int handler */
-    bool preempt_pending = false;
-    /* This logic is similar to thread_preempt_reenable() except that we
-     * call thread_preempt() below instead of thread_reschedule(). */
-    thread_t* current_thread = get_current_thread();
-    DEBUG_ASSERT(current_thread->preempt_disable > 0);
-    if (--current_thread->preempt_disable == 0) {
-        preempt_pending = current_thread->preempt_pending;
-    }
-    arch_set_in_int_handler(false);
+    bool do_preempt = int_handler_finish(&state);
 
     /* if we came from user space, check to see if we have any signals to handle */
     if (unlikely(from_user)) {
@@ -466,7 +481,7 @@ void x86_exception_handler(x86_iframe_t* frame) {
         x86_iframe_process_pending_signals(frame);
     }
 
-    if (preempt_pending)
+    if (do_preempt)
         thread_preempt();
 
     ktrace_tiny(TAG_IRQ_EXIT, ((uint)frame->vector << 8) | arch_curr_cpu_num());

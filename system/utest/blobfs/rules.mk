@@ -16,24 +16,35 @@ MODULE_SRCS := \
     $(LOCAL_DIR)/blobfs.cpp
 
 MODULE_STATIC_LIBS := \
-    system/ulib/fvm \
-    system/ulib/digest \
-    system/ulib/fs \
-    system/ulib/gpt \
-    system/ulib/zxcpp \
-    system/ulib/fbl \
+    system/ulib/async.cpp \
+    system/ulib/async \
+    system/ulib/async-loop.cpp \
+    system/ulib/async-loop \
     system/ulib/blobfs \
-    third_party/ulib/uboringssl \
+    system/ulib/digest \
+    system/ulib/fbl \
+    system/ulib/fvm \
+    system/ulib/fs \
+    system/ulib/fzl \
+    system/ulib/gpt \
     system/ulib/sync \
+    system/ulib/trace \
+    system/ulib/zx \
+    system/ulib/zxcpp \
+    third_party/ulib/lz4 \
+    third_party/ulib/uboringssl \
 
 MODULE_LIBS := \
-    system/ulib/fdio \
+    system/ulib/async.default \
     system/ulib/c \
+    system/ulib/fdio \
     system/ulib/fs-management \
-    system/ulib/zircon \
+    system/ulib/memfs \
+    system/ulib/trace-engine \
     system/ulib/unittest \
+    system/ulib/zircon \
 
-MODULE_COMPILEFLAGS := \
-    -Isystem/ulib/blobfs/include \
+MODULE_FIDL_LIBS := \
+    system/fidl/fuchsia-io \
 
 include make/module.mk

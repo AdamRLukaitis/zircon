@@ -9,6 +9,7 @@
 #include <fbl/alloc_checker.h>
 #include <fbl/array.h>
 #include <lib/unittest/unittest.h>
+#include <vm/physmap.h>
 #include <vm/vm.h>
 #include <vm/vm_address_region.h>
 #include <vm/vm_aspace.h>
@@ -23,16 +24,17 @@ static const uint kArchRwFlags = ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WR
 static bool pmm_smoke_test() {
     BEGIN_TEST;
     paddr_t pa;
+    vm_page_t* page;
 
-    vm_page_t* page = pmm_alloc_page(0, &pa);
-    EXPECT_NE(nullptr, page, "pmm_alloc single page");
-    EXPECT_NE(0u, pa, "pmm_alloc single page");
+    zx_status_t status = pmm_alloc_page(0, &page, &pa);
+    ASSERT_EQ(ZX_OK, status, "pmm_alloc single page");
+    ASSERT_NE(nullptr, page, "pmm_alloc single page");
+    ASSERT_NE(0u, pa, "pmm_alloc single page");
 
     vm_page_t* page2 = paddr_to_vm_page(pa);
-    EXPECT_EQ(page2, page, "paddr_to_vm_page on single page");
+    ASSERT_EQ(page2, page, "paddr_to_vm_page on single page");
 
-    auto ret = pmm_free_page(page);
-    EXPECT_EQ(1u, ret, "pmm_free_page on single page");
+    pmm_free_page(page);
     END_TEST;
 }
 
@@ -48,8 +50,7 @@ static bool pmm_large_alloc_test() {
     EXPECT_EQ(alloc_count, list_length(&list),
               "pmm_alloc_pages a bunch of pages list count");
 
-    auto ret = pmm_free(&list);
-    EXPECT_EQ(alloc_count, ret, "pmm_free_page on a list of pages");
+    pmm_free(&list);
     END_TEST;
 }
 
@@ -61,14 +62,25 @@ static bool pmm_oversized_alloc_test() {
     static const size_t alloc_count =
         (128 * 1024 * 1024 * 1024ULL) / PAGE_SIZE; // 128GB
 
-    auto count = pmm_alloc_pages(alloc_count, 0, &list);
-    EXPECT_NE(alloc_count, 0, "pmm_alloc_pages too many pages count > 0");
-    EXPECT_NE(alloc_count, count, "pmm_alloc_pages too many pages count");
-    EXPECT_EQ(count, list_length(&list),
-              "pmm_alloc_pages too many pages list count");
+    zx_status_t status = pmm_alloc_pages(alloc_count, 0, &list);
+    EXPECT_EQ(ZX_ERR_NO_MEMORY, status, "pmm_alloc_pages failed to alloc");
+    EXPECT_TRUE(list_is_empty(&list), "pmm_alloc_pages list is empty");
 
-    auto ret = pmm_free(&list);
-    EXPECT_EQ(count, ret, "pmm_free_page on a list of pages");
+    pmm_free(&list);
+    END_TEST;
+}
+
+// Allocates one page and frees it.
+static bool pmm_alloc_contiguous_one_test() {
+    BEGIN_TEST;
+    list_node list = LIST_INITIAL_VALUE(list);
+    paddr_t pa;
+    size_t count = 1U;
+    zx_status_t status = pmm_alloc_contiguous(count, 0, PAGE_SIZE_SHIFT, &pa, &list);
+    ASSERT_EQ(ZX_OK, status, "pmm_alloc_contiguous returned failure\n");
+    ASSERT_EQ(count, list_length(&list), "pmm_alloc_contiguous list size is wrong");
+    ASSERT_NE(nullptr, paddr_to_physmap(pa), "");
+    pmm_free(&list);
     END_TEST;
 }
 
@@ -139,12 +151,13 @@ static bool vmm_alloc_smoke_test() {
     auto kaspace = VmAspace::kernel_aspace();
     auto err = kaspace->Alloc(
         "test", alloc_size, &ptr, 0, 0, kArchRwFlags);
-    EXPECT_EQ(0, err, "VmAspace::Alloc region of memory");
-    EXPECT_NE(nullptr, ptr, "VmAspace::Alloc region of memory");
+    ASSERT_EQ(0, err, "VmAspace::Alloc region of memory");
+    ASSERT_NE(nullptr, ptr, "VmAspace::Alloc region of memory");
 
     // fill with known pattern and test
-    if (!fill_and_test(ptr, alloc_size))
+    if (!fill_and_test(ptr, alloc_size)) {
         all_ok = false;
+    }
 
     // free the region
     err = kaspace->FreeRegion(reinterpret_cast<vaddr_t>(ptr));
@@ -164,12 +177,13 @@ static bool vmm_alloc_contiguous_smoke_test() {
     auto err = kaspace->AllocContiguous("test",
                                         alloc_size, &ptr, 0,
                                         VmAspace::VMM_FLAG_COMMIT, kArchRwFlags);
-    EXPECT_EQ(0, err, "VmAspace::AllocContiguous region of memory");
-    EXPECT_NE(nullptr, ptr, "VmAspace::AllocContiguous region of memory");
+    ASSERT_EQ(0, err, "VmAspace::AllocContiguous region of memory");
+    ASSERT_NE(nullptr, ptr, "VmAspace::AllocContiguous region of memory");
 
     // fill with known pattern and test
-    if (!fill_and_test(ptr, alloc_size))
+    if (!fill_and_test(ptr, alloc_size)) {
         all_ok = false;
+    }
 
     // test that it is indeed contiguous
     unittest_printf("testing that region is contiguous\n");
@@ -197,37 +211,40 @@ static bool multiple_regions_test() {
     static const size_t alloc_size = 16 * 1024;
 
     fbl::RefPtr<VmAspace> aspace = VmAspace::Create(0, "test aspace");
-    EXPECT_NE(nullptr, aspace, "VmAspace::Create pointer");
+    ASSERT_NE(nullptr, aspace, "VmAspace::Create pointer");
 
     vmm_aspace_t* old_aspace = get_current_thread()->aspace;
     vmm_set_active_aspace(reinterpret_cast<vmm_aspace_t*>(aspace.get()));
 
     // allocate region 0
     zx_status_t err = aspace->Alloc("test0", alloc_size, &ptr, 0, 0, kArchRwFlags);
-    EXPECT_EQ(0, err, "VmAspace::Alloc region of memory");
-    EXPECT_NE(nullptr, ptr, "VmAspace::Alloc region of memory");
+    ASSERT_EQ(0, err, "VmAspace::Alloc region of memory");
+    ASSERT_NE(nullptr, ptr, "VmAspace::Alloc region of memory");
 
     // fill with known pattern and test
-    if (!fill_and_test(ptr, alloc_size))
+    if (!fill_and_test(ptr, alloc_size)) {
         all_ok = false;
+    }
 
     // allocate region 1
     err = aspace->Alloc("test1", 16384, &ptr, 0, 0, kArchRwFlags);
-    EXPECT_EQ(0, err, "VmAspace::Alloc region of memory");
-    EXPECT_NE(nullptr, ptr, "VmAspace::Alloc region of memory");
+    ASSERT_EQ(0, err, "VmAspace::Alloc region of memory");
+    ASSERT_NE(nullptr, ptr, "VmAspace::Alloc region of memory");
 
     // fill with known pattern and test
-    if (!fill_and_test(ptr, alloc_size))
+    if (!fill_and_test(ptr, alloc_size)) {
         all_ok = false;
+    }
 
     // allocate region 2
     err = aspace->Alloc("test2", 16384, &ptr, 0, 0, kArchRwFlags);
-    EXPECT_EQ(0, err, "VmAspace::Alloc region of memory");
-    EXPECT_NE(nullptr, ptr, "VmAspace::Alloc region of memory");
+    ASSERT_EQ(0, err, "VmAspace::Alloc region of memory");
+    ASSERT_NE(nullptr, ptr, "VmAspace::Alloc region of memory");
 
     // fill with known pattern and test
-    if (!fill_and_test(ptr, alloc_size))
+    if (!fill_and_test(ptr, alloc_size)) {
         all_ok = false;
+    }
 
     vmm_set_active_aspace(old_aspace);
 
@@ -243,7 +260,7 @@ static bool vmm_alloc_zero_size_fails() {
     void* ptr;
     zx_status_t err = VmAspace::kernel_aspace()->Alloc(
         "test", zero_size, &ptr, 0, 0, kArchRwFlags);
-    EXPECT_EQ(ZX_ERR_INVALID_ARGS, err, "");
+    ASSERT_EQ(ZX_ERR_INVALID_ARGS, err, "");
     END_TEST;
 }
 
@@ -254,7 +271,7 @@ static bool vmm_alloc_bad_specific_pointer_fails() {
     zx_status_t err = VmAspace::kernel_aspace()->Alloc(
         "test", 16384, &ptr, 0,
         VmAspace::VMM_FLAG_VALLOC_SPECIFIC | VmAspace::VMM_FLAG_COMMIT, kArchRwFlags);
-    EXPECT_EQ(ZX_ERR_INVALID_ARGS, err, "");
+    ASSERT_EQ(ZX_ERR_INVALID_ARGS, err, "");
     END_TEST;
 }
 
@@ -265,7 +282,7 @@ static bool vmm_alloc_contiguous_missing_flag_commit_fails() {
     void* ptr;
     zx_status_t err = VmAspace::kernel_aspace()->AllocContiguous(
         "test", 4096, &ptr, 0, zero_vmm_flags, kArchRwFlags);
-    EXPECT_EQ(ZX_ERR_INVALID_ARGS, err, "");
+    ASSERT_EQ(ZX_ERR_INVALID_ARGS, err, "");
     END_TEST;
 }
 
@@ -275,7 +292,7 @@ static bool vmm_alloc_contiguous_zero_size_fails() {
     void* ptr;
     zx_status_t err = VmAspace::kernel_aspace()->AllocContiguous(
         "test", zero_size, &ptr, 0, VmAspace::VMM_FLAG_COMMIT, kArchRwFlags);
-    EXPECT_EQ(ZX_ERR_INVALID_ARGS, err, "");
+    ASSERT_EQ(ZX_ERR_INVALID_ARGS, err, "");
     END_TEST;
 }
 
@@ -295,7 +312,7 @@ static bool vmaspace_alloc_smoke_test() {
 
     void* ptr;
     auto err = aspace->Alloc("test", PAGE_SIZE, &ptr, 0, 0, kArchRwFlags);
-    EXPECT_EQ(ZX_OK, err, "allocating region\n");
+    ASSERT_EQ(ZX_OK, err, "allocating region\n");
 
     // destroy the aspace, which should drop all the internal refs to it
     aspace->Destroy();
@@ -319,9 +336,11 @@ static bool dump_all_aspaces() {
 static bool vmo_create_test() {
     BEGIN_TEST;
     fbl::RefPtr<VmObject> vmo;
-    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, PAGE_SIZE, &vmo);
-    EXPECT_EQ(status, ZX_OK, "");
-    EXPECT_TRUE(vmo, "");
+    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, 0u, PAGE_SIZE, &vmo);
+    ASSERT_EQ(status, ZX_OK, "");
+    ASSERT_TRUE(vmo, "");
+    EXPECT_FALSE(vmo->is_contiguous(), "vmo is not contig\n");
+    EXPECT_FALSE(vmo->is_resizable(), "vmo is not resizable\n");
     END_TEST;
 }
 
@@ -330,13 +349,13 @@ static bool vmo_commit_test() {
     BEGIN_TEST;
     static const size_t alloc_size = PAGE_SIZE * 16;
     fbl::RefPtr<VmObject> vmo;
-    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, alloc_size, &vmo);
+    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, 0u, alloc_size, &vmo);
     ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
     ASSERT_TRUE(vmo, "vmobject creation\n");
 
     uint64_t committed;
     auto ret = vmo->CommitRange(0, alloc_size, &committed);
-    EXPECT_EQ(0, ret, "committing vm object\n");
+    ASSERT_EQ(0, ret, "committing vm object\n");
     EXPECT_EQ(ROUNDUP_PAGE_SIZE(alloc_size), committed,
               "committing vm object\n");
     END_TEST;
@@ -348,7 +367,8 @@ static bool vmo_pin_test() {
 
     static const size_t alloc_size = PAGE_SIZE * 16;
     fbl::RefPtr<VmObject> vmo;
-    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, alloc_size, &vmo);
+    zx_status_t status = VmObjectPaged::Create(
+        PMM_ALLOC_FLAG_ANY, VmObjectPaged::kResizable, alloc_size, &vmo);
     ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
     ASSERT_TRUE(vmo, "vmobject creation\n");
 
@@ -412,7 +432,7 @@ static bool vmo_multiple_pin_test() {
 
     static const size_t alloc_size = PAGE_SIZE * 16;
     fbl::RefPtr<VmObject> vmo;
-    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, alloc_size, &vmo);
+    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, 0u, alloc_size, &vmo);
     ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
     ASSERT_TRUE(vmo, "vmobject creation\n");
 
@@ -460,7 +480,7 @@ static bool vmo_odd_size_commit_test() {
     BEGIN_TEST;
     static const size_t alloc_size = 15;
     fbl::RefPtr<VmObject> vmo;
-    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, alloc_size, &vmo);
+    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, 0u, alloc_size, &vmo);
     ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
     ASSERT_TRUE(vmo, "vmobject creation\n");
 
@@ -472,20 +492,87 @@ static bool vmo_odd_size_commit_test() {
     END_TEST;
 }
 
-// Creates a vm object, commits contiguous memory.
-static bool vmo_contiguous_commit_test() {
+static bool vmo_create_physical_test() {
+    BEGIN_TEST;
+
+    paddr_t pa;
+    vm_page_t* vm_page;
+    zx_status_t status = pmm_alloc_page(0, &vm_page, &pa);
+    uint32_t cache_policy;
+
+    ASSERT_EQ(ZX_OK, status, "vm page allocation\n");
+    ASSERT_TRUE(vm_page, "");
+
+    fbl::RefPtr<VmObject> vmo;
+    status = VmObjectPhysical::Create(pa, PAGE_SIZE, &vmo);
+    ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
+    ASSERT_TRUE(vmo, "vmobject creation\n");
+    cache_policy = vmo->GetMappingCachePolicy();
+    EXPECT_EQ(ARCH_MMU_FLAG_UNCACHED, cache_policy, "check initial cache policy");
+    EXPECT_TRUE(vmo->is_contiguous(), "check contiguous");
+
+    pmm_free_page(vm_page);
+
+    END_TEST;
+}
+
+// Creates a vm object that commits contiguous memory.
+static bool vmo_create_contiguous_test() {
     BEGIN_TEST;
     static const size_t alloc_size = PAGE_SIZE * 16;
     fbl::RefPtr<VmObject> vmo;
-    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, alloc_size, &vmo);
+    zx_status_t status = VmObjectPaged::CreateContiguous(PMM_ALLOC_FLAG_ANY, alloc_size, 0, &vmo);
     ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
     ASSERT_TRUE(vmo, "vmobject creation\n");
 
-    uint64_t committed;
-    auto ret = vmo->CommitRangeContiguous(0, alloc_size, &committed, 0);
-    EXPECT_EQ(0, ret, "committing vm object contig\n");
-    EXPECT_EQ(ROUNDUP_PAGE_SIZE(alloc_size), committed,
-              "committing vm object contig\n");
+    EXPECT_TRUE(vmo->is_contiguous(), "vmo is contig\n");
+
+    paddr_t last_pa;
+    auto lookup_func = [](void* ctx, size_t offset, size_t index, paddr_t pa) {
+        paddr_t* last_pa = static_cast<paddr_t*>(ctx);
+        if (index != 0 && *last_pa + PAGE_SIZE != pa) {
+            return ZX_ERR_BAD_STATE;
+        }
+        *last_pa = pa;
+        return ZX_OK;
+    };
+    status = vmo->Lookup(0, alloc_size, 0, lookup_func, &last_pa);
+    EXPECT_EQ(status, ZX_OK, "vmo lookup\n");
+
+    END_TEST;
+}
+
+// Make sure decommitting is disallowed
+static bool vmo_contiguous_decommit_test() {
+    BEGIN_TEST;
+
+    static const size_t alloc_size = PAGE_SIZE * 16;
+    fbl::RefPtr<VmObject> vmo;
+    zx_status_t status = VmObjectPaged::CreateContiguous(PMM_ALLOC_FLAG_ANY, alloc_size, 0, &vmo);
+    ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
+    ASSERT_TRUE(vmo, "vmobject creation\n");
+
+    uint64_t n;
+    status = vmo->DecommitRange(PAGE_SIZE, 4 * PAGE_SIZE, &n);
+    ASSERT_EQ(status, ZX_ERR_NOT_SUPPORTED, "decommit fails due to pinned pages\n");
+    status = vmo->DecommitRange(0, 4 * PAGE_SIZE, &n);
+    ASSERT_EQ(status, ZX_ERR_NOT_SUPPORTED, "decommit fails due to pinned pages\n");
+    status = vmo->DecommitRange(alloc_size - PAGE_SIZE, PAGE_SIZE, &n);
+    ASSERT_EQ(status, ZX_ERR_NOT_SUPPORTED, "decommit fails due to pinned pages\n");
+
+    // Make sure all pages are still present and contiguous
+    paddr_t last_pa;
+    auto lookup_func = [](void* ctx, size_t offset, size_t index, paddr_t pa) {
+        paddr_t* last_pa = static_cast<paddr_t*>(ctx);
+        if (index != 0 && *last_pa + PAGE_SIZE != pa) {
+            return ZX_ERR_BAD_STATE;
+        }
+        *last_pa = pa;
+        return ZX_OK;
+    };
+    status = vmo->Lookup(0, alloc_size, 0, lookup_func, &last_pa);
+    ASSERT_EQ(status, ZX_OK, "vmo lookup\n");
+
     END_TEST;
 }
 
@@ -494,7 +581,7 @@ static bool vmo_precommitted_map_test() {
     BEGIN_TEST;
     static const size_t alloc_size = PAGE_SIZE * 16;
     fbl::RefPtr<VmObject> vmo;
-    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, alloc_size, &vmo);
+    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, 0, alloc_size, &vmo);
     ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
     ASSERT_TRUE(vmo, "vmobject creation\n");
 
@@ -502,11 +589,12 @@ static bool vmo_precommitted_map_test() {
     void* ptr;
     auto ret = ka->MapObjectInternal(vmo, "test", 0, alloc_size, &ptr,
                                      0, VmAspace::VMM_FLAG_COMMIT, kArchRwFlags);
-    EXPECT_EQ(ZX_OK, ret, "mapping object");
+    ASSERT_EQ(ZX_OK, ret, "mapping object");
 
     // fill with known pattern and test
-    if (!fill_and_test(ptr, alloc_size))
+    if (!fill_and_test(ptr, alloc_size)) {
         all_ok = false;
+    }
 
     auto err = ka->FreeRegion((vaddr_t)ptr);
     EXPECT_EQ(ZX_OK, err, "unmapping object");
@@ -518,7 +606,7 @@ static bool vmo_demand_paged_map_test() {
     BEGIN_TEST;
     static const size_t alloc_size = PAGE_SIZE * 16;
     fbl::RefPtr<VmObject> vmo;
-    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, alloc_size, &vmo);
+    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, 0u, alloc_size, &vmo);
     ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
     ASSERT_TRUE(vmo, "vmobject creation\n");
 
@@ -526,11 +614,12 @@ static bool vmo_demand_paged_map_test() {
     void* ptr;
     auto ret = ka->MapObjectInternal(vmo, "test", 0, alloc_size, &ptr,
                                      0, 0, kArchRwFlags);
-    EXPECT_EQ(ret, ZX_OK, "mapping object");
+    ASSERT_EQ(ret, ZX_OK, "mapping object");
 
     // fill with known pattern and test
-    if (!fill_and_test(ptr, alloc_size))
+    if (!fill_and_test(ptr, alloc_size)) {
         all_ok = false;
+    }
 
     auto err = ka->FreeRegion((vaddr_t)ptr);
     EXPECT_EQ(ZX_OK, err, "unmapping object");
@@ -542,7 +631,7 @@ static bool vmo_dropped_ref_test() {
     BEGIN_TEST;
     static const size_t alloc_size = PAGE_SIZE * 16;
     fbl::RefPtr<VmObject> vmo;
-    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, alloc_size, &vmo);
+    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, 0u, alloc_size, &vmo);
     ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
     ASSERT_TRUE(vmo, "vmobject creation\n");
 
@@ -550,13 +639,14 @@ static bool vmo_dropped_ref_test() {
     void* ptr;
     auto ret = ka->MapObjectInternal(fbl::move(vmo), "test", 0, alloc_size, &ptr,
                                      0, VmAspace::VMM_FLAG_COMMIT, kArchRwFlags);
-    EXPECT_EQ(ret, ZX_OK, "mapping object");
+    ASSERT_EQ(ret, ZX_OK, "mapping object");
 
     EXPECT_NULL(vmo, "dropped ref to object");
 
     // fill with known pattern and test
-    if (!fill_and_test(ptr, alloc_size))
+    if (!fill_and_test(ptr, alloc_size)) {
         all_ok = false;
+    }
 
     auto err = ka->FreeRegion((vaddr_t)ptr);
     EXPECT_EQ(ZX_OK, err, "unmapping object");
@@ -569,7 +659,7 @@ static bool vmo_remap_test() {
     BEGIN_TEST;
     static const size_t alloc_size = PAGE_SIZE * 16;
     fbl::RefPtr<VmObject> vmo;
-    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, alloc_size, &vmo);
+    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, 0u, alloc_size, &vmo);
     ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
     ASSERT_TRUE(vmo, "vmobject creation\n");
 
@@ -577,11 +667,12 @@ static bool vmo_remap_test() {
     void* ptr;
     auto ret = ka->MapObjectInternal(vmo, "test", 0, alloc_size, &ptr,
                                      0, VmAspace::VMM_FLAG_COMMIT, kArchRwFlags);
-    EXPECT_EQ(ZX_OK, ret, "mapping object");
+    ASSERT_EQ(ZX_OK, ret, "mapping object");
 
     // fill with known pattern and test
-    if (!fill_and_test(ptr, alloc_size))
+    if (!fill_and_test(ptr, alloc_size)) {
         all_ok = false;
+    }
 
     auto err = ka->FreeRegion((vaddr_t)ptr);
     EXPECT_EQ(ZX_OK, err, "unmapping object");
@@ -589,7 +680,7 @@ static bool vmo_remap_test() {
     // map it again
     ret = ka->MapObjectInternal(vmo, "test", 0, alloc_size, &ptr,
                                 0, VmAspace::VMM_FLAG_COMMIT, kArchRwFlags);
-    EXPECT_EQ(ret, ZX_OK, "mapping object");
+    ASSERT_EQ(ret, ZX_OK, "mapping object");
 
     // test that the pattern is still valid
     bool result = test_region((uintptr_t)ptr, ptr, alloc_size);
@@ -606,7 +697,7 @@ static bool vmo_double_remap_test() {
     BEGIN_TEST;
     static const size_t alloc_size = PAGE_SIZE * 16;
     fbl::RefPtr<VmObject> vmo;
-    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, alloc_size, &vmo);
+    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, 0u, alloc_size, &vmo);
     ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
     ASSERT_TRUE(vmo, "vmobject creation\n");
 
@@ -614,17 +705,18 @@ static bool vmo_double_remap_test() {
     void* ptr;
     auto ret = ka->MapObjectInternal(vmo, "test0", 0, alloc_size, &ptr,
                                      0, 0, kArchRwFlags);
-    EXPECT_EQ(ZX_OK, ret, "mapping object");
+    ASSERT_EQ(ZX_OK, ret, "mapping object");
 
     // fill with known pattern and test
-    if (!fill_and_test(ptr, alloc_size))
+    if (!fill_and_test(ptr, alloc_size)) {
         all_ok = false;
+    }
 
     // map it again
     void* ptr2;
     ret = ka->MapObjectInternal(vmo, "test1", 0, alloc_size, &ptr2,
                                 0, 0, kArchRwFlags);
-    EXPECT_EQ(ret, ZX_OK, "mapping object second time");
+    ASSERT_EQ(ret, ZX_OK, "mapping object second time");
     EXPECT_NE(ptr, ptr2, "second mapping is different");
 
     // test that the pattern is still valid
@@ -636,7 +728,7 @@ static bool vmo_double_remap_test() {
     static const size_t alloc_offset = PAGE_SIZE;
     ret = ka->MapObjectInternal(vmo, "test2", alloc_offset, alloc_size - alloc_offset,
                                 &ptr3, 0, 0, kArchRwFlags);
-    EXPECT_EQ(ret, ZX_OK, "mapping object third time");
+    ASSERT_EQ(ret, ZX_OK, "mapping object third time");
     EXPECT_NE(ptr3, ptr2, "third mapping is different");
     EXPECT_NE(ptr3, ptr, "third mapping is different");
 
@@ -662,14 +754,14 @@ static bool vmo_read_write_smoke_test() {
 
     // create object
     fbl::RefPtr<VmObject> vmo;
-    zx_status_t status = VmObjectPaged::Create(0, alloc_size, &vmo);
+    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, 0, alloc_size, &vmo);
     ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
     ASSERT_TRUE(vmo, "vmobject creation\n");
 
     // create test buffer
     fbl::AllocChecker ac;
     fbl::Array<uint8_t> a(new (&ac) uint8_t[alloc_size], alloc_size);
-    EXPECT_TRUE(ac.check(), "");
+    ASSERT_TRUE(ac.check(), "");
     fill_region(99, a.get(), alloc_size);
 
     // write to it, make sure it seems to work with valid args
@@ -699,7 +791,7 @@ static bool vmo_read_write_smoke_test() {
     uint8_t* ptr;
     err = ka->MapObjectInternal(vmo, "test", 0, alloc_size, (void**)&ptr,
                                 0, 0, kArchRwFlags);
-    EXPECT_EQ(ZX_OK, err, "mapping object");
+    ASSERT_EQ(ZX_OK, err, "mapping object");
 
     // write to it at odd offsets
     err = vmo->Write(a.get(), 31, 4197);
@@ -720,7 +812,7 @@ static bool vmo_read_write_smoke_test() {
 
     // test that we can read from it
     fbl::Array<uint8_t> b(new (&ac) uint8_t[alloc_size], alloc_size);
-    EXPECT_TRUE(ac.check(), "can't allocate buffer");
+    ASSERT_TRUE(ac.check(), "can't allocate buffer");
 
     err = vmo->Read(b.get(), 0, alloc_size);
     EXPECT_EQ(ZX_OK, err, "reading from object");
@@ -741,50 +833,51 @@ static bool vmo_cache_test() {
     BEGIN_TEST;
 
     paddr_t pa;
-    vm_page_t* vm_page = pmm_alloc_page(0, &pa);
+    vm_page_t* vm_page;
+    zx_status_t status = pmm_alloc_page(0, &vm_page, &pa);
     auto ka = VmAspace::kernel_aspace();
     uint32_t cache_policy = ARCH_MMU_FLAG_UNCACHED_DEVICE;
     uint32_t cache_policy_get;
     void* ptr;
 
-    EXPECT_TRUE(vm_page, "");
+    ASSERT_TRUE(vm_page, "");
     // Test that the flags set/get properly
     {
         fbl::RefPtr<VmObject> vmo;
-        zx_status_t status = VmObjectPhysical::Create(pa, PAGE_SIZE, &vmo);
-        EXPECT_EQ(status, ZX_OK, "vmobject creation\n");
-        EXPECT_TRUE(vmo, "vmobject creation\n");
-        EXPECT_EQ(ZX_OK, vmo->GetMappingCachePolicy(&cache_policy_get), "try get");
+        status = VmObjectPhysical::Create(pa, PAGE_SIZE, &vmo);
+        ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
+        ASSERT_TRUE(vmo, "vmobject creation\n");
+        cache_policy_get = vmo->GetMappingCachePolicy();
         EXPECT_NE(cache_policy, cache_policy_get, "check initial cache policy");
         EXPECT_EQ(ZX_OK, vmo->SetMappingCachePolicy(cache_policy), "try set");
-        EXPECT_EQ(ZX_OK, vmo->GetMappingCachePolicy(&cache_policy_get), "try get");
+        cache_policy_get = vmo->GetMappingCachePolicy();
         EXPECT_EQ(cache_policy, cache_policy_get, "compare flags");
     }
 
     // Test valid flags
     for (uint32_t i = 0; i <= ARCH_MMU_FLAG_CACHE_MASK; i++) {
         fbl::RefPtr<VmObject> vmo;
-        zx_status_t status = VmObjectPhysical::Create(pa, PAGE_SIZE, &vmo);
-        EXPECT_EQ(status, ZX_OK, "vmobject creation\n");
-        EXPECT_TRUE(vmo, "vmobject creation\n");
+        status = VmObjectPhysical::Create(pa, PAGE_SIZE, &vmo);
+        ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
+        ASSERT_TRUE(vmo, "vmobject creation\n");
         EXPECT_EQ(ZX_OK, vmo->SetMappingCachePolicy(cache_policy), "try setting valid flags");
     }
 
     // Test invalid flags
     for (uint32_t i = ARCH_MMU_FLAG_CACHE_MASK + 1; i < 32; i++) {
         fbl::RefPtr<VmObject> vmo;
-        zx_status_t status = VmObjectPhysical::Create(pa, PAGE_SIZE, &vmo);
-        EXPECT_EQ(status, ZX_OK, "vmobject creation\n");
-        EXPECT_TRUE(vmo, "vmobject creation\n");
+        status = VmObjectPhysical::Create(pa, PAGE_SIZE, &vmo);
+        ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
+        ASSERT_TRUE(vmo, "vmobject creation\n");
         EXPECT_EQ(ZX_ERR_INVALID_ARGS, vmo->SetMappingCachePolicy(i), "try set with invalid flags");
     }
 
     // Test valid flags with invalid flags
     {
         fbl::RefPtr<VmObject> vmo;
-        zx_status_t status = VmObjectPhysical::Create(pa, PAGE_SIZE, &vmo);
-        EXPECT_EQ(status, ZX_OK, "vmobject creation\n");
-        EXPECT_TRUE(vmo, "vmobject creation\n");
+        status = VmObjectPhysical::Create(pa, PAGE_SIZE, &vmo);
+        ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
+        ASSERT_TRUE(vmo, "vmobject creation\n");
         EXPECT_EQ(ZX_ERR_INVALID_ARGS, vmo->SetMappingCachePolicy(cache_policy | 0x5), "bad 0x5");
         EXPECT_EQ(ZX_ERR_INVALID_ARGS, vmo->SetMappingCachePolicy(cache_policy | 0xA), "bad 0xA");
         EXPECT_EQ(ZX_ERR_INVALID_ARGS, vmo->SetMappingCachePolicy(cache_policy | 0x55), "bad 0x55");
@@ -794,17 +887,17 @@ static bool vmo_cache_test() {
     // Test that changing policy while mapped is blocked
     {
         fbl::RefPtr<VmObject> vmo;
-        zx_status_t status = VmObjectPhysical::Create(pa, PAGE_SIZE, &vmo);
-        EXPECT_EQ(status, ZX_OK, "vmobject creation\n");
-        EXPECT_TRUE(vmo, "vmobject creation\n");
-        EXPECT_EQ(ZX_OK, ka->MapObjectInternal(vmo, "test", 0, PAGE_SIZE, (void**)&ptr, 0, 0,
+        status = VmObjectPhysical::Create(pa, PAGE_SIZE, &vmo);
+        ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
+        ASSERT_TRUE(vmo, "vmobject creation\n");
+        ASSERT_EQ(ZX_OK, ka->MapObjectInternal(vmo, "test", 0, PAGE_SIZE, (void**)&ptr, 0, 0,
                                                kArchRwFlags),
                   "map vmo");
         EXPECT_EQ(ZX_ERR_BAD_STATE, vmo->SetMappingCachePolicy(cache_policy),
                   "set flags while mapped");
         EXPECT_EQ(ZX_OK, ka->FreeRegion((vaddr_t)ptr), "unmap vmo");
         EXPECT_EQ(ZX_OK, vmo->SetMappingCachePolicy(cache_policy), "set flags after unmapping");
-        EXPECT_EQ(ZX_OK, ka->MapObjectInternal(vmo, "test", 0, PAGE_SIZE, (void**)&ptr, 0, 0,
+        ASSERT_EQ(ZX_OK, ka->MapObjectInternal(vmo, "test", 0, PAGE_SIZE, (void**)&ptr, 0, 0,
                                                kArchRwFlags),
                   "map vmo again");
         EXPECT_EQ(ZX_OK, ka->FreeRegion((vaddr_t)ptr), "unmap vmo");
@@ -819,7 +912,7 @@ static bool vmo_lookup_test() {
 
     static const size_t alloc_size = PAGE_SIZE * 16;
     fbl::RefPtr<VmObject> vmo;
-    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, alloc_size, &vmo);
+    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, 0u, alloc_size, &vmo);
     ASSERT_EQ(status, ZX_OK, "vmobject creation\n");
     ASSERT_TRUE(vmo, "vmobject creation\n");
 
@@ -883,28 +976,27 @@ static bool arch_noncontiguous_map() {
     // Get some phys pages to test on
     paddr_t phys[3];
     struct list_node phys_list = LIST_INITIAL_VALUE(phys_list);
-    size_t count = pmm_alloc_pages(fbl::count_of(phys), 0, &phys_list);
-    EXPECT_EQ(count, fbl::count_of(phys), "");
+    zx_status_t status = pmm_alloc_pages(fbl::count_of(phys), 0, &phys_list);
+    ASSERT_EQ(ZX_OK, status, "non contig map alloc");
     {
         size_t i = 0;
         vm_page_t* p;
-        list_for_every_entry(&phys_list, p, vm_page_t, free.node) {
-            phys[i] = vm_page_to_paddr(p);
+        list_for_every_entry (&phys_list, p, vm_page_t, queue_node) {
+            phys[i] = p->paddr();
             ++i;
         }
     }
 
-    zx_status_t status;
     {
         ArchVmAspace aspace;
         status = aspace.Init(USER_ASPACE_BASE, USER_ASPACE_SIZE, 0);
-        EXPECT_EQ(ZX_OK, status, "failed to init aspace\n");
+        ASSERT_EQ(ZX_OK, status, "failed to init aspace\n");
 
         // Attempt to map a set of vm_page_t
         size_t mapped;
         vaddr_t base = USER_ASPACE_BASE + 10 * PAGE_SIZE;
         status = aspace.Map(base, phys, fbl::count_of(phys), ARCH_MMU_FLAG_PERM_READ, &mapped);
-        EXPECT_EQ(ZX_OK, status, "failed first map\n");
+        ASSERT_EQ(ZX_OK, status, "failed first map\n");
         EXPECT_EQ(fbl::count_of(phys), mapped, "weird first map\n");
         for (size_t i = 0; i < fbl::count_of(phys); ++i) {
             paddr_t paddr;
@@ -954,6 +1046,7 @@ VM_UNITTEST(pmm_smoke_test)
 // runs the system out of memory, uncomment for debugging
 //VM_UNITTEST(pmm_large_alloc_test)
 //VM_UNITTEST(pmm_oversized_alloc_test)
+VM_UNITTEST(pmm_alloc_contiguous_one_test)
 VM_UNITTEST(vmm_alloc_smoke_test)
 VM_UNITTEST(vmm_alloc_contiguous_smoke_test)
 VM_UNITTEST(multiple_regions_test)
@@ -968,7 +1061,9 @@ VM_UNITTEST(vmo_pin_test)
 VM_UNITTEST(vmo_multiple_pin_test)
 VM_UNITTEST(vmo_commit_test)
 VM_UNITTEST(vmo_odd_size_commit_test)
-VM_UNITTEST(vmo_contiguous_commit_test)
+VM_UNITTEST(vmo_create_physical_test)
+VM_UNITTEST(vmo_create_contiguous_test)
+VM_UNITTEST(vmo_contiguous_decommit_test)
 VM_UNITTEST(vmo_precommitted_map_test)
 VM_UNITTEST(vmo_demand_paged_map_test)
 VM_UNITTEST(vmo_dropped_ref_test)

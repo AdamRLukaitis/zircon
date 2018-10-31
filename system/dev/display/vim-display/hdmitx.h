@@ -18,31 +18,30 @@
 #include "vpu.h"
 #include "dwc-hdmi.h"
 
+__BEGIN_CDECLS
+
 #define DISPLAY_MASK(start, count) (((1 << (count)) - 1) << (start))
 #define DISPLAY_SET_MASK(mask, start, count, value) \
                         ((mask & ~DISPLAY_MASK(start, count)) | \
                                 (((value) << (start)) & DISPLAY_MASK(start, count)))
 
-#define READ32_PRESET_REG(a)             readl(io_buffer_virt(&display->mmio_preset) + a)
-#define WRITE32_PRESET_REG(a, v)         writel(v, io_buffer_virt(&display->mmio_preset) + a)
+#define READ32_PRESET_REG(a)             display->mmio_preset->Read32(a)
+#define WRITE32_PRESET_REG(a, v)         display->mmio_preset->Write32(v, a)
 
-#define READ32_HDMITX_REG(a)             readl(io_buffer_virt(&display->mmio_hdmitx) + a)
-#define WRITE32_HDMITX_REG(a, v)         writel(v, io_buffer_virt(&display->mmio_hdmitx) + a)
+#define READ32_HDMITX_REG(a)             display->mmio_hdmitx->Read32(a)
+#define WRITE32_HDMITX_REG(a, v)         display->mmio_hdmitx->Write32(v, a)
 
-#define READ32_HHI_REG(a)                readl(io_buffer_virt(&display->mmio_hiu) + a)
-#define WRITE32_HHI_REG(a, v)            writel(v, io_buffer_virt(&display->mmio_hiu) + a)
+#define READ32_HHI_REG(a)                display->mmio_hiu->Read32(a)
+#define WRITE32_HHI_REG(a, v)            display->mmio_hiu->Write32(v, a)
 
-#define READ32_VPU_REG(a)                readl(io_buffer_virt(&display->mmio_vpu) + a)
-#define WRITE32_VPU_REG(a, v)            writel(v, io_buffer_virt(&display->mmio_vpu) + a)
+#define READ32_VPU_REG(a)                display->mmio_vpu->Read32(a)
+#define WRITE32_VPU_REG(a, v)            display->mmio_vpu->Write32(v, a)
 
-#define READ32_DMC_REG(a)                readl(io_buffer_virt(&display->mmio_dmc) + a)
-#define WRITE32_DMC_REG(a, v)            writel(v, io_buffer_virt(&display->mmio_dmc) + a)
+#define READ32_HDMITX_SEC_REG(a)         display->mmio_hdmitx_sec->Read32(a)
+#define WRITE32_HDMITX_SEC_REG(a, v)     display->mmio_hdmitx_sec->Write32(v, a)
 
-#define READ32_HDMITX_SEC_REG(a)         readl(io_buffer_virt(&display->mmio_hdmitx_sec) + a)
-#define WRITE32_HDMITX_SEC_REG(a, v)     writel(v, io_buffer_virt(&display->mmio_hdmitx_sec) + a)
-
-#define READ32_CBUS_REG(a)              readl(io_buffer_virt(&display->mmio_cbus) + 0x400 + a)
-#define WRITE32_CBUS_REG(a, v)          writel(v, io_buffer_virt(&display->mmio_cbus) + 0x400+ a)
+#define READ32_CBUS_REG(a)               display->mmio_cbus->Read32(0x400 + a)
+#define WRITE32_CBUS_REG(a, v)           display->mmio_cbus->Write32(v, 0x400 + a)
 
 #define SET_BIT32(x, dest, value, count, start) \
             WRITE32_##x##_REG(dest, (READ32_##x##_REG(dest) & ~DISPLAY_MASK(start, count)) | \
@@ -149,7 +148,7 @@ static const struct reg_val_pair ENC_LUT_GEN[] = {
 };
 
 struct cea_timing {
-    uint8_t             interlace_mode;
+    bool                interlace_mode;
     uint32_t            pfreq;
     uint8_t             ln;
     uint8_t             pixel_repeat;
@@ -162,7 +161,7 @@ struct cea_timing {
     uint32_t            hfront;
     uint32_t            hsync;
     uint32_t            hback;
-    uint8_t             hpol;
+    bool                hpol;
 
     uint32_t            vfreq;
     uint32_t            vactive;
@@ -172,7 +171,7 @@ struct cea_timing {
     uint32_t            vfront;
     uint32_t            vsync;
     uint32_t            vback;
-    uint8_t             vpol;
+    bool                vpol;
 };
 
 #define VID_PLL_DIV_1      0
@@ -231,6 +230,7 @@ struct hdmi_param {
 #define HDMI_COLOR_FORMAT_RGB   0
 #define HDMI_COLOR_FORMAT_444   1
 
+#define HDMI_ASPECT_RATIO_NONE  0
 #define HDMI_ASPECT_RATIO_4x3   1
 #define HDMI_ASPECT_RATIO_16x9  2
 
@@ -309,12 +309,16 @@ struct hdmi_param {
  #define VIC_VESA_800x600p_60Hz                 304
  #define VIC_VESA_1024x768p_60Hz                305
 
-void hdmitx_writereg(vim2_display_t* display, uint32_t addr, uint32_t data);
-uint32_t hdmitx_readreg(vim2_display_t* display, uint32_t addr);
-zx_status_t init_hdmi_hardware(vim2_display_t* display);
-void dump_regs(vim2_display_t* display);
-zx_status_t init_hdmi_interface(vim2_display_t* display, const struct hdmi_param* p);
-void hdmi_test(vim2_display_t* display, uint32_t width);
-zx_status_t configure_pll(vim2_display_t* display, const struct hdmi_param* p,
+struct vim2_display;  // fwd decl
+
+void hdmitx_writereg(const struct vim2_display* display, uint32_t addr, uint32_t data);
+uint32_t hdmitx_readreg(const struct vim2_display* display, uint32_t addr);
+void init_hdmi_hardware(struct vim2_display* display);
+void dump_regs(struct vim2_display* display);
+void init_hdmi_interface(struct vim2_display* display, const struct hdmi_param* p);
+void hdmi_test(struct vim2_display* display, uint32_t width);
+zx_status_t configure_pll(struct vim2_display* display, const struct hdmi_param* p,
     const struct pll_param* pll);
-void hdmi_shutdown(vim2_display_t* display);
+void hdmi_shutdown(struct vim2_display* display);
+
+__END_CDECLS

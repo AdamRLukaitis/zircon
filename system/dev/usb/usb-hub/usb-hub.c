@@ -8,10 +8,11 @@
 #include <ddk/driver.h>
 #include <ddk/protocol/usb.h>
 #include <ddk/protocol/usb-bus.h>
-#include <ddk/usb-request.h>
-#include <driver/usb.h>
+#include <ddk/protocol/usb-hub.h>
+#include <ddk/usb/usb.h>
+#include <usb/usb-request.h>
 #include <zircon/hw/usb-hub.h>
-#include <sync/completion.h>
+#include <lib/sync/completion.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,10 +41,10 @@ typedef struct usb_hub {
     zx_time_t power_on_delay;
 
     usb_request_t* status_request;
-    completion_t completion;
+    sync_completion_t completion;
 
     thrd_t thread;
-    bool thread_done;
+    atomic_bool thread_done;
 
     // port status values for our ports
     // length is num_ports
@@ -161,7 +162,7 @@ static zx_status_t usb_hub_wait_for_port(usb_hub_t* hub, int port, port_status_t
 static void usb_hub_interrupt_complete(usb_request_t* req, void* cookie) {
     zxlogf(TRACE, "usb_hub_interrupt_complete got %d %" PRIu64 "\n", req->response.status, req->response.actual);
     usb_hub_t* hub = (usb_hub_t*)cookie;
-    completion_signal(&hub->completion);
+    sync_completion_signal(&hub->completion);
 }
 
 static void usb_hub_power_on_port(usb_hub_t* hub, int port) {
@@ -214,6 +215,21 @@ static void usb_hub_port_connected(usb_hub_t* hub, int port) {
     usb_hub_port_enabled(hub, port);
 }
 
+static void usb_hub_port_reset(void* ctx, uint32_t port) {
+    port_status_t status;
+    usb_hub_t* hub = ctx;
+
+    usb_set_feature(&hub->usb, USB_RECIP_PORT, USB_FEATURE_PORT_RESET, port, ZX_TIME_INFINITE);
+    if (usb_hub_wait_for_port(hub, port, &status, USB_PORT_ENABLE, USB_PORT_ENABLE | USB_PORT_RESET,
+                              ZX_MSEC(100)) != ZX_OK) {
+        zxlogf(ERROR, "usb_hub_wait_for_port USB_PORT_RESET failed for USB hub, port %d\n", port);
+    }
+}
+
+static usb_hub_interface_ops_t _hub_interface = {
+    .reset_port = usb_hub_port_reset,
+};
+
 static void usb_hub_port_disconnected(usb_hub_t* hub, int port) {
     zxlogf(TRACE, "port %d usb_hub_port_disconnected\n", port);
     usb_bus_hub_device_removed(&hub->bus, hub->usb_device, port);
@@ -240,7 +256,11 @@ static void usb_hub_handle_port_status(usb_hub_t* hub, int port, port_status_t s
     }
     if ((status & USB_PORT_CONNECTION) && !(old_status & USB_PORT_CONNECTION)) {
         usb_hub_port_connected(hub, port);
-    } else if (!(status & USB_PORT_CONNECTION) && (old_status & USB_PORT_CONNECTION)) {
+    // Check for both USB_PORT_CONNECTION and USB_PORT_ENABLE below.
+    // It seems to be a quirk of newer x86 hardware that USB_PORT_ENABLE might be set
+    // but USB_PORT_CONNECTION is not.
+    } else if (!(status & USB_PORT_CONNECTION) &&
+                (old_status & USB_PORT_CONNECTION || old_status & USB_PORT_ENABLE)) {
         usb_hub_port_disconnected(hub, port);
     } else if ((status & USB_PORT_ENABLE) && !(old_status & USB_PORT_ENABLE)) {
         usb_hub_port_enabled(hub, port);
@@ -254,6 +274,11 @@ static void usb_hub_unbind(void* ctx) {
             usb_hub_port_disconnected(hub, port);
         }
     }
+
+    atomic_store(&hub->thread_done, true);
+    sync_completion_signal(&hub->completion);
+    thrd_join(hub->thread, NULL);
+
     device_remove(hub->zxdev);
 }
 
@@ -266,10 +291,6 @@ static zx_status_t usb_hub_free(usb_hub_t* hub) {
 
 static void usb_hub_release(void* ctx) {
     usb_hub_t* hub = ctx;
-
-    hub->thread_done = true;
-    completion_signal(&hub->completion);
-    thrd_join(hub->thread, NULL);
     usb_hub_free(hub);
 }
 
@@ -337,14 +358,14 @@ static int usb_hub_thread(void* arg) {
 
     // This loop handles events from our interrupt endpoint
     while (1) {
-        completion_reset(&hub->completion);
+        sync_completion_reset(&hub->completion);
         usb_request_queue(&hub->usb, req);
-        completion_wait(&hub->completion, ZX_TIME_INFINITE);
-        if (req->response.status != ZX_OK || hub->thread_done) {
+        sync_completion_wait(&hub->completion, ZX_TIME_INFINITE);
+        if (req->response.status != ZX_OK || atomic_load(&hub->thread_done)) {
             break;
         }
 
-        usb_request_copyfrom(req, status_buf, req->response.actual, 0);
+        usb_request_copy_from(req, status_buf, req->response.actual, 0);
         uint8_t* bitmap = status_buf;
         uint8_t* bitmap_end = bitmap + req->response.actual;
 
@@ -400,10 +421,11 @@ static zx_status_t usb_hub_bind(void* ctx, zx_device_t* device) {
         return ZX_ERR_NOT_SUPPORTED;
     }
 
-    // find our interrupt endpoint
     usb_desc_iter_t iter;
     status = usb_desc_iter_init(&usb, &iter);
-    if (status < 0) return status;
+    if (status < 0) {
+        return status;
+    }
 
     usb_interface_descriptor_t* intf = usb_desc_iter_next_interface(&iter, true);
     if (!intf || intf->bNumEndpoints != 1) {
@@ -411,24 +433,28 @@ static zx_status_t usb_hub_bind(void* ctx, zx_device_t* device) {
         return ZX_ERR_NOT_SUPPORTED;
     }
 
-    uint8_t ep_addr = 0;
-    uint16_t max_packet_size = 0;
     usb_endpoint_descriptor_t* endp = usb_desc_iter_next_endpoint(&iter);
-    if (endp && usb_ep_type(endp) == USB_ENDPOINT_INTERRUPT) {
-        ep_addr = endp->bEndpointAddress;
-        max_packet_size = usb_ep_max_packet(endp);
-    }
-    usb_desc_iter_release(&iter);
-
-    if (!ep_addr) {
+    if (!endp || usb_ep_type(endp) != USB_ENDPOINT_INTERRUPT) {
+        usb_desc_iter_release(&iter);
         return ZX_ERR_NOT_SUPPORTED;
     }
+
+    usb_ss_ep_comp_descriptor_t* ss_comp_desc = NULL;
+    usb_descriptor_header_t* desc = usb_desc_iter_next(&iter);
+    if (desc && desc->bDescriptorType == USB_DT_SS_EP_COMPANION) {
+        ss_comp_desc = (usb_ss_ep_comp_descriptor_t *)desc;
+    }
+
+    uint8_t ep_addr = endp->bEndpointAddress;
+    uint16_t max_packet_size = usb_ep_max_packet(endp);
 
     usb_hub_t* hub = calloc(1, sizeof(usb_hub_t));
     if (!hub) {
         zxlogf(ERROR, "Not enough memory for usb_hub_t.\n");
+        usb_desc_iter_release(&iter);
         return ZX_ERR_NO_MEMORY;
     }
+    atomic_init(&hub->thread_done, false);
 
     hub->usb_device = device;
     hub->hub_speed = usb_get_speed(&usb);
@@ -437,14 +463,25 @@ static zx_status_t usb_hub_bind(void* ctx, zx_device_t* device) {
     memcpy(&hub->bus, &bus, sizeof(usb_bus_protocol_t));
 
     usb_request_t* req;
-    status = usb_req_alloc(&usb, &req, max_packet_size, ep_addr);
+    status = usb_request_alloc(&req, max_packet_size, ep_addr, sizeof(usb_request_t));
     if (status != ZX_OK) {
+        usb_desc_iter_release(&iter);
         usb_hub_free(hub);
         return status;
     }
     req->complete_cb = usb_hub_interrupt_complete;
     req->cookie = hub;
     hub->status_request = req;
+
+    status = usb_enable_endpoint(&usb, endp, ss_comp_desc, true);
+    if (status != ZX_OK) {
+        zxlogf(ERROR, "%s: usb_enable_endpoint failed %d\n", __FUNCTION__, status);
+        usb_desc_iter_release(&iter);
+        usb_hub_free(hub);
+        return status;
+    }
+
+    usb_desc_iter_release(&iter);
 
     device_add_args_t args = {
         .version = DEVICE_ADD_ARGS_VERSION,
@@ -459,6 +496,11 @@ static zx_status_t usb_hub_bind(void* ctx, zx_device_t* device) {
         usb_hub_free(hub);
         return status;
     }
+
+    static usb_hub_interface_t hub_intf;
+    hub_intf.ops = &_hub_interface;
+    hub_intf.ctx = hub;
+    usb_bus_set_hub_interface(&bus, hub->usb_device, &hub_intf);
 
     int ret = thrd_create_with_name(&hub->thread, usb_hub_thread, hub, "usb_hub_thread");
     if (ret != thrd_success) {
@@ -475,6 +517,6 @@ static zx_driver_ops_t usb_hub_driver_ops = {
 };
 
 ZIRCON_DRIVER_BEGIN(usb_hub, usb_hub_driver_ops, "zircon", "0.1", 2)
-    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_USB),
+    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_USB_DEVICE),
     BI_MATCH_IF(EQ, BIND_USB_CLASS, USB_CLASS_HUB),
 ZIRCON_DRIVER_END(usb_hub)

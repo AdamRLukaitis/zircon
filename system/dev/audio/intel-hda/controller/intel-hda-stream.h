@@ -10,15 +10,16 @@
 #include <fbl/ref_counted.h>
 #include <fbl/ref_ptr.h>
 #include <fbl/unique_ptr.h>
-#include <fbl/vmo_mapper.h>
+#include <lib/fzl/pinned-vmo.h>
+#include <lib/fzl/vmo-mapper.h>
+#include <zircon/thread_annotations.h>
 
 #include <audio-proto/audio-proto.h>
 #include <dispatcher-pool/dispatcher-channel.h>
 #include <intel-hda/utils/intel-hda-registers.h>
+#include <intel-hda/utils/utils.h>
 
-#include "pinned-vmo.h"
 #include "debug-logging.h"
-#include "thread-annotations.h"
 #include "utils.h"
 
 namespace audio {
@@ -48,6 +49,10 @@ public:
     Type        configured_type() const { return configured_type_; }
     uint8_t     tag()             const { return tag_; }
     uint16_t    id()              const { return id_; }
+    uint16_t    dma_id()          const {
+        ZX_DEBUG_ASSERT(id() > 0);
+        return static_cast<uint16_t>(id() - 1);
+    }
     uint16_t    GetKey()          const { return id(); }
 
     zx_status_t SetStreamFormat(const fbl::RefPtr<dispatcher::ExecutionDomain>& domain,
@@ -103,12 +108,12 @@ private:
     static void EnsureStopped(hda_stream_desc_regs_t* regs);
     static void Reset(hda_stream_desc_regs_t* regs);
 
-    // Accessor for the CPU accessble view of the Buffer Descriptor List
+    // Accessor for the CPU accessible view of the Buffer Descriptor List
     IntelHDABDLEntry* bdl() const {
         return reinterpret_cast<IntelHDABDLEntry*>(bdl_cpu_mem_.start());
     }
 
-    // Paramters determined construction time.
+    // Parameters determined construction time.
     const Type                    type_ = Type::INVALID;
     const uint16_t                id_   = 0;
     hda_stream_desc_regs_t* const regs_ = nullptr;
@@ -126,21 +131,21 @@ private:
     const fbl::RefPtr<RefCountedBti> pci_bti_;
 
     // Storage allocated for this stream context's buffer descriptor list.
-    fbl::VmoMapper bdl_cpu_mem_;
-    PinnedVmo      bdl_hda_mem_;
+    fzl::VmoMapper bdl_cpu_mem_;
+    fzl::PinnedVmo bdl_hda_mem_;
 
     // The channel used by the application to talk to us once our format has
     // been set by the codec.
     fbl::Mutex channel_lock_;
     fbl::RefPtr<dispatcher::Channel> channel_ TA_GUARDED(channel_lock_);
-    PinnedVmo pinned_ring_buffer_ TA_GUARDED(channel_lock_);
+    fzl::PinnedVmo pinned_ring_buffer_ TA_GUARDED(channel_lock_);
 
-    // Paramters determined after stream format configuration.
+    // Parameters determined after stream format configuration.
     uint16_t encoded_fmt_ = 0;
     uint16_t fifo_depth_ = 0;
     uint32_t bytes_per_frame_ TA_GUARDED(channel_lock_) = 0;
 
-    // Paramters determined after ring buffer allocation.
+    // Parameters determined after ring buffer allocation.
     uint32_t cyclic_buffer_length_ TA_GUARDED(channel_lock_) = 0;
     uint32_t bdl_last_valid_index_ TA_GUARDED(channel_lock_) = 0;
 

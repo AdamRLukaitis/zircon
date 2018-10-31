@@ -15,28 +15,34 @@ MODULE_SRCS := \
     $(LOCAL_DIR)/main.cpp \
 
 MODULE_STATIC_LIBS := \
-    system/ulib/blobfs \
-    system/ulib/fs \
-    system/ulib/async.cpp \
     system/ulib/async \
-    system/ulib/async-loop.cpp \
+    system/ulib/async.cpp \
     system/ulib/async-loop \
+    system/ulib/async-loop.cpp \
+    system/ulib/bitmap \
+    system/ulib/blobfs \
     system/ulib/block-client \
     system/ulib/digest \
-    system/ulib/trace-provider \
+    system/ulib/fbl \
+    system/ulib/fs \
+    system/ulib/fzl \
+    system/ulib/sync \
     system/ulib/trace \
-    third_party/ulib/uboringssl \
+    system/ulib/trace-provider \
     system/ulib/zx \
     system/ulib/zxcpp \
-    system/ulib/fbl \
-    system/ulib/sync \
+    third_party/ulib/cksum \
+    third_party/ulib/lz4 \
+    third_party/ulib/uboringssl \
 
 MODULE_LIBS := \
     system/ulib/async.default \
-    system/ulib/bitmap \
     system/ulib/c \
     system/ulib/fdio \
     system/ulib/trace-engine \
     system/ulib/zircon \
+
+MODULE_FIDL_LIBS := \
+    system/fidl/fuchsia-io \
 
 include make/module.mk

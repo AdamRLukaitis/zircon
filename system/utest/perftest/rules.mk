@@ -10,7 +10,12 @@ MODULE_TYPE := usertest
 
 MODULE_SRCS += \
     $(LOCAL_DIR)/clock-test.cpp \
+    $(LOCAL_DIR)/handle-creation-test.cpp \
+    $(LOCAL_DIR)/malloc-test.cpp \
+    $(LOCAL_DIR)/memcpy-test.cpp \
+    $(LOCAL_DIR)/mutex-test.cpp \
     $(LOCAL_DIR)/null-test.cpp \
+    $(LOCAL_DIR)/process-test.cpp \
     $(LOCAL_DIR)/results-test.cpp \
     $(LOCAL_DIR)/runner-test.cpp \
     $(LOCAL_DIR)/sleep-test.cpp \
@@ -19,13 +24,23 @@ MODULE_SRCS += \
 MODULE_NAME := perf-test
 
 MODULE_STATIC_LIBS := \
+    system/ulib/async \
+    system/ulib/async-loop \
+    system/ulib/async-loop.cpp \
+    system/ulib/async.cpp \
     system/ulib/fbl \
     system/ulib/perftest \
+    system/ulib/trace \
+    system/ulib/trace-provider \
+    system/ulib/zx \
     system/ulib/zxcpp \
 
 MODULE_LIBS := \
+    system/ulib/async.default \
     system/ulib/c \
     system/ulib/fdio \
+    system/ulib/launchpad \
+    system/ulib/trace-engine \
     system/ulib/unittest \
     system/ulib/zircon \
 

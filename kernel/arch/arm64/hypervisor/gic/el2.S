@@ -8,16 +8,25 @@
 #include <asm.h>
 #include <zircon/errors.h>
 
+
+// For details please refer to ARM Generic Interrupt Controller Architecture Specification,
+// GIC architecture version 3.0 and version 4.0. Table 8-6 Mapping of MSR and MRS to
+// virtual interface control registers, AArch64 state and Table 8-8 Mapping of MCR and
+// MRC to virtual interface control registers, AArch32 state.
+#define ICH_AP0R0_EL2                   S3_4_C12_C8_0
 #define ICH_HCR_EL2                     S3_4_C12_C11_0
 #define ICH_VTR_EL2                     S3_4_C12_C11_1
+#define ICH_MISR_EL2                    S3_4_C12_C11_2
+#define ICH_ELRSR_EL2                   S3_4_C12_C11_5
 #define ICH_VMCR_EL2                    S3_4_C12_C11_7
-#define ICH_ELRS_EL2                    S3_4_C12_C11_5
 
-#define ICH_HCR_EL2_ID                  0
-#define ICH_VTR_EL2_ID                  1
-#define ICH_VMCR_EL2_ID                 2
-#define ICH_ELRS_EL2_ID                 3
-#define ICH_LR_EL2_ID                   4
+#define ICH_AP0R0_EL2_ID                0
+#define ICH_HCR_EL2_ID                  1
+#define ICH_VTR_EL2_ID                  2
+#define ICH_MISR_EL2_ID                 3
+#define ICH_ELRSR_EL2_ID                4
+#define ICH_VMCR_EL2_ID                 5
+#define ICH_LR_EL2_ID                   6
 
 #define LR0_EL2(x)                      S3_4_C12_C12_ ## x
 #define LR8_EL2(x)                      S3_4_C12_C13_ ## x
@@ -47,101 +56,74 @@
 .section .text.el2,"ax",@progbits
 .align 12
 
-.macro switch_to_host
-    msr vttbr_el2, xzr
-    isb
-.endm
-
-.macro exception_return literal
-    mov x0, \literal
-    eret
-.endm
-
 .macro read_sysreg literal
     mrs x0, \literal
-    switch_to_host
-    exception_return x0
+    b el2_gicv3_done
 .endm
 
 .macro write_sysreg literal
-    msr \literal, x2
-    isb
-    switch_to_host
-    exception_return ZX_OK
+    msr \literal, x0
+    b el2_gicv3_done
 .endm
 
-// This macro jumps to the address in the jump table based on
-// x3 - Index to calculate the jump address and an offset
-// We have two diffrent jump tables with different no. of
-// instructions to jump, so the second parameter is to get
-// the right offset i.e. no. of bits to left shift.
-// base_address_of_table + (x3*16 + x3*4) would be the
-// correct address
-.macro sysreg_jump table lshift
+.macro invalid_write
+    b el2_gicv3_done
+    nop
+.endm
+
+// Branch to an address within a jump table, calculated as follows:
+//   address = table + (reg << 3)
+.macro gic_jump table reg
     adr x9, \table
-    lsl x10, x3, 4
-    lsl x2, x3, \lshift
-    add x10, x10, x2
-    add x9, x9, x10
+    add x9, x9, \reg, lsl 3
     br x9
-.endm
-
-// Each Read or Write to LR register is 2 instructions
-// This macro calculates the correct jump address based on the
-// x1 - LR index
-// base_address_of_table + (x1*8) would be the correct jump address
-.macro lr_jump table
-    adr x9, \table
-    lsl x10, x1, 3
-    add x9, x9, x10
-    br x9
-.endm
-
-.macro read_lr_register reg
-    mrs x0, \reg
-    b .Llr_done
-.endm
-
-.macro write_lr_register reg
-    msr \reg, x0
-    b .Llr_done
 .endm
 
 // x0 - Value to write
-// x1 - Index for LR register
+// x1 - Index for ICH register
 // x2 - READ/WRITE
 // x3 - Register name/enum
 FUNCTION_LABEL(el2_hvc_sysreg)
     cbnz x2, .write_sys
 
-    // .Lread_sys is a jump table but it uses macros
-    // Each read is at an offset of 5 instructions
-    // The correct jump address for register enum idx is (idx*16 + idx*4)
-    // 2nd parameter to the macro is the no. of bits to left shift to calculate
-    // the latter part of the math
-    sysreg_jump .Lread_sys 2
+    gic_jump .Lread_sys x3
 
 .Lread_sys:
+    read_sysreg ICH_AP0R0_EL2
     read_sysreg ICH_HCR_EL2
     read_sysreg ICH_VTR_EL2
+    read_sysreg ICH_MISR_EL2
+    read_sysreg ICH_ELRSR_EL2
     read_sysreg ICH_VMCR_EL2
-    read_sysreg ICH_ELRS_EL2
-    b gicv3_read_lr_helper
+    b el2_gicv3_read_lr
 
 .write_sys:
-    // Similar to the read jump table above
-    // Here each write is at an offset of 6 instructions
-    // The correct jump address for register enum idx is (idx*16 + idx*8)
-    // 2nd parameter to the macro is the no. of bits to left shift to calculate
-    // the latter part of the math
-    sysreg_jump .Lwrite_sys 3
+    gic_jump .Lwrite_sys x3
 
 .Lwrite_sys:
+    write_sysreg ICH_AP0R0_EL2
     write_sysreg ICH_HCR_EL2
-    write_sysreg ICH_VTR_EL2
+    invalid_write // ICH_VTR_EL2 is readonly
+    invalid_write // ICH_MISR_EL2 is readonly
+    invalid_write // ICH_ELRSR_EL2 is readonly
     write_sysreg ICH_VMCR_EL2
-    write_sysreg ICH_ELRS_EL2
-    b gicv3_write_lr_helper
+    b el2_gicv3_write_lr
+
+// uint32_t arm64_el2_gicv3_read_gich_apr();
+FUNCTION(arm64_el2_gicv3_read_gich_apr)
+    mov x2, READ_SYSREG_ID
+    mov x3, ICH_AP0R0_EL2_ID
+    hvc 5
+    ret
+END_FUNCTION(arm64_el2_gicv3_read_gich_apr)
+
+// void arm64_el2_gicv3_write_gich_apr(uint32_t val)
+FUNCTION(arm64_el2_gicv3_write_gich_apr)
+    mov x2, WRITE_SYSREG_ID
+    mov x3, ICH_AP0R0_EL2_ID
+    hvc 5
+    ret
+END_FUNCTION(arm64_el2_gicv3_write_gich_apr)
 
 // uint32_t arm64_el2_gicv3_read_gich_hcr();
 FUNCTION(arm64_el2_gicv3_read_gich_hcr)
@@ -167,14 +149,6 @@ FUNCTION(arm64_el2_gicv3_read_gich_vtr)
     ret
 END_FUNCTION(arm64_el2_gicv3_read_gich_vtr)
 
-// void arm64_el2_gicv3_write_gich_vtr(uint32_t val)
-FUNCTION(arm64_el2_gicv3_write_gich_vtr)
-    mov x2, WRITE_SYSREG_ID
-    mov x3, ICH_VTR_EL2_ID
-    hvc 5
-    ret
-END_FUNCTION(arm64_el2_gicv3_write_gich_vtr)
-
 // uint32_t arm64_el2_gicv3_read_gich_vmcr();
 FUNCTION(arm64_el2_gicv3_read_gich_vmcr)
     mov x2, READ_SYSREG_ID
@@ -191,13 +165,21 @@ FUNCTION(arm64_el2_gicv3_write_gich_vmcr)
     ret
 END_FUNCTION(arm64_el2_gicv3_write_gich_vmcr)
 
-// uint32_t arm64_el2_gicv3_read_gich_elrs();
-FUNCTION(arm64_el2_gicv3_read_gich_elrs)
+// uint32_t arm64_el2_gicv3_read_gich_elrsr();
+FUNCTION(arm64_el2_gicv3_read_gich_elrsr)
     mov x2, READ_SYSREG_ID
-    mov x3, ICH_ELRS_EL2_ID
+    mov x3, ICH_ELRSR_EL2_ID
     hvc 5
     ret
-END_FUNCTION(arm64_el2_gicv3_read_gich_elrs)
+END_FUNCTION(arm64_el2_gicv3_read_gich_elrsr)
+
+// uint32_t arm64_el2_gicv3_read_gich_misr();
+FUNCTION(arm64_el2_gicv3_read_gich_misr)
+    mov x2, READ_SYSREG_ID
+    mov x3, ICH_MISR_EL2_ID
+    hvc 5
+    ret
+END_FUNCTION(arm64_el2_gicv3_read_gich_misr)
 
 // uint64_t arm64_el2_gicv3_read_gich_lr(uint32_t index);
 FUNCTION(arm64_el2_gicv3_read_gich_lr)
@@ -217,50 +199,51 @@ FUNCTION(arm64_el2_gicv3_write_gich_lr)
 END_FUNCTION(arm64_el2_gicv3_write_gich_lr)
 
 // x1 - Index for LR register
-FUNCTION_LABEL(gicv3_read_lr_helper)
-    lr_jump .Llr_read_table
+FUNCTION_LABEL(el2_gicv3_read_lr)
+    gic_jump .Llr_read_table x1
 
 .Llr_read_table:
-    read_lr_register ICH_LR(0)
-    read_lr_register ICH_LR(1)
-    read_lr_register ICH_LR(2)
-    read_lr_register ICH_LR(3)
-    read_lr_register ICH_LR(4)
-    read_lr_register ICH_LR(5)
-    read_lr_register ICH_LR(6)
-    read_lr_register ICH_LR(7)
-    read_lr_register ICH_LR(8)
-    read_lr_register ICH_LR(9)
-    read_lr_register ICH_LR(10)
-    read_lr_register ICH_LR(11)
-    read_lr_register ICH_LR(12)
-    read_lr_register ICH_LR(13)
-    read_lr_register ICH_LR(14)
-    read_lr_register ICH_LR(15)
+    read_sysreg ICH_LR(0)
+    read_sysreg ICH_LR(1)
+    read_sysreg ICH_LR(2)
+    read_sysreg ICH_LR(3)
+    read_sysreg ICH_LR(4)
+    read_sysreg ICH_LR(5)
+    read_sysreg ICH_LR(6)
+    read_sysreg ICH_LR(7)
+    read_sysreg ICH_LR(8)
+    read_sysreg ICH_LR(9)
+    read_sysreg ICH_LR(10)
+    read_sysreg ICH_LR(11)
+    read_sysreg ICH_LR(12)
+    read_sysreg ICH_LR(13)
+    read_sysreg ICH_LR(14)
+    read_sysreg ICH_LR(15)
 
 // x0 - Value to write
 // x1 - Index for LR register
-FUNCTION_LABEL(gicv3_write_lr_helper)
-    lr_jump .Llr_write_table
+FUNCTION_LABEL(el2_gicv3_write_lr)
+    gic_jump .Llr_write_table x1
 
 .Llr_write_table:
-    write_lr_register ICH_LR(0)
-    write_lr_register ICH_LR(1)
-    write_lr_register ICH_LR(2)
-    write_lr_register ICH_LR(3)
-    write_lr_register ICH_LR(4)
-    write_lr_register ICH_LR(5)
-    write_lr_register ICH_LR(6)
-    write_lr_register ICH_LR(7)
-    write_lr_register ICH_LR(8)
-    write_lr_register ICH_LR(9)
-    write_lr_register ICH_LR(10)
-    write_lr_register ICH_LR(11)
-    write_lr_register ICH_LR(12)
-    write_lr_register ICH_LR(13)
-    write_lr_register ICH_LR(14)
-    write_lr_register ICH_LR(15)
+    write_sysreg ICH_LR(0)
+    write_sysreg ICH_LR(1)
+    write_sysreg ICH_LR(2)
+    write_sysreg ICH_LR(3)
+    write_sysreg ICH_LR(4)
+    write_sysreg ICH_LR(5)
+    write_sysreg ICH_LR(6)
+    write_sysreg ICH_LR(7)
+    write_sysreg ICH_LR(8)
+    write_sysreg ICH_LR(9)
+    write_sysreg ICH_LR(10)
+    write_sysreg ICH_LR(11)
+    write_sysreg ICH_LR(12)
+    write_sysreg ICH_LR(13)
+    write_sysreg ICH_LR(14)
+    write_sysreg ICH_LR(15)
 
-.Llr_done:
-    switch_to_host
-    exception_return x0
+FUNCTION_LABEL(el2_gicv3_done)
+    msr vttbr_el2, xzr
+    isb
+    eret

@@ -8,12 +8,9 @@
 
 #include <assert.h>
 #include <lib/user_copy/user_ptr.h>
-#include <fbl/auto_lock.h>
 #include <object/thread_dispatcher.h>
 #include <trace.h>
 #include <zircon/types.h>
-
-using fbl::AutoLock;
 
 #define LOCAL_TRACE 0
 
@@ -42,16 +39,14 @@ zx_status_t FutexContext::FutexWait(user_in_ptr<const int> value_ptr, int curren
     // If a FutexWake() operation could occur between them, a userland mutex
     // operation built on top of futexes would have a race condition that
     // could miss wakeups.
-    lock_.Acquire();
+    Guard<fbl::Mutex> guard{&lock_};
 
     int value;
     zx_status_t result = value_ptr.copy_from_user(&value);
     if (result != ZX_OK) {
-        lock_.Release();
         return result;
     }
     if (value != current_value) {
-        lock_.Release();
         return ZX_ERR_BAD_STATE;
     }
 
@@ -62,7 +57,7 @@ zx_status_t FutexContext::FutexWait(user_in_ptr<const int> value_ptr, int curren
     QueueNodesLocked(&node);
 
     // Block current thread.  This releases lock_ and does not reacquire it.
-    result = node.BlockThread(&lock_, deadline);
+    result = node.BlockThread(guard.take(), deadline);
     if (result == ZX_OK) {
         DEBUG_ASSERT(!node.IsInQueue());
         // All the work necessary for removing us from the hash table was done by FutexWake()
@@ -75,7 +70,7 @@ zx_status_t FutexContext::FutexWait(user_in_ptr<const int> value_ptr, int curren
     //
     // We need to ensure that the thread's node is removed from the wait
     // queue, because FutexWake() probably didn't do that.
-    AutoLock lock(&lock_);
+    Guard<fbl::Mutex> guard2{&lock_};
     if (UnqueueNodeLocked(&node)) {
         return result;
     }
@@ -111,7 +106,9 @@ zx_status_t FutexContext::FutexWake(user_in_ptr<const int> value_ptr,
     if (futex_key % sizeof(int))
         return ZX_ERR_INVALID_ARGS;
 
-    AutoLock lock(&lock_);
+    AutoReschedDisable resched_disable; // Must come before the Guard.
+    resched_disable.Disable();
+    Guard<fbl::Mutex> guard{&lock_};
 
     FutexNode* node = futex_table_.erase(futex_key);
     if (!node) {
@@ -120,18 +117,12 @@ zx_status_t FutexContext::FutexWake(user_in_ptr<const int> value_ptr,
     }
     DEBUG_ASSERT(node->GetKey() == futex_key);
 
-    bool any_woken = false;
     FutexNode* remaining_waiters =
-        FutexNode::WakeThreads(node, count, futex_key, &any_woken);
+        FutexNode::WakeThreads(node, count, futex_key);
 
     if (remaining_waiters) {
         DEBUG_ASSERT(remaining_waiters->GetKey() == futex_key);
         futex_table_.insert(remaining_waiters);
-    }
-
-    if (any_woken) {
-        lock.release();
-        thread_reschedule();
     }
 
     return ZX_OK;
@@ -144,7 +135,8 @@ zx_status_t FutexContext::FutexRequeue(user_in_ptr<const int> wake_ptr, uint32_t
     if ((requeue_ptr.get() == nullptr) && requeue_count)
         return ZX_ERR_INVALID_ARGS;
 
-    AutoLock lock(&lock_);
+    AutoReschedDisable resched_disable; // Must come before the Guard.
+    Guard<fbl::Mutex> guard{&lock_};
 
     int value;
     zx_status_t result = wake_ptr.copy_from_user(&value);
@@ -166,9 +158,12 @@ zx_status_t FutexContext::FutexRequeue(user_in_ptr<const int> wake_ptr, uint32_t
         return ZX_OK;
     }
 
-    bool any_woken = false;
+    // This must come before WakeThreads() to be useful, but we want to
+    // avoid doing it before copy_from_user() in case that faults.
+    resched_disable.Disable();
+
     if (wake_count > 0) {
-        node = FutexNode::WakeThreads(node, wake_count, wake_key, &any_woken);
+        node = FutexNode::WakeThreads(node, wake_count, wake_key);
     }
 
     // node is now the head of wake_ptr futex after possibly removing some threads to wake
@@ -191,16 +186,11 @@ zx_status_t FutexContext::FutexRequeue(user_in_ptr<const int> wake_ptr, uint32_t
         futex_table_.insert(node);
     }
 
-    if (any_woken) {
-        lock.release();
-        thread_reschedule();
-    }
-
     return ZX_OK;
 }
 
 void FutexContext::QueueNodesLocked(FutexNode* head) {
-    DEBUG_ASSERT(lock_.IsHeld());
+    DEBUG_ASSERT(lock_.lock().IsHeld());
 
     FutexNode::HashTable::iterator iter;
 
@@ -216,7 +206,7 @@ void FutexContext::QueueNodesLocked(FutexNode* head) {
 // futex), given its FutexNode.  This returns whether the FutexNode was
 // found and removed from a futex wait queue.
 bool FutexContext::UnqueueNodeLocked(FutexNode* node) {
-    DEBUG_ASSERT(lock_.IsHeld());
+    DEBUG_ASSERT(lock_.lock().IsHeld());
 
     if (!node->IsInQueue())
         return false;

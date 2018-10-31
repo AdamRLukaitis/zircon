@@ -7,8 +7,8 @@
 
 #include <ddk/io-buffer.h>
 #include <ddk/protocol/hidbus.h>
+#include <hid/boot.h>
 #include <virtio/input.h>
-#include <zircon/device/input.h>
 
 #include "device.h"
 #include "ring.h"
@@ -32,20 +32,20 @@ private:
     static void virtio_input_release(void* ctx);
 
     static zx_status_t virtio_input_query(void* ctx, uint32_t options, hid_info_t* info);
-    static zx_status_t virtio_input_start(void* ctx, hidbus_ifc_t* ifc, void* cookie);
+    static zx_status_t virtio_input_start(void* ctx, const hidbus_ifc_t* ifc);
     static void virtio_input_stop(void* ctx);
     static zx_status_t virtio_input_get_descriptor(void* ctx, uint8_t desc_type,
                                                    void** data, size_t* len);
     static zx_status_t virtio_input_get_report(void* ctx, uint8_t rpt_type, uint8_t rpt_id,
                                                void* data, size_t len, size_t* out_len);
     static zx_status_t virtio_input_set_report(void* ctx, uint8_t rpt_type, uint8_t rpt_id,
-                                               void* data, size_t len);
+                                               const void* data, size_t len);
     static zx_status_t virtio_input_get_idle(void* ctx, uint8_t rpt_type, uint8_t* duration);
     static zx_status_t virtio_input_set_idle(void* ctx, uint8_t rpt_type, uint8_t duration);
     static zx_status_t virtio_input_get_protocol(void* ctx, uint8_t* protocol);
     static zx_status_t virtio_input_set_protocol(void* ctx, uint8_t protocol);
 
-    zx_status_t Start(hidbus_ifc_t* ifc, void* cookie);
+    zx_status_t Start(const hidbus_ifc_t* ifc);
     void Stop();
     zx_status_t Query(uint32_t options, hid_info_t* info);
     zx_status_t GetDescriptor(uint8_t desc_type, void** data, size_t* len);
@@ -65,10 +65,9 @@ private:
 
     uint8_t dev_class_;
     hidbus_protocol_ops_t hidbus_ops_;
-    hidbus_ifc_t* hidbus_ifc_;
-    void* hidbus_cookie_;
+    hidbus_ifc_t hidbus_ifc_;
 
-    boot_kbd_report_t report_;
+    hid_boot_kbd_report_t report_;
 
     Ring vring_ = {this};
 };

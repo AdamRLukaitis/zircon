@@ -5,14 +5,14 @@
 #include "pci.h"
 
 #include <assert.h>
-#include <fdio/debug.h>
 #include <stdio.h>
 
 #include <acpica/acpi.h>
+#include <ddk/debug.h>
 
 #include "resources.h"
 
-#define ZXDEBUG 0
+#define xprintf(fmt...) zxlogf(SPEW, fmt)
 
 #define PCIE_MAX_LEGACY_IRQ_PINS 4
 #define PCIE_MAX_DEVICES_PER_BUS 32
@@ -215,7 +215,7 @@ static zx_status_t find_pcie_config(zx_pci_init_arg_t* arg) {
         return ZX_ERR_NOT_SUPPORTED;
     }
 
-    arg->addr_windows[0].is_mmio = true;
+    arg->addr_windows[0].cfg_space_type = PCI_CFG_SPACE_TYPE_MMIO;
     arg->addr_windows[0].has_ecam = true;
     arg->addr_windows[0].bus_start = table_start->StartBusNumber;
     arg->addr_windows[0].bus_end = table_start->EndBusNumber;
@@ -327,7 +327,7 @@ static ACPI_STATUS find_pci_configs_cb(
     // is enabled we'll be using proper binding and not need this
     // anymore.
     if (AcpiGetObjectInfo(object, &info) == AE_OK) {
-        arg->addr_windows[0].is_mmio = false;
+        arg->addr_windows[0].cfg_space_type = PCI_CFG_SPACE_TYPE_PIO;
         arg->addr_windows[0].has_ecam = false;
         arg->addr_windows[0].base = 0;
         arg->addr_windows[0].bus_start = 0;

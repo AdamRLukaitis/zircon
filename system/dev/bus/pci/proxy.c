@@ -16,12 +16,6 @@
 
 #include "kpci-private.h"
 
-// pci_op_* methods are called by the proxy devhost. For each PCI
-// protocol method there is generally a pci_op_* method for the proxy
-// devhost and a corresponding kpci_* method in the top devhost that the
-// protocol request is handled by.
-_Atomic zx_txid_t pci_global_txid = 0;
-
 zx_status_t pci_rpc_request(kpci_device_t* dev, uint32_t op, zx_handle_t* handle,
                             pci_msg_t* req, pci_msg_t* resp) {
     if (dev->pciroot_rpcch == ZX_HANDLE_INVALID) {
@@ -36,7 +30,6 @@ zx_status_t pci_rpc_request(kpci_device_t* dev, uint32_t op, zx_handle_t* handle
         handle_cnt = 1;
     }
 
-    req->txid = pci_next_txid();
     req->ordinal = op;
     zx_channel_call_args_t cc_args = {
         .wr_bytes = req,
@@ -50,7 +43,7 @@ zx_status_t pci_rpc_request(kpci_device_t* dev, uint32_t op, zx_handle_t* handle
     uint32_t actual_bytes;
     uint32_t actual_handles;
     zx_status_t st = zx_channel_call(dev->pciroot_rpcch, 0, ZX_TIME_INFINITE,
-                                     &cc_args, &actual_bytes, &actual_handles, NULL);
+                                     &cc_args, &actual_bytes, &actual_handles);
     if (st != ZX_OK) {
         return st;
     }
@@ -61,6 +54,11 @@ zx_status_t pci_rpc_request(kpci_device_t* dev, uint32_t op, zx_handle_t* handle
 
     return resp->ordinal;
 }
+
+// pci_op_* methods are called by the proxy devhost. For each PCI
+// protocol method there is generally a pci_op_* method for the proxy
+// devhost and a corresponding kpci_* method in the top devhost that the
+// protocol request is handled by.
 
 // Enables or disables bus mastering for a particular device.
 static zx_status_t pci_op_enable_bus_master(void* ctx, bool enable) {
@@ -176,11 +174,11 @@ static zx_status_t pci_op_get_bar(void* ctx, uint32_t bar_id, zx_pci_bar_t* out_
     if (st == ZX_OK) {
         // Grab the payload and copy the handle over if one was passed back to us
         *out_bar = resp.bar;
-        if (out_bar->type == PCI_BAR_TYPE_PIO) {
+        if (out_bar->type == ZX_PCI_BAR_TYPE_PIO) {
 #if __x86_64__
             // x86 PIO space access requires permission in the I/O bitmap
             // TODO: this is the last remaining use of get_root_resource in pci
-            st = zx_mmap_device_io(get_root_resource(), out_bar->addr, out_bar->size);
+            st = zx_ioports_request(get_root_resource(), out_bar->addr, out_bar->size);
             if (st != ZX_OK) {
                 zxlogf(ERROR, "Failed to map IO window for bar into process: %d\n", st);
                 return st;
@@ -215,7 +213,7 @@ static zx_status_t pci_op_map_bar(void* ctx,
     }
 
     // TODO(cja): PIO may be mappable on non-x86 architectures
-    if (bar.type == PCI_BAR_TYPE_PIO || bar.handle == ZX_HANDLE_INVALID) {
+    if (bar.type == ZX_PCI_BAR_TYPE_PIO || bar.handle == ZX_HANDLE_INVALID) {
         return ZX_ERR_WRONG_TYPE;
     }
 
@@ -228,10 +226,10 @@ static zx_status_t pci_op_map_bar(void* ctx,
     // Map the config/bar passed in. Mappings require PAGE_SIZE alignment for
     // both base and size
     void* vaddr_tmp;
-    uint32_t map_flags = ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE | ZX_VM_FLAG_MAP_RANGE;
-    status = zx_vmar_map(zx_vmar_root_self(), 0, bar.handle, 0,
+    zx_vm_option_t map_options = ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_MAP_RANGE;
+    status = zx_vmar_map(zx_vmar_root_self(), map_options, 0, bar.handle, 0,
                          ROUNDUP(bar.size, PAGE_SIZE),
-                         map_flags, (uintptr_t*)&vaddr_tmp);
+                         (uintptr_t*)&vaddr_tmp);
     if (status != ZX_OK) {
         zx_handle_close(bar.handle);
         return status;
@@ -244,7 +242,7 @@ static zx_status_t pci_op_map_bar(void* ctx,
     return status;
 }
 
-static zx_status_t pci_op_map_interrupt(void* ctx, int which_irq, zx_handle_t* out_handle) {
+static zx_status_t pci_op_map_interrupt(void* ctx, int32_t which_irq, zx_handle_t* out_handle) {
     if (!out_handle) {
         return ZX_ERR_INVALID_ARGS;
     }
@@ -318,7 +316,7 @@ static zx_status_t pci_op_get_device_info(void* ctx, zx_pcie_device_info_t* out_
 }
 
 static zx_status_t pci_op_get_auxdata(void* ctx, const char* args, void* data,
-                                      uint32_t bytes, uint32_t* actual) {
+                                      size_t bytes, size_t* actual) {
     kpci_device_t* dev = ctx;
     size_t arglen = strlen(args);
     if (arglen > PCI_MAX_DATA) {
@@ -419,4 +417,4 @@ static zx_driver_ops_t kpci_driver_ops = {
 ZIRCON_DRIVER_BEGIN(pci_proxy, kpci_driver_ops, "zircon", "0.1", 1)
     BI_ABORT_IF_AUTOBIND,
 ZIRCON_DRIVER_END(pci_proxy)
-    // clang-format on
+// clang-format on

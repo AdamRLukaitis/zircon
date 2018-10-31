@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef ZIRCON_PROCESS_H_
+#define ZIRCON_PROCESS_H_
 
 #include <zircon/types.h>
 #include <stdint.h>
@@ -15,7 +16,7 @@ __BEGIN_CDECLS
 // |hnd_info|.  If one is found, atomically returns it and removes it from the
 // set available to future calls.
 // |hnd_info| is a value returned by PA_HND().
-zx_handle_t zx_get_startup_handle(uint32_t hnd_info);
+zx_handle_t zx_take_startup_handle(uint32_t hnd_info);
 
 zx_handle_t _zx_thread_self(void);
 zx_handle_t zx_thread_self(void);
@@ -30,3 +31,5 @@ zx_handle_t _zx_job_default(void);
 zx_handle_t zx_job_default(void);
 
 __END_CDECLS
+
+#endif // ZIRCON_PROCESS_H_

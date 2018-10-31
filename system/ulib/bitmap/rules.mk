@@ -8,11 +8,11 @@ MODULE := $(LOCAL_DIR)
 
 MODULE_TYPE := userlib
 
+MODULE_COMPILEFLAGS += -fvisibility=hidden
+
 MODULE_SRCS += \
     $(LOCAL_DIR)/raw-bitmap.cpp \
     $(LOCAL_DIR)/rle-bitmap.cpp \
-
-MODULE_SO_NAME := bitmap
 
 MODULE_STATIC_LIBS := \
     system/ulib/zx \
@@ -23,6 +23,6 @@ MODULE_LIBS := \
     system/ulib/zircon \
     system/ulib/c \
 
-MODULE_PACKAGE := shared
+MODULE_PACKAGE := src
 
 include make/module.mk

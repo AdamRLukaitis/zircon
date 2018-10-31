@@ -14,11 +14,12 @@
 #include <ddk/debug.h>
 #include <ddk/device.h>
 #include <ddk/driver.h>
-#include <ddk/protocol/platform-defs.h>
+#include <ddk/platform-defs.h>
 
 #include <zircon/assert.h>
 #include <zircon/process.h>
 #include <zircon/syscalls.h>
+#include <zircon/threads.h>
 
 #include "gauss.h"
 #include "gauss-hw.h"
@@ -53,7 +54,7 @@ static const pbus_dev_t i2c_test_dev = {
     .vid = PDEV_VID_GOOGLE,
     .pid = PDEV_PID_GAUSS,
     .did = PDEV_DID_GAUSS_I2C_TEST,
-    .i2c_channels = i2c_test_channels,
+    .i2c_channel_list = i2c_test_channels,
     .i2c_channel_count = countof(i2c_test_channels),
 };
 #endif
@@ -70,28 +71,13 @@ static const pbus_dev_t led_dev = {
     .vid = PDEV_VID_GOOGLE,
     .pid = PDEV_PID_GAUSS,
     .did = PDEV_DID_GAUSS_LED,
-    .i2c_channels = led_i2c_channels,
+    .i2c_channel_list = led_i2c_channels,
     .i2c_channel_count = countof(led_i2c_channels),
-};
-
-static zx_status_t gauss_get_initial_mode(void* ctx, usb_mode_t* out_mode) {
-    *out_mode = USB_MODE_HOST;
-    return ZX_OK;
-}
-
-static zx_status_t gauss_set_mode(void* ctx, usb_mode_t mode) {
-    gauss_bus_t* bus = ctx;
-    return gauss_usb_set_mode(bus, mode);
-}
-
-usb_mode_switch_protocol_ops_t usb_mode_switch_ops = {
-    .get_initial_mode = gauss_get_initial_mode,
-    .set_mode = gauss_set_mode,
 };
 
 static void gauss_bus_release(void* ctx) {
     gauss_bus_t* bus = ctx;
-    io_buffer_release(&bus->usb_phy);
+    mmio_buffer_release(&bus->usb_phy);
     zx_handle_close(bus->bti_handle);
     free(bus);
 }
@@ -128,33 +114,32 @@ static int gauss_start_thread(void* arg) {
     }
 
     // pinmux for Gauss i2c
-    gpio_set_alt_function(&bus->gpio, I2C_SCK_A, 1);
-    gpio_set_alt_function(&bus->gpio, I2C_SDA_A, 1);
-    gpio_set_alt_function(&bus->gpio, I2C_SCK_B, 1);
-    gpio_set_alt_function(&bus->gpio, I2C_SDA_B, 1);
+    gpio_impl_set_alt_function(&bus->gpio, I2C_SCK_A, 1);
+    gpio_impl_set_alt_function(&bus->gpio, I2C_SDA_A, 1);
+    gpio_impl_set_alt_function(&bus->gpio, I2C_SCK_B, 1);
+    gpio_impl_set_alt_function(&bus->gpio, I2C_SDA_B, 1);
 
     // Config pinmux for gauss PDM pins
-    gpio_set_alt_function(&bus->gpio, A113_GPIOA(14), 1);
-    gpio_set_alt_function(&bus->gpio, A113_GPIOA(15), 1);
-    gpio_set_alt_function(&bus->gpio, A113_GPIOA(16), 1);
-    gpio_set_alt_function(&bus->gpio, A113_GPIOA(17), 1);
-    gpio_set_alt_function(&bus->gpio, A113_GPIOA(18), 1);
+    gpio_impl_set_alt_function(&bus->gpio, A113_GPIOA(14), 1);
+    gpio_impl_set_alt_function(&bus->gpio, A113_GPIOA(15), 1);
+    gpio_impl_set_alt_function(&bus->gpio, A113_GPIOA(16), 1);
+    gpio_impl_set_alt_function(&bus->gpio, A113_GPIOA(17), 1);
+    gpio_impl_set_alt_function(&bus->gpio, A113_GPIOA(18), 1);
 
-    gpio_set_alt_function(&bus->gpio, TDM_BCLK_C, 1);
-    gpio_set_alt_function(&bus->gpio, TDM_FSYNC_C, 1);
-    gpio_set_alt_function(&bus->gpio, TDM_MOSI_C, 1);
-    gpio_set_alt_function(&bus->gpio, TDM_MISO_C, 2);
+    gpio_impl_set_alt_function(&bus->gpio, TDM_BCLK_C, 1);
+    gpio_impl_set_alt_function(&bus->gpio, TDM_FSYNC_C, 1);
+    gpio_impl_set_alt_function(&bus->gpio, TDM_MOSI_C, 1);
+    gpio_impl_set_alt_function(&bus->gpio, TDM_MISO_C, 2);
 
-    gpio_set_alt_function(&bus->gpio, SPK_MUTEn, 0);
-    gpio_config(&bus->gpio, SPK_MUTEn, GPIO_DIR_OUT);
-    gpio_write(&bus->gpio, SPK_MUTEn, 1);
+    gpio_impl_set_alt_function(&bus->gpio, SPK_MUTEn, 0);
+    gpio_impl_config_out(&bus->gpio, SPK_MUTEn, 1);
 
     if ((status = gauss_i2c_init(bus)) != ZX_OK) {
         zxlogf(ERROR, "gauss_i2c_init failed: %d\n", status);
         goto fail;
     }
 
-    status = a113_clk_init(bus->bti_handle, &bus->clocks);
+    status = a113_clk_init(&bus->clocks);
     if (status != ZX_OK) {
         zxlogf(ERROR, "a113_clk_init failed: %d\n",status);
         goto fail;
@@ -167,11 +152,6 @@ static int gauss_start_thread(void* arg) {
 
     zxlogf(INFO,"Requested sample rate = %d, actual = %ld\n",GAUSS_TDM_SAMPLE_RATE,
                                                        actual_freq / GAUSS_TDM_CLK_N);
-
-    status = pbus_set_protocol(&bus->pbus, ZX_PROTOCOL_USB_MODE_SWITCH, &bus->usb_mode_switch);
-    if (status != ZX_OK) {
-        goto fail;
-    }
 
     if ((status = gauss_pcie_init(bus)) != ZX_OK) {
         zxlogf(ERROR, "gauss_pcie_init failed: %d\n", status);
@@ -193,7 +173,12 @@ static int gauss_start_thread(void* arg) {
     }
 #endif
 
-    if ((status = pbus_device_add(&bus->pbus, &led_dev, 0)) != ZX_OK) {
+    if ((status = gauss_raw_nand_init(bus)) != ZX_OK) {
+        zxlogf(ERROR, "gauss_raw_nand_init failed: %d\n", status);
+        goto fail;
+    }
+
+    if ((status = pbus_device_add(&bus->pbus, &led_dev)) != ZX_OK) {
         zxlogf(ERROR, "a113_i2c_init could not add i2c_led_dev: %d\n", status);
         goto fail;
     }
@@ -210,7 +195,7 @@ static zx_status_t gauss_bus_bind(void* ctx, zx_device_t* parent) {
         return ZX_ERR_NO_MEMORY;
     }
 
-    zx_status_t status = device_get_protocol(parent, ZX_PROTOCOL_PLATFORM_BUS, &bus->pbus);
+    zx_status_t status = device_get_protocol(parent, ZX_PROTOCOL_PBUS, &bus->pbus);
     if (status != ZX_OK) {
         goto fail;
     }
@@ -228,8 +213,6 @@ static zx_status_t gauss_bus_bind(void* ctx, zx_device_t* parent) {
     }
 
     bus->parent = parent;
-    bus->usb_mode_switch.ops = &usb_mode_switch_ops;
-    bus->usb_mode_switch.ctx = bus;
 
    device_add_args_t args = {
         .version = DEVICE_ADD_ARGS_VERSION,
@@ -247,6 +230,7 @@ static zx_status_t gauss_bus_bind(void* ctx, zx_device_t* parent) {
     thrd_t t;
     int thrd_rc = thrd_create_with_name(&t, gauss_start_thread, bus, "gauss_start_thread");
     if (thrd_rc != thrd_success) {
+        status = thrd_status_to_zx_status(thrd_rc);
         goto fail;
     }
     return ZX_OK;
@@ -263,7 +247,7 @@ static zx_driver_ops_t gauss_bus_driver_ops = {
 };
 
 ZIRCON_DRIVER_BEGIN(gauss_bus, gauss_bus_driver_ops, "zircon", "0.1", 3)
-    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_PLATFORM_BUS),
+    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_PBUS),
     BI_ABORT_IF(NE, BIND_PLATFORM_DEV_VID, PDEV_VID_GOOGLE),
     BI_MATCH_IF(EQ, BIND_PLATFORM_DEV_PID, PDEV_PID_GAUSS),
 ZIRCON_DRIVER_END(gauss_bus)

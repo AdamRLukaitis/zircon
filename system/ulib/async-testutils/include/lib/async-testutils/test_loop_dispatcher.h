@@ -4,51 +4,80 @@
 
 #pragma once
 
-#include <zircon/listnode.h>
-
+#include <fbl/macros.h>
+#include <fbl/unique_ptr.h>
+#include <lib/async-testutils/dispatcher_stub.h>
+#include <lib/async-testutils/time-keeper.h>
 #include <lib/async/dispatcher.h>
 #include <lib/async/task.h>
 #include <lib/async/wait.h>
-#include <lib/async-testutils/async_stub.h>
-
 #include <lib/zx/port.h>
 #include <lib/zx/time.h>
+#include <zircon/listnode.h>
 
 namespace async {
 
-// A C++ implementation of async_t (to which this class can always be upcast),
-// providing an ecapsulation of the dispatch methods at the core of |TestLoop|.
-class TestLoopDispatcher : public AsyncStub {
+// An asynchronous dispatcher with an abstracted sense of time, controlled by an
+// external time-keeping object, for use in testing.
+class TestLoopDispatcher : public DispatcherStub, public TimerDispatcher {
 public:
-    TestLoopDispatcher(zx::time* current_time);
+    TestLoopDispatcher(TimeKeeper* time_keeper);
     ~TestLoopDispatcher();
+    DISALLOW_COPY_ASSIGN_AND_MOVE(TestLoopDispatcher);
 
-    // async_t operation implementations.
-    zx::time Now() override { return *current_time_; };
+    // async_dispatcher_t operation implementations.
+    zx::time Now() override;
     zx_status_t BeginWait(async_wait_t* wait) override;
     zx_status_t CancelWait(async_wait_t* wait) override;
     zx_status_t PostTask(async_task_t* task) override;
     zx_status_t CancelTask(async_task_t* task) override;
 
-    // Dispatches the next queued wait. This is non-blocking.
-    zx_status_t DispatchNextWait();
+    // TimerDispatcher operation implementation.
+    void FireTimer() override;
 
-    // Dispatch all posted tasks with deadlines up to |time|.
-    void DispatchTasks();
+    // Dispatches the next due task or wait. Returns true iff a message was
+    // dispatched.
+    bool DispatchNextDueMessage();
 
-    // Dispatch all waits and task - with deadlines less than or equal to
-    // |current_time| - with the |ASYNC_FLAG_HANDLE_SHUTDOWN| flag.
-    void Shutdown();
+    // Whether there are any due tasks or waits.
+    bool HasPendingWork();
+
+    // Returns the deadline of the next posted task if one is pending; else
+    // returns zx::time::infinite().
+    zx::time GetNextTaskDueTime();
 
 private:
-    zx::time* const current_time_;
+    // Moves due tasks from |task_list_| to |due_list_|.
+    void ExtractDueTasks();
 
-    // Doubly-linked lists of posted waits and tasks.
-    list_node_t task_list_;
-    list_node_t wait_list_;
+    // Dispatches the next due task.
+    void DispatchNextDueTask();
 
-    // Port on which waits are signaled.
+    // Dequeues from |port_| the next due packet. Must not be called if
+    // |due_packet_| is already non-null.
+    void ExtractNextDuePacket();
+
+    // Dispatches all remaining posted waits and tasks, invoking their handlers
+    // with status ZX_ERR_CANCELED.
+    void Shutdown();
+
+    // A reference to an external object that manages the current time and
+    // and timers.
+    TimeKeeper* const time_keeper_;
+
+    // Port on which waits and timer expirations from |time_keeper_| are
+    // signaled.
     zx::port port_;
+
+    // The most recent packet dequeued from |port_|.
+    fbl::unique_ptr<zx_port_packet_t> due_packet_;
+
+    // Pending tasks, earliest deadline first.
+    list_node_t task_list_;
+    // Due tasks, earliest deadlines first.
+    list_node_t due_list_;
+    // Pending waits, most recently added first.
+    list_node_t wait_list_;
 };
 
 } // namespace async

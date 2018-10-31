@@ -9,7 +9,7 @@
 
 // clang-format off
 
-#define BOOTLOADER_VERSION "0.7.3"
+#define BOOTLOADER_VERSION "0.7.10"
 
 #define NB_MAGIC              0xAA774217
 #define NB_DEBUGLOG_MAGIC     0xAEAE1123
@@ -33,6 +33,7 @@
 #define NB_WRITE             9   // arg=blocknum, data=data
 #define NB_CLOSE             10  // arg=0
 #define NB_LAST_DATA         11  // arg=offset, data=data
+#define NB_REBOOT            12  // arg=0
 
 #define NB_ACK                0 // arg=0 or -err, NB_READ: data=data
 #define NB_FILE_RECEIVED      0x70000001 // arg=size
@@ -59,10 +60,18 @@
 #define NB_IMAGE_PREFIX "<<image>>"
 #define NB_FVM_HOST_FILENAME "sparse.fvm"
 #define NB_FVM_FILENAME NB_IMAGE_PREFIX NB_FVM_HOST_FILENAME
+#define NB_BOOTLOADER_HOST_FILENAME "bootloader.img"
+#define NB_BOOTLOADER_FILENAME NB_IMAGE_PREFIX NB_BOOTLOADER_HOST_FILENAME
 #define NB_EFI_HOST_FILENAME "efi.img"
 #define NB_EFI_FILENAME NB_IMAGE_PREFIX NB_EFI_HOST_FILENAME
 #define NB_KERNC_HOST_FILENAME "kernc.img"
 #define NB_KERNC_FILENAME NB_IMAGE_PREFIX NB_KERNC_HOST_FILENAME
+#define NB_ZIRCONA_HOST_FILENAME "zircona.img"
+#define NB_ZIRCONA_FILENAME NB_IMAGE_PREFIX NB_ZIRCONA_HOST_FILENAME
+#define NB_ZIRCONB_HOST_FILENAME "zirconb.img"
+#define NB_ZIRCONB_FILENAME NB_IMAGE_PREFIX NB_ZIRCONB_HOST_FILENAME
+#define NB_ZIRCONR_HOST_FILENAME "zirconr.img"
+#define NB_ZIRCONR_FILENAME NB_IMAGE_PREFIX NB_ZIRCONR_HOST_FILENAME
 
 typedef struct nbmsg_t {
     uint32_t magic;

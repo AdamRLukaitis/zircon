@@ -8,100 +8,246 @@
 #include <ddk/binding.h>
 #include <ddk/device.h>
 #include <ddk/driver.h>
+#include <zircon/compiler.h>
 #include <zircon/types.h>
 #include <zircon/listnode.h>
 
+#include <fbl/intrusive_double_list.h>
+#include <fbl/new.h>
+#include <fbl/string.h>
+#include <fbl/unique_ptr.h>
+#include <lib/zx/job.h>
+#include <lib/zx/process.h>
+#include <lib/zx/vmo.h>
 #include <port/port.h>
 
-typedef struct dc_work work_t;
-typedef struct dc_pending pending_t;
-typedef struct dc_devhost devhost_t;
-typedef struct dc_device device_t;
-typedef struct dc_driver driver_t;
-typedef struct dc_devnode devnode_t;
+namespace devmgr {
 
-struct dc_work {
-    list_node_t node;
-    uint32_t op;
+struct Devhost;
+struct Devnode;
+
+struct Work {
+    fbl::DoublyLinkedListNodeState<Work*> node;
+    struct Node {
+        static fbl::DoublyLinkedListNodeState<Work*>& node_state(
+            Work& obj) {
+            return obj.node;
+        }
+    };
+
+    enum struct Op : uint32_t {
+        kIdle = 0,
+        kDeviceAdded = 1,
+        kDriverAdded = 2,
+    } op;
     uint32_t arg;
     void* ptr;
 };
 
-struct dc_pending {
-    list_node_t node;
+struct Pending {
+    Pending();
+
+    fbl::DoublyLinkedListNodeState<Pending*> node;
+    struct Node {
+        static fbl::DoublyLinkedListNodeState<Pending*>& node_state(
+            Pending& obj) {
+            return obj.node;
+        }
+    };
+
     void* ctx;
-    uint32_t op;
+    enum struct Op : uint32_t {
+        kBind = 1,
+        kSuspend = 2,
+    } op;
 };
 
-#define PENDING_BIND 1
-#define PENDING_SUSPEND 2
+struct Metadata {
+    fbl::DoublyLinkedListNodeState<fbl::unique_ptr<Metadata>> node;
+    struct Node {
+        static fbl::DoublyLinkedListNodeState<fbl::unique_ptr<Metadata>>& node_state(
+            Metadata& obj) {
+            return obj.node;
+        }
+    };
 
-struct dc_devhost {
-    port_handler_t ph;
-    zx_handle_t hrpc;
-    zx_handle_t proc;
-    zx_koid_t koid;
-    int32_t refcount;
-    uint32_t flags;
-    devhost_t* parent;
+    uint32_t type;
+    uint32_t length;
+    bool has_path;      // zero terminated string starts at data[length]
 
-    // list of all devices on this devhost
-    list_node_t devices;
+    char* Data() {
+        return reinterpret_cast<char*>(this + 1);
+    }
 
-    // listnode for this devhost in the all devhosts list
-    list_node_t anode;
+    const char* Data() const {
+        return reinterpret_cast<const char*>(this + 1);
+    }
 
-    // listnode for this devhost in the order-to-suspend list
-    list_node_t snode;
+    static zx_status_t Create(size_t data_len, fbl::unique_ptr<Metadata>* out) {
+        uint8_t* buf = new uint8_t[sizeof(Metadata) + data_len];
+        if (!buf) {
+            return ZX_ERR_NO_MEMORY;
+        }
+        new (buf) Metadata();
 
-    // listnode for this devhost in its parent devhost's list-of-children
-    list_node_t node;
+        out->reset(reinterpret_cast<Metadata*>(buf));
+        return ZX_OK;
+    }
 
-    // list of all cild devhosts of this devhost
-    list_node_t children;
+    // Implement a custom delete to deal with the allocation mechanism used in
+    // Create().  Since the ctor is private, all Metadata* will come from
+    // Create().
+    void operator delete(void* ptr) {
+        delete [] reinterpret_cast<uint8_t*>(ptr);
+    }
+
+ private:
+    Metadata() = default;
+
+    Metadata(const Metadata&) = delete;
+    Metadata& operator=(const Metadata&) = delete;
+
+    Metadata(Metadata&&) = delete;
+    Metadata& operator=(Metadata&&) = delete;
 };
 
 #define DEV_HOST_DYING 1
 #define DEV_HOST_SUSPEND 2
 
-struct dc_device {
+struct Device {
+    Device();
+    ~Device();
+
     zx_handle_t hrpc;
     uint32_t flags;
 
     port_handler_t ph;
 
-    devhost_t* host;
+    Devhost* host;
     const char* name;
     const char* libname;
-    const char* args;
-    work_t work;
-    int32_t refcount;
+    fbl::unique_ptr<const char[]> args;
+    Work work;
+    mutable int32_t refcount_;
     uint32_t protocol_id;
     uint32_t prop_count;
-    devnode_t* self;
-    devnode_t* link;
-    device_t* parent;
-    device_t* proxy;
+    Devnode* self;
+    Devnode* link;
+    Device* parent;
+    Device* proxy;
 
     // listnode for this device in its parent's
     // list-of-children
-    list_node_t node;
+    fbl::DoublyLinkedListNodeState<Device*> node;
+    struct Node {
+        static fbl::DoublyLinkedListNodeState<Device*>& node_state(
+            Device& obj) {
+            return obj.node;
+        }
+    };
 
     // listnode for this device in its devhost's
     // list-of-devices
-    list_node_t dhnode;
+    fbl::DoublyLinkedListNodeState<Device*> dhnode;
+    struct DevhostNode {
+        static fbl::DoublyLinkedListNodeState<Device*>& node_state(
+            Device& obj) {
+            return obj.dhnode;
+        }
+    };
 
     // list of all child devices of this device
-    list_node_t children;
+    fbl::DoublyLinkedList<Device*, Node> children;
 
     // list of outstanding requests from the devcoord
     // to this device's devhost, awaiting a response
-    list_node_t pending;
+    fbl::DoublyLinkedList<Pending*, Pending::Node> pending;
 
     // listnode for this device in the all devices list
-    list_node_t anode;
+    fbl::DoublyLinkedListNodeState<Device*> anode;
+    struct AllDevicesNode {
+        static fbl::DoublyLinkedListNodeState<Device*>& node_state(
+            Device& obj) {
+            return obj.anode;
+        }
+    };
 
-    zx_device_prop_t props[];
+    // Metadata entries associated to this device.
+    fbl::DoublyLinkedList<fbl::unique_ptr<Metadata>, Metadata::Node> metadata;
+
+    fbl::unique_ptr<zx_device_prop_t[]> props;
+
+    // Allocation backing |name| and |libname|
+    fbl::unique_ptr<char[]> name_alloc_;
+
+    // The AddRef and Release functions follow the contract for fbl::RefPtr.
+    void AddRef() const {
+        ++refcount_;
+    }
+
+    // Returns true when the last reference has been released.
+    bool Release() const {
+        const int32_t rc = refcount_;
+        --refcount_;
+        return rc == 1;
+    }
+};
+
+struct Devhost {
+    Devhost();
+
+    port_handler_t ph;
+    zx_handle_t hrpc;
+    zx::process proc;
+    zx_koid_t koid;
+    mutable int32_t refcount_;
+    uint32_t flags;
+    Devhost* parent;
+
+    // list of all devices on this devhost
+    fbl::DoublyLinkedList<Device*, Device::DevhostNode> devices;
+
+    // listnode for this devhost in the all devhosts list
+    fbl::DoublyLinkedListNodeState<Devhost*> anode;
+    struct AllDevhostsNode {
+        static fbl::DoublyLinkedListNodeState<Devhost*>& node_state(
+            Devhost& obj) {
+            return obj.anode;
+        }
+    };
+
+    // listnode for this devhost in the order-to-suspend list
+    fbl::DoublyLinkedListNodeState<Devhost*> snode;
+    struct SuspendNode {
+        static fbl::DoublyLinkedListNodeState<Devhost*>& node_state(
+            Devhost& obj) {
+            return obj.snode;
+        }
+    };
+
+    // listnode for this devhost in its parent devhost's list-of-children
+    fbl::DoublyLinkedListNodeState<Devhost*> node;
+    struct Node {
+        static fbl::DoublyLinkedListNodeState<Devhost*>& node_state(
+            Devhost& obj) {
+            return obj.node;
+        }
+    };
+
+    // list of all child devhosts of this devhost
+    fbl::DoublyLinkedList<Devhost*, Node> children;
+
+    // The AddRef and Release functions follow the contract for fbl::RefPtr.
+    void AddRef() const {
+        ++refcount_;
+    }
+
+    // Returns true when the last reference has been released.
+    bool Release() const {
+        const int32_t rc = refcount_;
+        --refcount_;
+        return rc == 1;
+    }
 };
 
 // This device is never destroyed
@@ -137,31 +283,44 @@ struct dc_device {
 // return to this state once made visible.
 #define DEV_CTX_INVISIBLE     0x80
 
-struct dc_driver {
-    const char* name;
-    const zx_bind_inst_t* binding;
-    uint32_t binding_size;
-    uint32_t flags;
-    struct list_node node;
-    const char* libname;
+struct Driver {
+    Driver() = default;
+
+    fbl::String name;
+    fbl::unique_ptr<const zx_bind_inst_t[]> binding;
+    // Binding size in number of bytes, not number of entries
+    // TODO: Change it to number of entries
+    uint32_t binding_size = 0;
+    uint32_t flags = 0;
+    zx::vmo dso_vmo;
+
+    fbl::DoublyLinkedListNodeState<Driver*> node;
+    struct Node {
+        static fbl::DoublyLinkedListNodeState<Driver*>& node_state(
+            Driver& obj) {
+            return obj.node;
+        }
+    };
+
+    fbl::String libname;
 };
 
 #define DRIVER_NAME_LEN_MAX 64
 
-zx_status_t devfs_publish(device_t* parent, device_t* dev);
-void devfs_unpublish(device_t* dev);
-void devfs_advertise(device_t* dev);
-void devfs_advertise_modified(device_t* dev);
+zx_status_t devfs_publish(Device* parent, Device* dev);
+void devfs_unpublish(Device* dev);
+void devfs_advertise(Device* dev);
+void devfs_advertise_modified(Device* dev);
 
-device_t* coordinator_init(zx_handle_t root_job);
-void coordinator(void);
+Device* coordinator_init(const zx::job& root_job);
+void coordinator();
 
-void dc_driver_added(driver_t* drv, const char* version);
+void load_driver(const char* path,
+                 void (*func)(Driver* drv, const char* version));
+void find_loadable_drivers(const char* path,
+                           void (*func)(Driver* drv, const char* version));
 
-void load_driver(const char* path);
-void find_loadable_drivers(const char* path);
-
-bool dc_is_bindable(driver_t* drv, uint32_t protocol_id,
+bool dc_is_bindable(const Driver* drv, uint32_t protocol_id,
                     zx_device_prop_t* props, size_t prop_count,
                     bool autobind);
 
@@ -171,11 +330,42 @@ bool dc_is_bindable(driver_t* drv, uint32_t protocol_id,
 // with those of remoteio messages so we avoid needing a
 // dedicated channel for forwarding OPEN operations.
 // Our opcodes set the high bit to avoid overlap.
-typedef struct {
+struct Message {
     zx_txid_t txid;     // FIDL message header
     uint32_t reserved0;
+
     uint32_t flags;
-    uint32_t op;
+
+    enum struct Op : uint32_t {
+        // This bit differentiates DC OPs from RIO OPs
+        kIdBit = 0x10000000,
+
+        // Coord->Host Ops
+        kCreateDeviceStub = 0x10000001,
+        kCreateDevice = 0x10000002,
+        kBindDriver = 0x10000003,
+        kConnectProxy = 0x10000004,
+        kSuspend = 0x10000005,
+
+        // Host->Coord Ops
+        kStatus = 0x10000010,
+        kAddDevice = 0x10000011,
+        kAddDeviceInvisible = 0x10000012,
+        kRemoveDevice = 0x10000013,  // also Coord->Host
+        kMakeVisible = 0x10000014,
+        kBindDevice = 0x10000015,
+        kGetTopoPath = 0x10000016,
+        kLoadFirmware = 0x10000017,
+        kGetMetadata = 0x10000018,
+        kAddMetadata = 0x10000019,
+        kPublishMetadata = 0x1000001a,
+
+        // Host->Coord Ops for DmCtl
+        kDmCommand = 0x10000020,
+        kDmOpenVirtcon = 0x10000021,
+        kDmWatch = 0x10000022,
+        kDmMexec = 0x10000023,
+    } op;
 
     union {
         zx_status_t status;
@@ -187,48 +377,26 @@ typedef struct {
     uint32_t argslen;
 
     uint8_t data[DC_MAX_DATA];
-} dc_msg_t;
+};
 
-typedef struct {
+struct Status {
     zx_txid_t txid;
     zx_status_t status;
-} dc_status_t;
+};
 
-// This bit differentiates DC OPs from RIO OPs
-#define DC_OP_ID_BIT                0x10000000
-
-// Coord->Host Ops
-#define DC_OP_CREATE_DEVICE_STUB    0x10000001
-#define DC_OP_CREATE_DEVICE         0x10000002
-#define DC_OP_BIND_DRIVER           0x10000003
-#define DC_OP_CONNECT_PROXY         0x10000004
-#define DC_OP_SUSPEND               0x10000005
-
-// Host->Coord Ops
-#define DC_OP_STATUS                0x10000010
-#define DC_OP_ADD_DEVICE            0x10000011
-#define DC_OP_ADD_DEVICE_INVISIBLE  0x10000012
-#define DC_OP_REMOVE_DEVICE         0x10000013  // also Coord->Host
-#define DC_OP_MAKE_VISIBLE          0x10000014
-#define DC_OP_BIND_DEVICE           0x10000015
-#define DC_OP_GET_TOPO_PATH         0x10000016
-#define DC_OP_LOAD_FIRMWARE         0x10000017
-
-// Host->Coord Ops for DmCtl
-#define DC_OP_DM_COMMAND            0x10000020
-#define DC_OP_DM_OPEN_VIRTCON       0x10000021
-#define DC_OP_DM_WATCH              0x10000022
-#define DC_OP_DM_MEXEC              0x10000023
 #define DC_PATH_MAX 1024
 
-zx_status_t dc_msg_pack(dc_msg_t* msg, uint32_t* len_out,
+zx_status_t dc_msg_pack(Message* msg, uint32_t* len_out,
                         const void* data, size_t datalen,
                         const char* name, const char* args);
-zx_status_t dc_msg_unpack(dc_msg_t* msg, size_t len, const void** data,
+zx_status_t dc_msg_unpack(Message* msg, size_t len, const void** data,
                           const char** name, const char** args);
-zx_status_t dc_msg_rpc(zx_handle_t h, dc_msg_t* msg, size_t msglen,
+zx_status_t dc_msg_rpc(zx_handle_t h, Message* msg, size_t msglen,
                        zx_handle_t* handles, size_t hcount,
-                       dc_status_t* rsp, size_t rsp_len,
+                       Status* rsp, size_t rsp_len, size_t* resp_actual,
                        zx_handle_t* outhandle);
 
 extern bool dc_asan_drivers;
+extern bool dc_launched_first_devhost;
+
+} // namespace devmgr

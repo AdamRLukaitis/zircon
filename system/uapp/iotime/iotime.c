@@ -9,11 +9,13 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <fs-management/ramdisk.h>
-#include <zircon/syscalls.h>
-#include <zircon/device/ramdisk.h>
-#include <zircon/device/block.h>
 #include <block-client/client.h>
+#include <fs-management/ramdisk.h>
+#include <zircon/device/block.h>
+#include <zircon/device/ramdisk.h>
+#include <zircon/syscalls.h>
+#include <zircon/time.h>
+#include <zircon/types.h>
 
 static uint64_t number(const char* str) {
     char* end;
@@ -52,14 +54,14 @@ static void bytes_per_second(uint64_t bytes, uint64_t nanos) {
     fprintf(stderr, "%g %s/s\n", rate, unit);
 }
 
-static zx_time_t iotime_posix(int is_read, int fd, size_t total, size_t bufsz) {
+static zx_duration_t iotime_posix(int is_read, int fd, size_t total, size_t bufsz) {
     void* buffer = malloc(bufsz);
     if (buffer == NULL) {
         fprintf(stderr, "error: out of memory\n");
         return ZX_TIME_INFINITE;
     }
 
-    zx_time_t t0 = zx_clock_get(ZX_CLOCK_MONOTONIC);
+    zx_time_t t0 = zx_clock_get_monotonic();
     size_t n = total;
     const char* fn_name = is_read ? "read" : "write";
     while (n > 0) {
@@ -75,22 +77,22 @@ static zx_time_t iotime_posix(int is_read, int fd, size_t total, size_t bufsz) {
         }
         n -= xfer;
     }
-    zx_time_t t1 = zx_clock_get(ZX_CLOCK_MONOTONIC);
+    zx_time_t t1 = zx_clock_get_monotonic();
 
-    return t1 - t0;
+    return zx_time_sub_time(t1, t0);
 }
 
 
 static int make_ramdisk(size_t blocks) {
     char ramdisk_path[PATH_MAX];
-    if (create_ramdisk(512, blocks / 512, ramdisk_path)) {
+    if (create_ramdisk(512, blocks / 512, ramdisk_path) != ZX_OK) {
         return -1;
     }
 
     return open(ramdisk_path, O_RDWR);
 }
 
-static zx_time_t iotime_block(int is_read, int fd, size_t total, size_t bufsz) {
+static zx_duration_t iotime_block(int is_read, int fd, size_t total, size_t bufsz) {
     if ((total % 4096) || (bufsz % 4096)) {
         fprintf(stderr, "error: total and buffer size must be multiples of 4K\n");
         return ZX_TIME_INFINITE;
@@ -99,7 +101,7 @@ static zx_time_t iotime_block(int is_read, int fd, size_t total, size_t bufsz) {
     return iotime_posix(is_read, fd, total, bufsz);
 }
 
-static zx_time_t iotime_fifo(char* dev, int is_read, int fd, size_t total, size_t bufsz) {
+static zx_duration_t iotime_fifo(char* dev, int is_read, int fd, size_t total, size_t bufsz) {
     zx_status_t r;
     zx_handle_t vmo;
     if ((r = zx_vmo_create(bufsz, 0, &vmo)) != ZX_OK) {
@@ -119,11 +121,7 @@ static zx_time_t iotime_fifo(char* dev, int is_read, int fd, size_t total, size_
         return ZX_TIME_INFINITE;
     }
 
-    txnid_t txnid;
-    if (ioctl_block_alloc_txn(fd, &txnid) != sizeof(txnid)) {
-        fprintf(stderr, "error: cannot allocate txn for '%s'\n", dev);
-        return ZX_TIME_INFINITE;
-    }
+    groupid_t group = 0;
 
     zx_handle_t dup;
     if ((r = zx_handle_duplicate(vmo, ZX_RIGHT_SAME_RIGHTS, &dup)) != ZX_OK) {
@@ -143,12 +141,12 @@ static zx_time_t iotime_fifo(char* dev, int is_read, int fd, size_t total, size_
         return ZX_TIME_INFINITE;
     }
 
-    zx_time_t t0 = zx_clock_get(ZX_CLOCK_MONOTONIC);
+    zx_time_t t0 = zx_clock_get_monotonic();
     size_t n = total;
     while (n > 0) {
         size_t xfer = (n > bufsz) ? bufsz : n;
         block_fifo_request_t request = {
-            .txnid = txnid,
+            .group = group,
             .vmoid = vmoid,
             .opcode = is_read ? BLOCKIO_READ : BLOCKIO_WRITE,
             .length = xfer / info.block_size,
@@ -161,8 +159,8 @@ static zx_time_t iotime_fifo(char* dev, int is_read, int fd, size_t total, size_
         }
         n -= xfer;
     }
-    zx_time_t t1 = zx_clock_get(ZX_CLOCK_MONOTONIC);
-    return t1 - t0;
+    zx_time_t t1 = zx_clock_get_monotonic();
+    return zx_time_sub_time(t1, t0);
 }
 
 static int usage(void) {
@@ -200,7 +198,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    zx_time_t res;
+    zx_duration_t res;
     if (!strcmp(argv[2], "posix")) {
         res = iotime_posix(is_read, fd, total, bufsz);
     } else if (!strcmp(argv[2], "block")) {

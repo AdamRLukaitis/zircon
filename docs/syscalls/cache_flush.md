@@ -9,7 +9,7 @@ zx_cache_flush - Flush CPU data and/or instruction caches
 ```
 #include <zircon/syscalls.h>
 
-zx_status_t zx_cache_flush(const void* addr, size_t len, uint32_t flags);
+zx_status_t zx_cache_flush(const void* addr, size_t size, uint32_t flags);
 ```
 
 ## DESCRIPTION
@@ -41,6 +41,10 @@ the thread may fault as it would for a data read.
 
 At least one of **ZX_CACHE_FLUSH_DATA** and **ZX_CACHE_FLUSH_INSN**
 must be included in *flags*.
+
+## RIGHTS
+
+TODO(ZX-2399)
 
 ## RETURN VALUE
 

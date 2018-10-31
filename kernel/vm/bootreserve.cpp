@@ -7,12 +7,14 @@
 #include <inttypes.h>
 #include <sys/types.h>
 
+#include <fbl/algorithm.h>
+#include <fbl/function.h>
+#include <trace.h>
 #include <vm/bootreserve.h>
+#include <vm/pmm.h>
 
 #include "vm_priv.h"
 
-#include <trace.h>
-#include <vm/pmm.h>
 
 #define LOCAL_TRACE MAX(VM_GLOBAL_TRACE, 0)
 
@@ -21,7 +23,7 @@ static reserve_range_t res[NUM_RESERVES];
 static size_t res_idx;
 
 void boot_reserve_init() {
-    /* add the kernel to the boot reserve list */
+    // add the kernel to the boot reserve list
     boot_reserve_add_range(get_kernel_base_phys(), get_kernel_size());
 }
 
@@ -68,8 +70,8 @@ void boot_reserve_wire() {
                 res[i].pa, res[i].pa + res[i].len - 1);
 
         size_t pages = ROUNDUP_PAGE_SIZE(res[i].len) / PAGE_SIZE;
-        size_t actual = pmm_alloc_range(res[i].pa, pages, &reserved_page_list);
-        if (actual != pages) {
+        zx_status_t status = pmm_alloc_range(res[i].pa, pages, &reserved_page_list);
+        if (status != ZX_OK) {
             printf("PMM: unable to reserve reserved range [%#" PRIxPTR ", %#" PRIxPTR "]\n",
                    res[i].pa, res[i].pa + res[i].len - 1);
             continue; // this is probably fatal but go ahead and continue
@@ -78,7 +80,7 @@ void boot_reserve_wire() {
 
     // mark all of the pages we allocated as WIRED
     vm_page_t* p;
-    list_for_every_entry (&reserved_page_list, p, vm_page_t, free.node) {
+    list_for_every_entry (&reserved_page_list, p, vm_page_t, queue_node) {
         p->state = VM_PAGE_STATE_WIRED;
     }
 }
@@ -121,3 +123,14 @@ retry:
     *alloc_range = {alloc_pa, alloc_len};
     return ZX_OK;
 }
+
+// Returns false and exits early if the callback returns false, true otherwise.
+bool boot_reserve_foreach(const fbl::Function<bool(const reserve_range_t)>& cb) {
+    for (size_t i = 0; i < res_idx; i++) {
+        if (!cb(res[i])) {
+            return false;
+        }
+    }
+
+    return true;
+};

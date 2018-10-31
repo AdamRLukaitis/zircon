@@ -7,7 +7,6 @@
 #pragma once
 
 #include <arch/arm64.h>
-#include <arch/spinlock.h>
 #include <kernel/align.h>
 #include <kernel/cpu.h>
 #include <reg.h>
@@ -38,8 +37,8 @@ struct arm64_percpu {
     // cpu number
     uint32_t cpu_num;
 
-    // is the cpu currently inside an interrupt handler
-    uint32_t in_irq;
+    // Whether blocking is disallowed.  See arch_blocking_disallowed().
+    uint32_t blocking_disallowed;
 } __CPU_ALIGN;
 
 void arch_init_cpu_map(uint cluster_count, const uint* cluster_cpus);
@@ -66,12 +65,13 @@ static inline uint32_t arm64_read_percpu_u32(size_t offset) {
     // a copy between
     __asm__ volatile("ldr %w[val], [x18, %[offset]]"
                      : [val] "=r"(val)
-                     : [offset] "I"(offset));
+                     : [offset] "Ir"(offset));
     return val;
 }
 
 static inline void arm64_write_percpu_u32(size_t offset, uint32_t val) {
-    __asm__("str %w[val], [x18, %[offset]]" ::[val] "r"(val), [offset] "I"(offset)
+    __asm__("str %w[val], [x18, %[offset]]"
+            ::[val] "r"(val), [offset] "Ir"(offset)
             : "memory");
 }
 
@@ -98,6 +98,8 @@ static inline uint arch_cpu_num_to_cpu_id(uint cpu) {
 
     return arm64_cpu_cpu_ids[cpu];
 }
+
+cpu_num_t arch_mpid_to_cpu_num(uint cluster, uint cpu);
 
 #define READ_PERCPU_FIELD32(field) \
     arm64_read_percpu_u32(offsetof(struct arm64_percpu, field))

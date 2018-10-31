@@ -46,7 +46,7 @@ constexpr uint8_t PCIE_CAP_ID_ENHANCED_ALLOCATION      = 0x14;
 /**
  * Structure definitions for capability PCIE_CAP_ID_MSI
  *
- * @see The PCI Local Bus specificiaion v3.0 Section 6.8.1
+ * @see The PCI Local Bus specification v3.0 Section 6.8.1
  */
 #define PCIE_CAP_MSI_CAP_HDR_SIZE               (offsetof(pcie_cap_msi_t, nopvm_32bit))
 #define PCIE_CAP_MSI_CTRL_PVM_SUPPORTED(ctrl)   ((ctrl & 0x0100) != 0)
@@ -234,7 +234,7 @@ public:
     PciReg16 data_reg() const { return data_; }
     PciReg32 mask_bits_reg() const { return mask_bits_; }
     PciReg32 pending_bits_reg() const { return pending_bits_; }
-    pcie_msi_block_t irq_block() const { return irq_block_; }
+    msi_block_t irq_block() const { return irq_block_; }
 
 private:
     // TODO(cja): Dragons here. irq_block_ is setup by PcieDevice rather than the init for
@@ -244,7 +244,7 @@ private:
     bool has_pvm_;
     bool is_64_bit_;
     unsigned int max_irqs_ = 0;
-    pcie_msi_block_t irq_block_;
+    msi_block_t irq_block_;
 
     // Cached registers
     PciReg16 ctrl_;

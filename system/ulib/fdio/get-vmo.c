@@ -8,9 +8,9 @@
 #include <zircon/process.h>
 #include <zircon/syscalls.h>
 
-#include <fdio/io.h>
-#include <fdio/remoteio.h>
-#include <fdio/vfs.h>
+#include <lib/fdio/io.h>
+#include <lib/fdio/remoteio.h>
+#include <lib/fdio/vfs.h>
 
 #define MIN_WINDOW (PAGE_SIZE * 4)
 #define MAX_WINDOW ((size_t)64 << 20)
@@ -18,7 +18,7 @@
 static zx_status_t read_at(fdio_t* io, void* buf, size_t len, off_t offset,
                            size_t* actual_len) {
     zx_status_t status;
-    while ((status = fdio_read_at(io, buf, len, offset)) == ZX_ERR_SHOULD_WAIT) {
+    while ((status = io->ops->read_at(io, buf, len, offset)) == ZX_ERR_SHOULD_WAIT) {
         status = fdio_wait(io, FDIO_EVT_READABLE, ZX_TIME_INFINITE, NULL);
         if (status != ZX_OK) {
             return status;
@@ -38,18 +38,15 @@ static zx_status_t read_file_into_vmo(fdio_t* io, zx_handle_t* out_vmo) {
     zx_handle_t current_vmar_handle = zx_vmar_root_self();
 
     vnattr_t attr;
-    int r = io->ops->misc(io, ZXRIO_STAT, 0, sizeof(attr), &attr, 0);
-    if (r < 0) {
+    zx_status_t status = io->ops->get_attr(io, &attr);
+    if (status != ZX_OK) {
         return ZX_ERR_BAD_HANDLE;
-    }
-    if (r < (int)sizeof(attr)) {
-        return ZX_ERR_IO;
     }
 
     uint64_t size = attr.size;
     uint64_t offset = 0;
 
-    zx_status_t status = zx_vmo_create(size, 0, out_vmo);
+    status = zx_vmo_create(size, 0, out_vmo);
     if (status != ZX_OK) {
         return status;
     }
@@ -79,9 +76,9 @@ static zx_status_t read_file_into_vmo(fdio_t* io, zx_handle_t* out_vmo) {
             size_t chunk = size < MAX_WINDOW ? size : MAX_WINDOW;
             size_t window = (chunk + PAGE_SIZE - 1) & -PAGE_SIZE;
             uintptr_t start = 0;
-            status = zx_vmar_map(
-                current_vmar_handle, 0, *out_vmo, offset, window,
-                ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE, &start);
+            status = zx_vmar_map(current_vmar_handle,
+                ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
+                0, *out_vmo, offset, window, &start);
             if (status != ZX_OK) {
                 zx_handle_close(*out_vmo);
                 return status;
@@ -123,15 +120,13 @@ static zx_status_t copy_file_vmo(fdio_t* io, zx_handle_t* out_vmo) {
         status = zx_handle_replace(
             vmo,
             ZX_RIGHTS_BASIC | ZX_RIGHTS_PROPERTY |
-            ZX_RIGHT_READ | ZX_RIGHT_EXECUTE | ZX_RIGHT_MAP,
+            ZX_RIGHT_READ | ZX_RIGHT_MAP,
             out_vmo);
-        if (status != ZX_OK) {
-            zx_handle_close(vmo);
-        }
     }
     return status;
 }
 
+__EXPORT
 zx_status_t fdio_get_vmo_copy(int fd, zx_handle_t* out_vmo) {
     fdio_t* io = fd_to_io(fd);
     if (io == NULL) {
@@ -142,6 +137,7 @@ zx_status_t fdio_get_vmo_copy(int fd, zx_handle_t* out_vmo) {
     return status;
 }
 
+__EXPORT
 zx_status_t fdio_get_vmo_clone(int fd, zx_handle_t* out_vmo) {
     fdio_t* io = fd_to_io(fd);
     if (io == NULL) {
@@ -152,10 +148,7 @@ zx_status_t fdio_get_vmo_clone(int fd, zx_handle_t* out_vmo) {
     return status;
 }
 
-zx_status_t fdio_get_vmo(int fd, zx_handle_t* out_vmo) {
-    return fdio_get_vmo_copy(fd, out_vmo);
-}
-
+__EXPORT
 zx_status_t fdio_get_vmo_exact(int fd, zx_handle_t* out_vmo) {
     fdio_t* io = fd_to_io(fd);
     if (io == NULL) {
@@ -167,8 +160,4 @@ zx_status_t fdio_get_vmo_exact(int fd, zx_handle_t* out_vmo) {
     fdio_release(io);
 
     return status;
-}
-
-zx_status_t fdio_get_exact_vmo(int fd, zx_handle_t* out_vmo) {
-    return fdio_get_vmo_exact(fd, out_vmo);
 }

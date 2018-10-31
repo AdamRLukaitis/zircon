@@ -15,7 +15,6 @@
 #include <fbl/auto_lock.h>
 #include <object/handle.h>
 #include <object/job_dispatcher.h>
-#include <object/port_dispatcher.h>
 #include <object/process_dispatcher.h>
 #include <object/vm_object_dispatcher.h>
 #include <pretty/sizes.h>
@@ -57,10 +56,11 @@ static void DumpProcessListKeyMap() {
     printf("#so: number of sockets\n");
     printf("#tm : number of timers\n");
     printf("#fi : number of fifos\n");
+    printf("#?? : number of all other handle types\n");
 }
 
 static const char* ObjectTypeToString(zx_obj_type_t type) {
-    static_assert(ZX_OBJ_TYPE_LAST == 27, "need to update switch below");
+    static_assert(ZX_OBJ_TYPE_LAST == 28, "need to update switch below");
 
     switch (type) {
         case ZX_OBJ_TYPE_PROCESS: return "process";
@@ -74,7 +74,7 @@ static const char* ObjectTypeToString(zx_obj_type_t type) {
         case ZX_OBJ_TYPE_LOG: return "log";
         case ZX_OBJ_TYPE_SOCKET: return "socket";
         case ZX_OBJ_TYPE_RESOURCE: return "resource";
-        case ZX_OBJ_TYPE_EVENT_PAIR: return "event-pair";
+        case ZX_OBJ_TYPE_EVENTPAIR: return "event-pair";
         case ZX_OBJ_TYPE_JOB: return "job";
         case ZX_OBJ_TYPE_VMAR: return "vmar";
         case ZX_OBJ_TYPE_FIFO: return "fifo";
@@ -85,6 +85,7 @@ static const char* ObjectTypeToString(zx_obj_type_t type) {
         case ZX_OBJ_TYPE_BTI: return "bti";
         case ZX_OBJ_TYPE_PROFILE: return "profile";
         case ZX_OBJ_TYPE_PMT: return "pmt";
+        case ZX_OBJ_TYPE_SUSPEND_TOKEN: return "suspend-token";
         default: return "???";
     }
 }
@@ -113,10 +114,12 @@ static uint32_t BuildHandleStats(const ProcessDispatcher& pd,
 // buffer as strings.
 static void FormatHandleTypeCount(const ProcessDispatcher& pd,
                                   char *buf, size_t buf_len) {
+    static_assert(ZX_OBJ_TYPE_LAST == 28, "need to update table below");
+
     uint32_t types[ZX_OBJ_TYPE_LAST] = {0};
     uint32_t handle_count = BuildHandleStats(pd, types, sizeof(types));
 
-    snprintf(buf, buf_len, "%4u: %3u %3u %3u %3u %3u %3u %3u %3u %3u %3u %3u",
+    snprintf(buf, buf_len, "%4u: %4u %3u %3u %3u %3u %3u %3u %3u %3u %3u %3u %3u",
              handle_count,
              types[ZX_OBJ_TYPE_JOB],
              types[ZX_OBJ_TYPE_PROCESS],
@@ -124,16 +127,22 @@ static void FormatHandleTypeCount(const ProcessDispatcher& pd,
              types[ZX_OBJ_TYPE_VMO],
              types[ZX_OBJ_TYPE_VMAR],
              types[ZX_OBJ_TYPE_CHANNEL],
-             types[ZX_OBJ_TYPE_EVENT] + types[ZX_OBJ_TYPE_EVENT_PAIR],
+             types[ZX_OBJ_TYPE_EVENT] + types[ZX_OBJ_TYPE_EVENTPAIR],
              types[ZX_OBJ_TYPE_PORT],
              types[ZX_OBJ_TYPE_SOCKET],
              types[ZX_OBJ_TYPE_TIMER],
-             types[ZX_OBJ_TYPE_FIFO]
+             types[ZX_OBJ_TYPE_FIFO],
+             types[ZX_OBJ_TYPE_INTERRUPT] + types[ZX_OBJ_TYPE_PCI_DEVICE] +
+             types[ZX_OBJ_TYPE_LOG] + types[ZX_OBJ_TYPE_RESOURCE] +
+             types[ZX_OBJ_TYPE_GUEST] + types[ZX_OBJ_TYPE_VCPU] +
+             types[ZX_OBJ_TYPE_IOMMU] + types[ZX_OBJ_TYPE_BTI] +
+             types[ZX_OBJ_TYPE_PROFILE] + types[ZX_OBJ_TYPE_PMT] +
+             types[ZX_OBJ_TYPE_SUSPEND_TOKEN]
              );
 }
 
 void DumpProcessList() {
-    printf("%7s  #h:  #jb #pr #th #vo #vm #ch #ev #po #so #tm #fi [name]\n", "id");
+    printf("%7s  #h:  #jb #pr #th #vo #vm #ch #ev #po #so #tm #fi #?? [name]\n", "id");
 
     auto walker = MakeProcessWalker([](ProcessDispatcher* process) {
         char handle_counts[(ZX_OBJ_TYPE_LAST * 4) + 1 + /*slop*/ 16];
@@ -150,9 +159,9 @@ void DumpProcessList() {
 }
 
 void DumpJobList() {
-    printf("All jobs from least to most important:\n");
+    printf("All jobs:\n");
     printf("%7s %s\n", "koid", "name");
-    JobDispatcher::ForEachJobByImportance([&](JobDispatcher* job) {
+    JobDispatcher::ForEachJob([&](JobDispatcher* job) {
         char name[ZX_MAX_NAME_LEN];
         job->get_name(name);
         printf("%7" PRIu64 " '%s'\n", job->get_koid(), name);
@@ -436,13 +445,13 @@ unsigned int arch_mmu_flags_to_vm_flags(unsigned int arch_mmu_flags) {
     }
     unsigned int ret = 0;
     if (arch_mmu_flags & ARCH_MMU_FLAG_PERM_READ) {
-        ret |= ZX_VM_FLAG_PERM_READ;
+        ret |= ZX_VM_PERM_READ;
     }
     if (arch_mmu_flags & ARCH_MMU_FLAG_PERM_WRITE) {
-        ret |= ZX_VM_FLAG_PERM_WRITE;
+        ret |= ZX_VM_PERM_WRITE;
     }
     if (arch_mmu_flags & ARCH_MMU_FLAG_PERM_EXECUTE) {
-        ret |= ZX_VM_FLAG_PERM_EXECUTE;
+        ret |= ZX_VM_PERM_EXECUTE;
     }
     return ret;
 }
@@ -489,6 +498,7 @@ public:
             u->vmo_koid = vmo->user_id();
             u->committed_pages = vmo->AllocatedPagesInRange(
                 map->object_offset(), map->size());
+            u->vmo_offset = map->object_offset();
             if (maps_.copy_array_to_user(&entry, 1, nelem_) != ZX_OK) {
                 return false;
             }
@@ -544,29 +554,6 @@ zx_status_t GetVmAspaceMaps(fbl::RefPtr<VmAspace> aspace,
 }
 
 namespace {
-zx_info_vmo_t VmoToInfoEntry(const VmObject* vmo,
-                             bool is_handle, zx_rights_t handle_rights) {
-    zx_info_vmo_t entry = {};
-    entry.koid = vmo->user_id();
-    vmo->get_name(entry.name, sizeof(entry.name));
-    entry.size_bytes = vmo->size();
-    entry.parent_koid = vmo->parent_user_id();
-    entry.num_children = vmo->num_children();
-    entry.num_mappings = vmo->num_mappings();
-    entry.share_count = vmo->share_count();
-    entry.flags =
-        (vmo->is_paged() ? ZX_INFO_VMO_TYPE_PAGED : ZX_INFO_VMO_TYPE_PHYSICAL) |
-        (vmo->is_cow_clone() ? ZX_INFO_VMO_IS_COW_CLONE : 0);
-    entry.committed_bytes = vmo->AllocatedPages() * PAGE_SIZE;
-    if (is_handle) {
-        entry.flags |= ZX_INFO_VMO_VIA_HANDLE;
-        entry.handle_rights = handle_rights;
-    } else {
-        entry.flags |= ZX_INFO_VMO_VIA_MAPPING;
-    }
-    return entry;
-}
-
 // Builds a list of all VMOs mapped into a VmAspace.
 class AspaceVmoEnumerator final : public VmEnumerator {
 public:
@@ -736,11 +723,6 @@ void DumpProcessMemoryUsage(const char* prefix, size_t min_pages) {
     GetRootJobDispatcher()->EnumerateChildren(&walker, /* recurse */ true);
 }
 
-static void DumpPortPacketInfo() {
-    const size_t count = PortPacket::DiagnosticAllocationCount();
-    printf("port packet allocation count: %zu\n", count);
-}
-
 static int mwd_thread(void* arg) {
     for (;;) {
         thread_sleep_relative(ZX_SEC(1));
@@ -763,7 +745,6 @@ static int cmd_diagnostics(int argc, const cmd_args* argv, uint32_t flags) {
         printf("                     : dump process/all/hidden VMOs\n");
         printf("                 -u? : fix all sizes to the named unit\n");
         printf("                       where ? is one of [BkMGTPE]\n");
-        printf("%s ppinfo            : port packet arena info\n", argv[0].str);
         printf("%s kill <pid>        : kill process\n", argv[0].str);
         printf("%s asd  <pid>|kernel : dump process/kernel address space\n",
                argv[0].str);
@@ -776,7 +757,7 @@ static int cmd_diagnostics(int argc, const cmd_args* argv, uint32_t flags) {
             mwd_limit = argv[2].u * 256;
         }
         if (!mwd_running) {
-            thread_t* t = thread_create("mwd", mwd_thread, nullptr, DEFAULT_PRIORITY, DEFAULT_STACK_SIZE);
+            thread_t* t = thread_create("mwd", mwd_thread, nullptr, DEFAULT_PRIORITY);
             if (t) {
                 mwd_running = true;
                 thread_resume(t);
@@ -795,7 +776,7 @@ static int cmd_diagnostics(int argc, const cmd_args* argv, uint32_t flags) {
             hwd_limit = argv[2].u;
         }
         if (!hwd_running) {
-            thread_t* t = thread_create("hwd", hwd_thread, nullptr, DEFAULT_PRIORITY, DEFAULT_STACK_SIZE);
+            thread_t* t = thread_create("hwd", hwd_thread, nullptr, DEFAULT_PRIORITY);
             if (t) {
                 hwd_running = true;
                 thread_resume(t);
@@ -824,10 +805,6 @@ static int cmd_diagnostics(int argc, const cmd_args* argv, uint32_t flags) {
         } else {
             DumpProcessVmObjects(argv[2].u, format_unit);
         }
-    } else if (strcmp(argv[1].str, "ppinfo") == 0) {
-        if (argc != 2)
-            goto usage;
-        DumpPortPacketInfo();
     } else if (strcmp(argv[1].str, "kill") == 0) {
         if (argc < 3)
             goto usage;

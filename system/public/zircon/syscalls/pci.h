@@ -17,11 +17,10 @@ __BEGIN_CDECLS
 // in the case of an MMIO bar, as well as a PIO addr/size pair for the memory region
 // to access if a PIO bar. In the latter case, the protocol will acquire the appropriate
 // permissions for the process to write to that PIO region on that architecture.
-typedef enum {
-    PCI_BAR_TYPE_UNUSED = 0,
-    PCI_BAR_TYPE_MMIO,
-    PCI_BAR_TYPE_PIO,
-} zx_pci_bar_types_t;
+typedef uint32_t zx_pci_bar_types_t;
+#define ZX_PCI_BAR_TYPE_UNUSED ((zx_pci_bar_types_t) 0u)
+#define ZX_PCI_BAR_TYPE_MMIO ((zx_pci_bar_types_t) 1u)
+#define ZX_PCI_BAR_TYPE_PIO ((zx_pci_bar_types_t) 2u)
 
 // TODO(cja): This makes some assumptions that anything in an arch's PIO region
 // is going to be defined as a base address and size. This will need to be
@@ -73,6 +72,12 @@ typedef struct zx_pcie_device_info {
 
 #define ZX_PCI_NO_IRQ_MAPPING UINT32_MAX
 
+// Used for zx_pci_init_arg_t::addr_windows::cfg_space_type
+#define PCI_CFG_SPACE_TYPE_PIO     (0u)
+#define PCI_CFG_SPACE_TYPE_MMIO    (1u)
+#define PCI_CFG_SPACE_TYPE_DW_ROOT (2u)  // Designware Root Bridge ECAM
+#define PCI_CFG_SPACE_TYPE_DW_DS   (3u)  // Designware Downstream ECAM
+
 // Dimensions: device id, function id, legacy pin number
 // ZX_PCI_NO_IRQ_MAPPING if no mapping specified.
 typedef uint32_t zx_pci_irq_swizzle_lut_t[ZX_PCI_MAX_DEVICES_PER_BUS]
@@ -91,26 +96,25 @@ typedef struct zx_pci_init_arg {
 
     uint32_t addr_window_count;
     struct {
-        bool is_mmio;
-        bool has_ecam;
         uint64_t base;
         size_t size;
         uint8_t bus_start;
         uint8_t bus_end;
+        uint8_t cfg_space_type;
+        bool has_ecam;
     } addr_windows[];
 } zx_pci_init_arg_t;
 
-#define ZX_PCI_INIT_ARG_MAX_ECAM_WINDOWS 1
+#define ZX_PCI_INIT_ARG_MAX_ECAM_WINDOWS 2
 #define ZX_PCI_INIT_ARG_MAX_SIZE (sizeof(((zx_pci_init_arg_t*)NULL)->addr_windows[0]) * \
                                   ZX_PCI_INIT_ARG_MAX_ECAM_WINDOWS + \
                                   sizeof(zx_pci_init_arg_t))
 
 // Enum used to select PCIe IRQ modes
-typedef enum {
-    ZX_PCIE_IRQ_MODE_DISABLED = 0,
-    ZX_PCIE_IRQ_MODE_LEGACY   = 1,
-    ZX_PCIE_IRQ_MODE_MSI      = 2,
-    ZX_PCIE_IRQ_MODE_MSI_X    = 3,
-} zx_pci_irq_mode_t;
+typedef uint32_t zx_pci_irq_mode_t;
+#define ZX_PCIE_IRQ_MODE_DISABLED ((zx_pci_irq_mode_t) 0u)
+#define ZX_PCIE_IRQ_MODE_LEGACY ((zx_pci_irq_mode_t) 1u)
+#define ZX_PCIE_IRQ_MODE_MSI ((zx_pci_irq_mode_t) 2u)
+#define ZX_PCIE_IRQ_MODE_MSI_X ((zx_pci_irq_mode_t) 3u)
 
 __END_CDECLS

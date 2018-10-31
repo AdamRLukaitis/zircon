@@ -11,10 +11,17 @@
 #include <threads.h>
 #include <unistd.h>
 
+#include <fbl/algorithm.h>
+#include <fbl/unique_fd.h>
+#include <lib/fdio/limits.h>
+#include <lib/fdio/util.h>
+
 #include "filesystems.h"
 #include "misc.h"
 
-bool test_append(void) {
+namespace {
+
+bool test_append() {
     BEGIN_TEST;
 
     char buf[4096];
@@ -72,8 +79,78 @@ bool test_append(void) {
     END_TEST;
 }
 
+bool TestAppendOnClone() {
+    BEGIN_TEST;
+
+    enum AppendState {
+        Append,
+        NoAppend,
+    };
+
+    auto verify_append = [](fbl::unique_fd& fd, AppendState appendState) {
+        BEGIN_HELPER;
+
+        // Ensure we have a file of non-zero size.
+        char buf[32];
+        memset(buf, 'a', sizeof(buf));
+        ASSERT_EQ(lseek(fd.get(), 0, SEEK_SET), 0);
+        ASSERT_EQ(write(fd.get(), buf, sizeof(buf)), sizeof(buf));
+        struct stat st;
+        ASSERT_EQ(fstat(fd.get(), &st), 0);
+        off_t size = st.st_size;
+
+        // Write at the 'start' of the file.
+        ASSERT_EQ(lseek(fd.get(), 0, SEEK_SET), 0);
+        ASSERT_EQ(write(fd.get(), buf, sizeof(buf)), sizeof(buf));
+        ASSERT_EQ(fstat(fd.get(), &st), 0);
+
+        switch (appendState) {
+        case Append:
+            // Even though we wrote to the 'start' of the file, it
+            // appends to the end if the file was opened as O_APPEND.
+            ASSERT_EQ(st.st_size, size + static_cast<off_t>(sizeof(buf)));
+            ASSERT_EQ(fcntl(fd.get(), F_GETFL), O_APPEND | O_RDWR);
+            break;
+        case NoAppend:
+            // We wrote to the start of the file, so the size
+            // should be unchanged.
+            ASSERT_EQ(st.st_size, size);
+            ASSERT_EQ(fcntl(fd.get(), F_GETFL), O_RDWR);
+            break;
+        default:
+            ASSERT_TRUE(false);
+        }
+        END_HELPER;
+    };
+
+    fbl::unique_fd fd(open("::append_clone", O_RDWR | O_CREAT | O_APPEND));
+    ASSERT_TRUE(fd);
+    // Verify the file was originally opened as append.
+    ASSERT_TRUE(verify_append(fd, Append));
+
+    // Verify we can toggle append off and back on.
+    ASSERT_EQ(fcntl(fd.get(), F_SETFL, 0), 0);
+    ASSERT_TRUE(verify_append(fd, NoAppend));
+    ASSERT_EQ(fcntl(fd.get(), F_SETFL, O_APPEND), 0);
+    ASSERT_TRUE(verify_append(fd, Append));
+
+    // Verify that cloning the fd doesn't lose the APPEND flag.
+    zx_handle_t handles[FDIO_MAX_HANDLES];
+    uint32_t types[FDIO_MAX_HANDLES];
+    uint32_t count = fdio_clone_fd(fd.get(), 0, handles, types);
+    ASSERT_GT(count, 0, "Didn't clone any handles");
+
+    int raw_fd;
+    ASSERT_EQ(fdio_create_fd(handles, types, count, &raw_fd), ZX_OK);
+    fbl::unique_fd cloned_fd(raw_fd);
+    ASSERT_TRUE(verify_append(cloned_fd, Append));
+
+    ASSERT_EQ(unlink("::append_clone"), 0);
+    END_TEST;
+}
+
 template <size_t kNumThreads>
-bool test_append_atomic(void) {
+bool TestAppendAtomic() {
     BEGIN_TEST;
 
     constexpr size_t kWriteLength = 32;
@@ -134,7 +211,7 @@ bool test_append_atomic(void) {
         ASSERT_EQ(memcmp(&buf[i], tmp, sizeof(tmp)), 0, "Non-atomic Append Detected");
     }
 
-    for (size_t i = 0; i < countof(counts); i++) {
+    for (size_t i = 0; i < fbl::count_of(counts); i++) {
         ASSERT_EQ(counts[i], kNumWrites, "Unexpected number of writes from a thread");
     }
 
@@ -143,10 +220,13 @@ bool test_append_atomic(void) {
     END_TEST;
 }
 
+}
+
 RUN_FOR_ALL_FILESYSTEMS(append_tests,
     RUN_TEST_MEDIUM(test_append)
-    RUN_TEST_MEDIUM((test_append_atomic<1>))
-    RUN_TEST_MEDIUM((test_append_atomic<2>))
-    RUN_TEST_MEDIUM((test_append_atomic<5>))
-    RUN_TEST_MEDIUM((test_append_atomic<10>))
+    RUN_TEST_MEDIUM(TestAppendOnClone)
+    RUN_TEST_MEDIUM((TestAppendAtomic<1>))
+    RUN_TEST_MEDIUM((TestAppendAtomic<2>))
+    RUN_TEST_MEDIUM((TestAppendAtomic<5>))
+    RUN_TEST_MEDIUM((TestAppendAtomic<10>))
 )

@@ -21,12 +21,13 @@ static int thread_sleep_test(void) {
         zx_duration_t actual_delay = current_time() - now;
         if (actual_delay < ZX_MSEC(500)) {
             early = 1;
-            printf("thread_sleep_relative(ZX_MSEC(500)) returned after %" PRIu64 " ns\n", actual_delay);
+            printf("thread_sleep_relative(ZX_MSEC(500)) returned after %" PRIi64 " ns\n", actual_delay);
         }
     }
     return early;
 }
 
-int sleep_tests(void) {
-    return thread_sleep_test();
+int sleep_tests(int, const cmd_args*, uint32_t) {
+    thread_sleep_test();
+    return 0;
 }

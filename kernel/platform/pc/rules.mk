@@ -33,10 +33,13 @@ MODULE_DEPS += \
     kernel/lib/cbuf \
     kernel/lib/gfxconsole \
     kernel/lib/fixed_point \
+    kernel/lib/lockdep \
     kernel/lib/memory_limit \
     kernel/lib/fbl \
     kernel/lib/pow2_range_allocator \
+    kernel/lib/smbios \
     kernel/lib/version \
+    kernel/lib/zbi \
     kernel/dev/interrupt \
     kernel/dev/pcie \
 

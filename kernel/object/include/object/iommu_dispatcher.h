@@ -6,16 +6,18 @@
 
 #pragma once
 
+#include <zircon/rights.h>
+
 #include <dev/iommu.h>
 #include <object/dispatcher.h>
 #include <fbl/canary.h>
 
 #include <sys/types.h>
 
-class IommuDispatcher final : public SoloDispatcher {
+class IommuDispatcher final : public SoloDispatcher<IommuDispatcher, ZX_DEFAULT_IOMMU_RIGHTS> {
 public:
     static zx_status_t Create(uint32_t type, fbl::unique_ptr<const uint8_t[]> desc,
-                              uint32_t desc_len, fbl::RefPtr<Dispatcher>* dispatcher,
+                              size_t desc_len, fbl::RefPtr<Dispatcher>* dispatcher,
                               zx_rights_t* rights);
 
     ~IommuDispatcher() final;

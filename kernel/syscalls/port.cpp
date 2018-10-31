@@ -14,7 +14,6 @@
 #include <object/process_dispatcher.h>
 
 #include <fbl/alloc_checker.h>
-#include <fbl/auto_lock.h>
 #include <fbl/ref_ptr.h>
 
 #include <zircon/syscalls/policy.h>
@@ -24,13 +23,9 @@
 
 #define LOCAL_TRACE 0
 
+// zx_status_t zx_port_create
 zx_status_t sys_port_create(uint32_t options, user_out_handle* out) {
     LTRACEF("options %u\n", options);
-
-    // No options are supported.
-    if (options != 0u)
-        return ZX_ERR_INVALID_ARGS;
-
     auto up = ProcessDispatcher::GetCurrent();
     zx_status_t result = up->QueryPolicy(ZX_POL_NEW_PORT);
     if (result != ZX_OK)
@@ -51,12 +46,9 @@ zx_status_t sys_port_create(uint32_t options, user_out_handle* out) {
     return result;
 }
 
-zx_status_t sys_port_queue(zx_handle_t handle, user_in_ptr<const zx_port_packet_t> packet_in, size_t count) {
+// zx_status_t zx_port_queue
+zx_status_t sys_port_queue(zx_handle_t handle, user_in_ptr<const zx_port_packet_t> packet_in) {
     LTRACEF("handle %x\n", handle);
-
-    // TODO(ZX-1291) Disallow 0u here.
-    if (count != 0u && count != 1u)
-        return ZX_ERR_INVALID_ARGS;
 
     auto up = ProcessDispatcher::GetCurrent();
 
@@ -73,13 +65,10 @@ zx_status_t sys_port_queue(zx_handle_t handle, user_in_ptr<const zx_port_packet_
     return port->QueueUser(packet);
 }
 
+// zx_status_t zx_port_wait
 zx_status_t sys_port_wait(zx_handle_t handle, zx_time_t deadline,
-                          user_out_ptr<zx_port_packet_t> packet_out, size_t count) {
+                          user_out_ptr<zx_port_packet_t> packet_out) {
     LTRACEF("handle %x\n", handle);
-
-    // TODO(ZX-1291) Disallow 0u here.
-    if (count != 0u && count != 1u)
-        return ZX_ERR_INVALID_ARGS;
 
     auto up = ProcessDispatcher::GetCurrent();
 
@@ -105,6 +94,7 @@ zx_status_t sys_port_wait(zx_handle_t handle, zx_time_t deadline,
     return ZX_OK;
 }
 
+// zx_status_t zx_port_cancel
 zx_status_t sys_port_cancel(zx_handle_t handle, zx_handle_t source, uint64_t key) {
     auto up = ProcessDispatcher::GetCurrent();
 
@@ -114,7 +104,7 @@ zx_status_t sys_port_cancel(zx_handle_t handle, zx_handle_t source, uint64_t key
         return status;
 
     {
-        fbl::AutoLock lock(up->handle_table_lock());
+        Guard<fbl::Mutex> guard{up->handle_table_lock()};
         Handle* watched = up->GetHandleLocked(source);
         if (!watched)
             return ZX_ERR_BAD_HANDLE;
@@ -122,7 +112,7 @@ zx_status_t sys_port_cancel(zx_handle_t handle, zx_handle_t source, uint64_t key
             return ZX_ERR_ACCESS_DENIED;
 
         auto dispatcher = watched->dispatcher();
-        if (!dispatcher->has_state_tracker())
+        if (!dispatcher->is_waitable())
             return ZX_ERR_NOT_SUPPORTED;
 
         bool had_observer = dispatcher->CancelByKey(watched, port.get(), key);

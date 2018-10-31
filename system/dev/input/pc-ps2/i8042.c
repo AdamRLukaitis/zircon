@@ -6,12 +6,13 @@
 #include <ddk/device.h>
 #include <ddk/driver.h>
 #include <ddk/protocol/hidbus.h>
-#include <zircon/device/input.h>
 #include <hw/inout.h>
 
+#include <zircon/input/c/fidl.h>
 #include <zircon/syscalls.h>
 #include <zircon/types.h>
 
+#include <hid/boot.h>
 #include <hid/usages.h>
 
 #include <stdio.h>
@@ -24,7 +25,7 @@
 
 typedef struct i8042_device {
     mtx_t lock;
-    hidbus_ifc_t* ifc;
+    hidbus_ifc_t ifc;
     void* cookie;
 
     zx_handle_t irq;
@@ -32,10 +33,10 @@ typedef struct i8042_device {
 
     int last_code;
 
-    int type;
+    zircon_input_BootProtocol type;
     union {
-        boot_kbd_report_t kbd;
-        boot_mouse_report_t mouse;
+        hid_boot_kbd_report_t kbd;
+        hid_boot_mouse_report_t mouse;
     } report;
 } i8042_device_t;
 
@@ -275,7 +276,7 @@ static const uint8_t mouse_hid_report_desc[] = {
     0xC0,              // End Collection
 };
 
-static const boot_kbd_report_t report_err_rollover = {
+static const hid_boot_kbd_report_t report_err_rollover = {
     .modifier = 1,
     .usage = {1, 1, 1, 1, 1, 1 }
 };
@@ -450,10 +451,10 @@ static void i8042_process_scode(i8042_device_t* dev, uint8_t scode, unsigned int
 
     //cprintf("i8042: scancode=0x%x, keyup=%u, multi=%u: usage=0x%x\n", scode, !!key_up, multi, usage);
 
-    const boot_kbd_report_t* report = rollover ? &report_err_rollover : &dev->report.kbd;
+    const hid_boot_kbd_report_t* report = rollover ? &report_err_rollover : &dev->report.kbd;
     mtx_lock(&dev->lock);
-    if (dev->ifc) {
-        dev->ifc->io_queue(dev->cookie, (const uint8_t*)report, sizeof(*report));
+    if (dev->ifc.ops) {
+        hidbus_ifc_io_queue(&dev->ifc, (const uint8_t*)report, sizeof(*report));
     }
     mtx_unlock(&dev->lock);
 }
@@ -481,9 +482,9 @@ static void i8042_process_mouse(i8042_device_t* dev, uint8_t data, unsigned int 
         dev->report.mouse.buttons &= 0x7;
 
         mtx_lock(&dev->lock);
-        if (dev->ifc) {
-            dev->ifc->io_queue(dev->cookie, (const uint8_t*)&dev->report.mouse,
-                               sizeof(dev->report.mouse));
+        if (dev->ifc.ops) {
+            hidbus_ifc_io_queue(&dev->ifc, (const uint8_t*)&dev->report.mouse,
+                            sizeof(dev->report.mouse));
         }
         mtx_unlock(&dev->lock);
         memset(&dev->report.mouse, 0, sizeof(dev->report.mouse));
@@ -499,52 +500,52 @@ static int i8042_irq_thread(void* arg) {
     // enable I/O port access
     // TODO
     zx_status_t status;
-    status = zx_mmap_device_io(get_root_resource(), I8042_COMMAND_REG, 1);
+    status = zx_ioports_request(get_root_resource(), I8042_COMMAND_REG, 1);
     if (status)
         return 0;
-    status = zx_mmap_device_io(get_root_resource(), I8042_DATA_REG, 1);
+    status = zx_ioports_request(get_root_resource(), I8042_DATA_REG, 1);
     if (status)
         return 0;
 
     for (;;) {
-         uint64_t slots;
-       status = zx_interrupt_wait(device->irq, &slots);
-        if (status == ZX_OK) {
-            // keep handling status on the controller until no bits are set we care about
-            bool retry;
-            do {
-                retry = false;
-
-                uint8_t str = i8042_read_status();
-
-                // check for incoming data from the controller
-                // TODO: deal with potential race between IRQ1 and IRQ12
-                if (str & I8042_STR_OBF) {
-                    uint8_t data = i8042_read_data();
-                    // TODO: should we check (str & I8042_STR_AUXDATA) before
-                    // handling this byte?
-                    if (device->type == INPUT_PROTO_KBD) {
-                        i8042_process_scode(device, data,
-                                            ((str & I8042_STR_PARITY) ? I8042_STR_PARITY : 0) |
-                                                ((str & I8042_STR_TIMEOUT) ? I8042_STR_TIMEOUT : 0));
-                    } else if (device->type == INPUT_PROTO_MOUSE) {
-                        i8042_process_mouse(device, data, 0);
-                    }
-                    retry = true;
-                }
-                // TODO check other status bits here
-            } while (retry);
+        status = zx_interrupt_wait(device->irq, NULL);
+        if (status != ZX_OK) {
+            break;
         }
+        // keep handling status on the controller until no bits are set we care about
+        bool retry;
+        do {
+            retry = false;
+
+            uint8_t str = i8042_read_status();
+
+            // check for incoming data from the controller
+            // TODO: deal with potential race between IRQ1 and IRQ12
+            if (str & I8042_STR_OBF) {
+                uint8_t data = i8042_read_data();
+                // TODO: should we check (str & I8042_STR_AUXDATA) before
+                // handling this byte?
+                if (device->type == zircon_input_BootProtocol_KBD) {
+                    i8042_process_scode(device, data,
+                                        ((str & I8042_STR_PARITY) ? I8042_STR_PARITY : 0) |
+                                        ((str & I8042_STR_TIMEOUT) ? I8042_STR_TIMEOUT : 0));
+                } else if (device->type == zircon_input_BootProtocol_MOUSE) {
+                    i8042_process_mouse(device, data, 0);
+                }
+                retry = true;
+            }
+            // TODO check other status bits here
+        } while (retry);
     }
     return 0;
 }
 
 static zx_status_t i8042_setup(uint8_t* ctr) {
     // enable I/O port access
-    zx_status_t status = zx_mmap_device_io(get_root_resource(), I8042_COMMAND_REG, 1);
+    zx_status_t status = zx_ioports_request(get_root_resource(), I8042_COMMAND_REG, 1);
     if (status)
         return status;
-    status = zx_mmap_device_io(get_root_resource(), I8042_DATA_REG, 1);
+    status = zx_ioports_request(get_root_resource(), I8042_DATA_REG, 1);
     if (status)
         return status;
 
@@ -614,20 +615,19 @@ static void i8042_identify(int (*cmd)(uint8_t* param, int command)) {
 static zx_status_t i8042_query(void* ctx, uint32_t options, hid_info_t* info) {
     i8042_device_t* i8042 = ctx;
     info->dev_num = i8042->type;  // use the type for the device number for now
-    info->dev_class = i8042->type;
+    info->device_class = i8042->type;
     info->boot_device = true;
     return ZX_OK;
 }
 
-static zx_status_t i8042_start(void* ctx, hidbus_ifc_t* ifc, void* cookie) {
+static zx_status_t i8042_start(void* ctx, const hidbus_ifc_t* ifc) {
     i8042_device_t* i8042 = ctx;
     mtx_lock(&i8042->lock);
-    if (i8042->ifc != NULL) {
+    if (i8042->ifc.ops != NULL) {
         mtx_unlock(&i8042->lock);
         return ZX_ERR_ALREADY_BOUND;
     }
-    i8042->ifc = ifc;
-    i8042->cookie = cookie;
+    i8042->ifc = *ifc;
     mtx_unlock(&i8042->lock);
     return ZX_OK;
 }
@@ -635,8 +635,8 @@ static zx_status_t i8042_start(void* ctx, hidbus_ifc_t* ifc, void* cookie) {
 static void i8042_stop(void* ctx) {
     i8042_device_t* i8042 = ctx;
     mtx_lock(&i8042->lock);
-    i8042->ifc = NULL;
-    i8042->cookie = NULL;
+    i8042->ifc.ops = NULL;
+    i8042->ifc.ctx = NULL;
     mtx_unlock(&i8042->lock);
 }
 
@@ -646,17 +646,17 @@ static zx_status_t i8042_get_descriptor(void* ctx, uint8_t desc_type,
         return ZX_ERR_INVALID_ARGS;
     }
 
-    if (desc_type != HID_DESC_TYPE_REPORT) {
+    if (desc_type != HID_DESCRIPTION_TYPE_REPORT) {
         return ZX_ERR_NOT_FOUND;
     }
 
     i8042_device_t* device = ctx;
     const uint8_t* buf = NULL;
     size_t buflen = 0;
-    if (device->type == INPUT_PROTO_KBD) {
+    if (device->type == zircon_input_BootProtocol_KBD) {
         buf = (void*)&kbd_hid_report_desc;
         buflen = sizeof(kbd_hid_report_desc);
-    } else if (device->type == INPUT_PROTO_MOUSE) {
+    } else if (device->type == zircon_input_BootProtocol_MOUSE) {
         buf = (void*)&mouse_hid_report_desc;
         buflen = sizeof(mouse_hid_report_desc);
     } else {
@@ -675,7 +675,7 @@ static zx_status_t i8042_get_report(void* ctx, uint8_t rpt_type, uint8_t rpt_id,
 }
 
 static zx_status_t i8042_set_report(void* ctx, uint8_t rpt_type, uint8_t rpt_id,
-        void* data, size_t len) {
+        const void* data, size_t len) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
@@ -708,48 +708,53 @@ static hidbus_protocol_ops_t hidbus_ops = {
     .set_protocol = i8042_set_protocol,
 };
 
+static void i8042_cleanup_irq_thread(i8042_device_t* dev) {
+    zx_interrupt_destroy(dev->irq);
+    thrd_join(dev->irq_thread, NULL);
+    zx_handle_close(dev->irq);
+}
+
 static void i8042_release(void* ctx) {
     i8042_device_t* i8042 = ctx;
+    i8042_cleanup_irq_thread(i8042);
     free(i8042);
 }
 
 static zx_protocol_device_t i8042_dev_proto = {
-     .version = DEVICE_OPS_VERSION,
-   .release = i8042_release,
+    .version = DEVICE_OPS_VERSION,
+    .release = i8042_release,
 };
 
 static zx_status_t i8042_dev_init(i8042_device_t* dev, const char* name, zx_device_t* parent) {
     // enable device port
-    int cmd = dev->type == INPUT_PROTO_KBD ?
+    int cmd = dev->type == zircon_input_BootProtocol_KBD ?
         I8042_CMD_CTL_KBD_DIS : I8042_CMD_CTL_MOUSE_DIS;
     i8042_command(NULL, cmd);
 
     // TODO: use identity to determine device type, rather than assuming aux ==
     // mouse
-    i8042_identify(dev->type == INPUT_PROTO_KBD ?
+    i8042_identify(dev->type == zircon_input_BootProtocol_KBD ?
             i8042_dev_command : i8042_aux_command);
 
-    cmd = dev->type == INPUT_PROTO_KBD ?
+    cmd = dev->type == zircon_input_BootProtocol_KBD ?
         I8042_CMD_CTL_KBD_EN : I8042_CMD_CTL_MOUSE_EN;
     i8042_command(NULL, cmd);
 
-    uint32_t interrupt = dev->type == INPUT_PROTO_KBD ?
+    uint32_t interrupt = dev->type == zircon_input_BootProtocol_KBD ?
         ISA_IRQ_KEYBOARD : ISA_IRQ_MOUSE;
-    zx_status_t status = zx_interrupt_create(get_root_resource(), 0, &(dev->irq));
+
+    zx_status_t status = zx_interrupt_create(get_root_resource(), interrupt,
+                        ZX_INTERRUPT_REMAP_IRQ, &dev->irq);
     if (status != ZX_OK) {
-        return status;
-    }
-    status = zx_interrupt_bind(dev->irq, 0, get_root_resource(), interrupt, ZX_INTERRUPT_REMAP_IRQ);
-    if (status != ZX_OK) {
-        zx_handle_close(dev->irq);
         return status;
     }
 
         // create irq thread
-    const char* tname = dev->type == INPUT_PROTO_KBD ?
+    const char* tname = dev->type == zircon_input_BootProtocol_KBD ?
         "i8042-kbd-irq" : "i8042-mouse-irq";
     int ret = thrd_create_with_name(&dev->irq_thread, i8042_irq_thread, dev, tname);
     if (ret != thrd_success) {
+        zx_handle_close(dev->irq);
         return ZX_ERR_BAD_STATE;
     }
 
@@ -762,7 +767,11 @@ static zx_status_t i8042_dev_init(i8042_device_t* dev, const char* name, zx_devi
         .proto_ops = &hidbus_ops,
     };
 
-    return device_add(parent, &args, NULL);
+    status = device_add(parent, &args, NULL);
+    if (status != ZX_OK) {
+        i8042_cleanup_irq_thread(dev);
+    }
+    return status;
 }
 
 static int i8042_init_thread(void* arg) {
@@ -795,7 +804,7 @@ static int i8042_init_thread(void* arg) {
         return ZX_ERR_NO_MEMORY;
 
     mtx_init(&kbd_device->lock, mtx_plain);
-    kbd_device->type = INPUT_PROTO_KBD;
+    kbd_device->type = zircon_input_BootProtocol_KBD;
     status = i8042_dev_init(kbd_device, "i8042-keyboard", parent);
     if (status != ZX_OK) {
         free(kbd_device);
@@ -807,7 +816,7 @@ static int i8042_init_thread(void* arg) {
         mouse_device = calloc(1, sizeof(i8042_device_t));
         if (mouse_device) {
             mtx_init(&mouse_device->lock, mtx_plain);
-            mouse_device->type = INPUT_PROTO_MOUSE;
+            mouse_device->type = zircon_input_BootProtocol_MOUSE;
             status = i8042_dev_init(mouse_device, "i8042-mouse", parent);
             if (status != ZX_OK) {
                 free(mouse_device);

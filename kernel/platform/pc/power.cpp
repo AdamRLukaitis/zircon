@@ -5,9 +5,10 @@
 // https://opensource.org/licenses/MIT
 //
 
-#include <arch/x86/apic.h>
 #include <arch/mp.h>
 #include <arch/x86.h>
+#include <arch/x86/apic.h>
+#include <arch/x86/feature.h>
 #include <arch/x86/mp.h>
 #include <fbl/atomic.h>
 #include <stdio.h>
@@ -17,11 +18,8 @@
 #include <platform/keyboard.h>
 
 #include <lib/console.h>
-#include <lib/version.h>
-
-#if WITH_LIB_DEBUGLOG
 #include <lib/debuglog.h>
-#endif
+#include <lib/version.h>
 
 // The I/O port to write to for QEMU debug exit.
 const uint16_t kQEMUDebugExitPort = 0xf4;
@@ -34,11 +32,9 @@ static_assert(kQEMUExitCode != 0 && kQEMUExitCode % 2 != 0,
               "QEMU exit code must be non-zero and odd.");
 
 static void reboot(void) {
-    // Try legacy reboot path first
+    x86_get_microarch_config()->reboot_system();
+    // We fell through. Try rebooting via keyboard controller.
     pc_keyboard_reboot();
-
-    // Try 100-Series Chipset Reset Control Register: CPU + SYS Reset
-    outp(0xCF9, 0x06);
 }
 
 static fbl::atomic<cpu_mask_t> halted_cpus(0);
@@ -78,9 +74,7 @@ void platform_panic_start(void) {
 
     static fbl::atomic<int> panic_started(0);
     if (panic_started.exchange(1) == 0) {
-#if WITH_LIB_DEBUGLOG
         dlog_bluescreen_init();
-#endif
     }
 
     halt_other_cpus();
@@ -104,7 +98,6 @@ void platform_halt(
         printf("Power off failed, halting\n");
         break;
     case HALT_ACTION_REBOOT:
-    case HALT_ACTION_REBOOT_BOOTLOADER:
         printf("Rebooting...\n");
         reboot();
         printf("Reboot failed, halting\n");
@@ -113,12 +106,16 @@ void platform_halt(
         printf("Halting...\n");
         halt_other_cpus();
         break;
+    case HALT_ACTION_REBOOT_BOOTLOADER:
+    case HALT_ACTION_REBOOT_RECOVERY:
+        printf("platform_halt: Unsupported halt reason %d\n", suggested_action);
+        break;
     }
 
-#if WITH_LIB_DEBUGLOG
-    thread_print_current_backtrace();
-    dlog_bluescreen_halt();
-#endif
+    if (reason == HALT_REASON_SW_PANIC) {
+        thread_print_current_backtrace();
+        dlog_bluescreen_halt();
+    }
 
     if (!halt_on_panic) {
         printf("Rebooting...\n");

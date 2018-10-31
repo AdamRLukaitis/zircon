@@ -2,6 +2,7 @@
 
 ## Handles
 + [handle_close](syscalls/handle_close.md) - close a handle
++ [handle_close_many](syscalls/handle_close_many.md) - close several handles
 + [handle_duplicate](syscalls/handle_duplicate.md) - create a duplicate handle (optionally with reduced rights)
 + [handle_replace](syscalls/handle_replace.md) - create a new handle (optionally with reduced rights) and destroy the old one
 
@@ -35,12 +36,12 @@
 ## Jobs
 + [job_create](syscalls/job_create.md) - create a new job within a job
 + [job_set_policy](syscalls/job_set_policy.md) - modify policies for a job and its descendants
-+ [job_set_relative_importance](syscalls/job_set_relative_importance.md) - update a global ordering of jobs
 
 ## Tasks (Thread, Process, or Job)
 + [task_bind_exception_port](syscalls/task_bind_exception_port.md) - attach an exception port to a task
 + [task_kill](syscalls/task_kill.md) - cause a task to stop running
 + [task_resume](syscalls/task_resume.md) - cause a suspended task to continue running
++ [task_resume_from_exception](syscalls/task_resume_from_exception.md) - resume a task from a previously caught exception
 + [task_suspend](syscalls/task_suspend.md) - cause a task to be suspended
 
 ## Channels
@@ -83,6 +84,7 @@
 + [vmo_get_size](syscalls/vmo_get_size.md) - obtain the size of a vmo
 + [vmo_set_size](syscalls/vmo_set_size.md) - adjust the size of a vmo
 + [vmo_op_range](syscalls/vmo_op_range.md) - perform an operation on a range of a vmo
++ [vmo_replace_as_executable](syscall/vmo_replace_as_executable.md) - add execute rights to a vmo
 
 ## Virtual Memory Address Regions (VMARs)
 + [vmar_allocate](syscalls/vmar_allocate.md) - create a new child VMAR
@@ -98,6 +100,7 @@
 ## Time
 + [nanosleep](syscalls/nanosleep.md) - sleep for some number of nanoseconds
 + [clock_get](syscalls/clock_get.md) - read a system clock
++ [clock_get_monotonic](syscalls/clock_get_monotonic.md) - read the monotonic system clock
 + [ticks_get](syscalls/ticks_get.md) - read high-precision timer ticks
 + [ticks_per_second](syscalls/ticks_per_second.md) - read the number of high-precision timer ticks in a second
 
@@ -134,14 +137,15 @@
 
 ## DDK
 + [cache_flush](syscalls/cache_flush.md) - Flush CPU data and/or instruction caches
-+ [interrupt_create](syscalls/interrupt_create.md) - Create an interrupt object
-+ [interrupt_bind](syscalls/interrupt_bind.md) - Bind an interrupt vector to interrupt object
-+ [interrupt_wait](syscalls/interrupt_wait.md) - Wait for an interrupt on an interrupt object
-+ [interrupt_get_timestamp](syscalls/interrupt_get_timestamp.md) - Get the timestamp for an interrupt
-+ [interrupt_signal](syscalls/interrupt_signal.md) - Signals a virtual interrupt on an interrupt object
++ [interrupt_ack](syscalls/interrupt_ack.md) - Acknowledge an interrupt object
++ [interrupt_bind](syscalls/interrupt_bind.md) - Bind an interrupt object to a port
++ [interrupt_create](syscalls/interrupt_create.md) - Create a physical or virtual interrupt object
++ [interrupt_destroy](syscalls/interrupt_destroy.md) - Destroy an interrupt object
++ [interrupt_trigger](syscalls/interrupt_trigger.md) - Trigger a virtual interrupt object
++ [interrupt_wait](syscalls/interrupt_wait.md) - Wait on an interrupt object
++ [smc_call](syscalls/smc_call.md) - Make an SMC call from user space
 + acpi_uefi_rsdp
-+ mmap_device_io
-+ set_framebuffer
-+ set_framebuffer_vmo
++ ioports_request
++ framebuffer_set_range
 + vmo_create_contiguous
 + vmo_create_physical

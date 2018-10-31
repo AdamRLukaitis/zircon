@@ -3,7 +3,8 @@
 // found in the LICENSE file.
 
 #include <zircon/types.h>
-#include <fdio/io.h>
+#include <lib/fdio/io.h>
+#include <lib/fdio/util.h>
 #include <dirent.h>
 #include <endian.h>
 #include <fcntl.h>
@@ -14,16 +15,39 @@
 #include <unistd.h>
 #include <limits.h>
 
+#include <zircon/assert.h>
+#include <zircon/syscalls.h>
 #include <zircon/hw/usb.h>
 #include <zircon/hw/usb-hid.h>
-#include <zircon/device/usb.h>
+#include <zircon/usb/device/c/fidl.h>
 #include <pretty/hexdump.h>
 
-#define DEV_USB "/dev/class/usb"
+#define DEV_USB "/dev/class/usb-device"
 
-static void get_string_desc(int fd, int index, char* buf, int buflen) {
-    buf[0] = 0;
-    ioctl_usb_get_string_desc(fd, &index, buf, buflen);
+#define EN_US 0x0409
+
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+
+static void get_string_desc(zx_handle_t svc, uint8_t desc_id, char* buffer, size_t buffer_size) {
+    if (desc_id) {
+        // Default to asking for US english.
+        zx_status_t status;
+        size_t actual;
+        uint16_t actual_lang_id;
+        zx_status_t res = zircon_usb_device_DeviceGetStringDescriptor(svc, desc_id, EN_US, &status,
+                                                                      (uint8_t*)buffer, buffer_size,
+                                                                      &actual, &actual_lang_id);
+        if (res == ZX_OK) res = status;
+        if (res == ZX_OK) {
+            if (actual < buffer_size) {
+                buffer[actual] = 0;
+            }
+        } else {
+            snprintf(buffer, buffer_size, "<err %d>", res);
+        }
+    } else {
+        snprintf(buffer, buffer_size, "<none>");
+    }
 }
 
 static const char* usb_speeds[] = {
@@ -34,40 +58,30 @@ static const char* usb_speeds[] = {
     "SUPER",
 };
 
-static int do_list_device(int fd, int configuration, bool verbose, const char* devname, int depth,
-                          int max_depth) {
+static int do_list_device(zx_handle_t svc, int configuration, bool verbose, const char* devname,
+                          int depth, int max_depth) {
     usb_device_descriptor_t device_desc;
-    char manufacturer[256];
-    char product[256];
-    manufacturer[0] = 0;
-    product[0] = 0;
+    char manufacturer[zircon_usb_device_MAX_STRING_DESC_SIZE];
+    char product[zircon_usb_device_MAX_STRING_DESC_SIZE];;
     ssize_t ret = 0;
 
-    int device_type;
-    ret = ioctl_usb_get_device_type(fd, &device_type);
-    if (ret != sizeof(device_type)) {
-        printf("IOCTL_USB_GET_DEVICE_TYPE failed for %s/%s\n", DEV_USB, devname);
-        return ret;
-    }
-    if (device_type != USB_DEVICE_TYPE_DEVICE) {
-        return ret;
-    }
-
-    ret = ioctl_usb_get_device_desc(fd, &device_desc);
-    if (ret != sizeof(device_desc)) {
-        printf("IOCTL_USB_GET_DEVICE_DESC failed for %s/%s\n", DEV_USB, devname);
+    size_t actual;
+    ret = zircon_usb_device_DeviceGetDeviceDescriptor(svc, (uint8_t*)&device_desc,
+                                                      sizeof(device_desc), &actual);
+    if (ret != ZX_OK || actual != sizeof(device_desc)) {
+        printf("DeviceGetDeviceDescriptor failed for %s/%s\n", DEV_USB, devname);
         return ret;
     }
 
-    int speed;
-    ret = ioctl_usb_get_device_speed(fd, &speed);
-    if (ret != sizeof(speed) || speed < 0 || (size_t)speed >= countof(usb_speeds)) {
-        printf("IOCTL_USB_GET_DEVICE_SPEED failed for %s/%s\n", DEV_USB, devname);
+    uint32_t speed;
+    ret = zircon_usb_device_DeviceGetDeviceSpeed(svc, &speed);
+    if (ret != ZX_OK || speed >= countof(usb_speeds)) {
+        printf("DeviceGetDeviceSpeed failed for %s/%s\n", DEV_USB, devname);
         return ret;
     }
 
-    get_string_desc(fd, device_desc.iManufacturer, manufacturer, sizeof(manufacturer));
-    get_string_desc(fd, device_desc.iProduct, product, sizeof(product));
+    get_string_desc(svc, device_desc.iManufacturer, manufacturer, sizeof(manufacturer));
+    get_string_desc(svc, device_desc.iProduct, product, sizeof(product));
 
     int left_pad = depth * 4;
     int right_pad = (max_depth - depth) * 4;
@@ -76,7 +90,7 @@ static int do_list_device(int fd, int configuration, bool verbose, const char* d
            manufacturer, product);
 
     if (verbose) {
-        char string_buf[256];
+        char string_buf[zircon_usb_device_MAX_STRING_DESC_SIZE];;
 
         // print device descriptor
         printf("Device Descriptor:\n");
@@ -94,19 +108,25 @@ static int do_list_device(int fd, int configuration, bool verbose, const char* d
                                                             le16toh(device_desc.bcdDevice) & 0xFF);
         printf("  iManufacturer                   %d %s\n", device_desc.iManufacturer, manufacturer);
         printf("  iProduct                        %d %s\n", device_desc.iProduct, product);
-        get_string_desc(fd, device_desc.iSerialNumber, string_buf, sizeof(string_buf));
+        get_string_desc(svc, device_desc.iSerialNumber, string_buf, sizeof(string_buf));
         printf("  iSerialNumber                   %d %s\n", device_desc.iSerialNumber, string_buf);
         printf("  bNumConfigurations              %d\n", device_desc.bNumConfigurations);
 
         if (configuration == -1) {
-            ret = ioctl_usb_get_configuration(fd, &configuration);
-            if (ret != sizeof(configuration)) return ret;
+            uint8_t config;
+            ret = zircon_usb_device_DeviceGetConfiguration(svc, &config);
+            if (ret != ZX_OK) return ret;
+            configuration = config;
         }
 
-        int desc_size;
-        ret = ioctl_usb_get_config_desc_size(fd, &configuration, &desc_size);
-        if (ret != sizeof(desc_size)) {
-            printf("IOCTL_USB_GET_CONFIG_DESC_SIZE failed for %s/%s\n", DEV_USB, devname);
+        // Read header of configuration descriptor to get total length.
+        zx_status_t status;
+        uint16_t desc_size;
+        ret = zircon_usb_device_DeviceGetConfigurationDescriptorSize(svc, configuration, &status,
+                                                                     &desc_size);
+        if (ret == ZX_OK) ret = status;
+        if (ret != ZX_OK) {
+            printf("GetConfigurationDescriptor failed for %s/%s\n", DEV_USB, devname);
             return ret;
         }
 
@@ -116,9 +136,11 @@ static int do_list_device(int fd, int configuration, bool verbose, const char* d
             return ret;
         }
 
-        ret = ioctl_usb_get_config_desc(fd, &configuration, desc, desc_size);
-        if (ret != desc_size) {
-            printf("IOCTL_USB_GET_CONFIG_DESC failed for %s/%s\n", DEV_USB, devname);
+        ret = zircon_usb_device_DeviceGetConfigurationDescriptor(svc, configuration, &status, desc,
+                                                                 desc_size, &actual);
+        if (ret == ZX_OK) ret = status;
+        if (ret != ZX_OK || actual != desc_size) {
+            printf("GetConfigurationDescriptor failed for %s/%s\n", DEV_USB, devname);
             goto free_out;
         }
 
@@ -132,7 +154,7 @@ static int do_list_device(int fd, int configuration, bool verbose, const char* d
         printf("    wTotalLength                  %d\n", le16toh(config_desc->wTotalLength));
         printf("    bNumInterfaces                %d\n", config_desc->bNumInterfaces);
         printf("    bConfigurationValue           %d\n", config_desc->bConfigurationValue);
-        get_string_desc(fd, config_desc->iConfiguration, string_buf, sizeof(string_buf));
+        get_string_desc(svc, config_desc->iConfiguration, string_buf, sizeof(string_buf));
         printf("    iConfiguration                %d %s\n", config_desc->iConfiguration, string_buf);
         printf("    bmAttributes                  0x%02X\n", config_desc->bmAttributes);
         printf("    bMaxPower                     %d\n", config_desc->bMaxPower);
@@ -155,7 +177,7 @@ static int do_list_device(int fd, int configuration, bool verbose, const char* d
                 printf("      bInterfaceClass             %d\n", desc->bInterfaceClass);
                 printf("      bInterfaceSubClass          %d\n", desc->bInterfaceSubClass);
                 printf("      bInterfaceProtocol          %d\n", desc->bInterfaceProtocol);
-                get_string_desc(fd, desc->iInterface, string_buf, sizeof(string_buf));
+                get_string_desc(svc, desc->iInterface, string_buf, sizeof(string_buf));
                 printf("      iInterface                  %d %s\n", desc->iInterface, string_buf);
             } else if (header->bDescriptorType == USB_DT_ENDPOINT) {
                 usb_endpoint_descriptor_t* desc = (usb_endpoint_descriptor_t *)header;
@@ -194,7 +216,7 @@ static int do_list_device(int fd, int configuration, bool verbose, const char* d
                 printf("          bLength                 %d\n", desc->bLength);
                 printf("          bDescriptorType         %d\n", desc->bDescriptorType);
                 printf("          wReserved               %d\n", le16toh(desc->wReserved));
-                printf("          wBytesPerInterval       %d\n", le16toh(desc->wBytesPerInterval));
+                printf("          dwBytesPerInterval      %d\n", le32toh(desc->dwBytesPerInterval));
             } else if (header->bDescriptorType == USB_DT_INTERFACE_ASSOCIATION) {
                 usb_interface_assoc_descriptor_t* desc = (usb_interface_assoc_descriptor_t *)header;
                 printf("    Interface Association Descriptor:\n");
@@ -234,7 +256,15 @@ static int list_device(const char* device_id, int configuration, bool verbose) {
         return fd;
     }
 
-    int ret = do_list_device(fd, configuration, verbose, device_id, 0, 0);
+    zx_handle_t svc;
+    zx_status_t status = fdio_get_service_handle(fd, &svc);
+    if (status != ZX_OK) {
+        close(fd);
+        return status;
+    }
+
+    int ret = do_list_device(svc, configuration, verbose, device_id, 0, 0);
+    zx_handle_close(svc);
     close(fd);
     return ret;
 }
@@ -258,9 +288,10 @@ static int list_devices(bool verbose) {
 }
 struct device_node {
     int fd;
+    zx_handle_t svc;
     char devname[4];
-    uint64_t device_id;
-    uint64_t hub_id;
+    uint32_t device_id;
+    uint32_t hub_id;
     struct device_node* next;
     int depth;  // depth in tree, or -1 if not computed yet
 };
@@ -284,7 +315,7 @@ static void do_list_tree(struct device_node* devices, uint64_t hub_id, int max_d
     struct device_node* node = devices;
     while (node) {
         if (node->hub_id == hub_id) {
-            do_list_device(node->fd, -1, false, node->devname, node->depth, max_depth);
+            do_list_device(node->svc, -1, false, node->devname, node->depth, max_depth);
             do_list_tree(devices, node->device_id, max_depth);
         }
         node = node->next;
@@ -311,31 +342,35 @@ static int list_tree(void) {
             printf("Error opening %s\n", devname);
             continue;
         }
-        int device_type = -1;
-        ioctl_usb_get_device_type(fd, &device_type);
-        if (device_type != USB_DEVICE_TYPE_DEVICE) {
+
+        zx_handle_t svc;
+        zx_status_t status = fdio_get_service_handle(fd, &svc);
+        if (status != ZX_OK) {
             close(fd);
-            continue;
+            return status;
         }
 
         struct device_node* node = (struct device_node *)malloc(sizeof(struct device_node));
         if (!node) return -1;
 
-        int ret = ioctl_usb_get_device_id(fd, &node->device_id);
-        if (ret < 0) {
-            printf("ioctl_usb_get_device_id failed for %s\n", devname);
+        int ret = zircon_usb_device_DeviceGetDeviceId(svc, &node->device_id);
+        if (ret != ZX_OK) {
+            printf("DeviceGetDeviceId failed for %s\n", devname);
             free(node);
+            zx_handle_close(svc);
             close(fd);
             continue;
         }
-        ret = ioctl_usb_get_device_hub_id(fd, &node->hub_id);
-        if (ret < 0) {
-            printf("ioctl_usb_get_device_hub_id failed for %s\n", devname);
+        ret = zircon_usb_device_DeviceGetHubDeviceId(svc, &node->hub_id);
+        if (ret != ZX_OK) {
+            printf("DeviceGetHubDeviceId failed for %s\n", devname);
             free(node);
+            zx_handle_close(svc);
             close(fd);
             continue;
         }
         node->fd = fd;
+        node->svc = svc;
         node->depth = -1;
         strlcpy(node->devname, de->d_name, sizeof(node->devname));
         if (devices == NULL) {
@@ -371,6 +406,7 @@ static int list_tree(void) {
      node = devices;
     while (node) {
         struct device_node* next = node->next;
+        zx_handle_close(node->svc);
         close(node->fd);
         free(node);
         node = next;

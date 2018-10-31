@@ -1,4 +1,4 @@
-# zx_vmo_op_range
+# zx_set_cache_policy
 
 ## NAME
 
@@ -36,6 +36,10 @@ This is architecture dependent and may be equivalent to
 *ZX_CACHE_POLICY_UNCACHED* on some architectures.
 
 **ZX_CACHE_POLICY_WRITE_COMBINING** - Uncached with write combining.
+
+## RIGHTS
+
+TODO(ZX-2399)
 
 ## RETURN VALUE
 

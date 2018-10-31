@@ -18,10 +18,21 @@ typedef struct zx_device_prop zx_device_prop_t;
 
 typedef struct zx_protocol_device zx_protocol_device_t;
 
+typedef struct fidl_msg fidl_msg_t;
+typedef struct fidl_txn fidl_txn_t;
+
+// Max device name length, not including a null-terminator
 #define ZX_DEVICE_NAME_MAX 31
 
-// echo -n "zx_device_ops_v0.5" | sha256sum | cut -c1-16
-#define DEVICE_OPS_VERSION 0Xc9410d2a24f57424
+// echo -n "mx_device_ops_v0.5" | sha256sum | cut -c1-16
+#define DEVICE_OPS_VERSION_0_50 0xc9410d2a24f57424
+
+// echo -n "zx_device_ops_v0.51" | sha256sum | cut -c1-16
+#define DEVICE_OPS_VERSION_0_51 0xc4640f7115d2ee49
+
+// Current Version
+#define DEVICE_OPS_VERSION DEVICE_OPS_VERSION_0_51
+
 
 // TODO: temporary flags used by devcoord to communicate
 // with the system bus device.
@@ -33,6 +44,7 @@ typedef struct zx_protocol_device zx_protocol_device_t;
 
 // reboot modifiers
 #define DEVICE_SUSPEND_FLAG_REBOOT_BOOTLOADER   (DEVICE_SUSPEND_FLAG_REBOOT | 0x01)
+#define DEVICE_SUSPEND_FLAG_REBOOT_RECOVERY     (DEVICE_SUSPEND_FLAG_REBOOT | 0x02)
 
 //@doc(docs/ddk/device-ops.md)
 
@@ -200,6 +212,19 @@ typedef struct zx_protocol_device {
     // when a new client connects -- at which point any state from
     // the previous client should be torn down.
     zx_status_t (*rxrpc)(void* ctx, zx_handle_t channel);
+
+    //@ ## message
+    // Process a FIDL rpc message.  This is used to handle class or
+    // device specific messaging.  fuchsia.io.{Node,File,Device} are
+    // handles by the devhost itself.
+    //
+    // The entire message becomes the responsibility of the driver,
+    // including the handles.
+    //
+    // The txn provided to respond to the message is only valid for
+    // the duration of the message() call.  It must not be cached
+    // and used later.
+    zx_status_t (*message)(void* ctx, fidl_msg_t* msg, fidl_txn_t* txn);
 } zx_protocol_device_t;
 
 
@@ -213,7 +238,7 @@ zx_device_t* device_get_parent(zx_device_t* dev);
 //     protocol_xyz_ops_t* ops;
 //     void* ctx;
 // } protocol_xyz_t;
-zx_status_t device_get_protocol(zx_device_t* dev, uint32_t proto_id, void* protocol);
+zx_status_t device_get_protocol(const zx_device_t* dev, uint32_t proto_id, void* protocol);
 
 
 // Direct Device Ops Functions
@@ -228,6 +253,24 @@ zx_off_t device_get_size(zx_device_t* dev);
 zx_status_t device_ioctl(zx_device_t* dev, uint32_t op,
                          const void* in_buf, size_t in_len,
                          void* out_buf, size_t out_len, size_t* out_actual);
+
+// Device Metadata Support
+
+// retrieves metadata for a specific device
+// searches parent devices to find a match
+zx_status_t device_get_metadata(zx_device_t* dev, uint32_t type, void* buf, size_t buflen,
+                                size_t* actual);
+
+// Adds metadata to a specific device.
+zx_status_t device_add_metadata(zx_device_t* dev, uint32_t type, const void* data, size_t length);
+
+
+// Adds metadata to be provided to future devices matching the specified topo path.
+// Drivers may use this to publish metadata to a driver with a topo path that matches
+// itself or one of its children. Only drivers running in the "sys" devhost may publish
+// metadata to arbitrary topo paths.
+zx_status_t device_publish_metadata(zx_device_t* dev, const char* path, uint32_t type,
+                                    const void* data, size_t length);
 
 // Device State Change Functions
 //@ #### Device State Bits

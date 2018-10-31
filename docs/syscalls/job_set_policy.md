@@ -57,7 +57,7 @@ Where *condition* is one of
   a new channel.
 + **ZX_POL_NEW_EVENT** a process under this job is attempting to create
   a new event.
-+ **ZX_POL_NEW_EVPAIR** a process under this job is attempting to create
++ **ZX_POL_NEW_EVENTPAIR** a process under this job is attempting to create
   a new event pair.
 + **ZX_POL_NEW_PORT** a process under this job is attempting to create
   a new port.
@@ -67,9 +67,11 @@ Where *condition* is one of
   a new fifo.
 + **ZX_POL_NEW_TIMER** a process under this job is attempting to create
   a new timer.
++ **ZX_POL_NEW_PROCESS** a process under this job is attempting to create
+  a new process.
 + **ZX_POL_NEW_ANY** is a special *condition* that stands for all of
   the above **ZX_NEW** condtions such as **ZX_POL_NEW_VMO**,
-  **ZX_POL_NEW_CHANNEL**, **ZX_POL_NEW_EVENT**, **ZX_POL_NEW_EVPAIR**,
+  **ZX_POL_NEW_CHANNEL**, **ZX_POL_NEW_EVENT**, **ZX_POL_NEW_EVENTPAIR**,
   **ZX_POL_NEW_PORT**, **ZX_POL_NEW_SOCKET**, **ZX_POL_NEW_FIFO**,
   and any future ZX_NEW policy. This will include any new
   kernel objects which do not require a parent object for creation.
@@ -85,11 +87,20 @@ Optionally it can be augmented via OR with
 + **ZX_POL_ACTION_KILL** terminate the process. It also
 implies **ZX_POL_ACTION_DENY**.
 
+## RIGHTS
+
+TODO(ZX-2399)
+
 ## RETURN VALUE
 
 **zx_job_set_policy**() returns **ZX_OK** on success.  In the event of failure,
 a negative error value is returned.
 
+## NOTES
+
+The **ZX_POL_BAD_HANDLE** policy does not apply when calling ``zx_object_get_info()``
+with the topic ZX_INFO_HANDLE_VALID.  All other topics and all other syscalls that
+take handles are subject to the policy.
 
 ## ERRORS
 
@@ -112,9 +123,12 @@ bigger than ZX_POL_MAX.
 
 **ZX_ERR_NOT_SUPPORTED** an entry in *policy* has an invalid value.
 
-**ZX_ERR_NO_MEMORY**  (Temporary) Out of memory condition.
+**ZX_ERR_NO_MEMORY**  Failure due to lack of memory.
+There is no good way for userspace to handle this (unlikely) error.
+In a future build this error will no longer occur.
 
 ## SEE ALSO
 
 [job_create](job_create.md).
 [process_create](job_create.md).
+[object_get_info](object_get_info.md).

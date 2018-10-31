@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef ZIRCON_FIDL_H_
+#define ZIRCON_FIDL_H_
 
 #include <assert.h>
 #include <stdalign.h>
@@ -22,7 +23,7 @@ __BEGIN_CDECLS
 // in the representation of pointers to out-of-line allocations. On
 // the wire, allocations are encoded as either present or not. In C,
 // they are actual pointers. The C representation also places any
-// transfered handle types (including requests) inline. The wire
+// transferred handle types (including requests) inline. The wire
 // format tracks handles separately, just like the underlying channel
 // transport does.
 //
@@ -57,6 +58,10 @@ __BEGIN_CDECLS
 #define FIDL_ALIGNMENT ((size_t)8)
 #define FIDL_ALIGN(a) (((a) + 7) & ~7)
 #define FIDL_ALIGNDECL alignas(FIDL_ALIGNMENT)
+
+// An opaque struct representing the encoding of a particular fidl
+// type.
+typedef struct fidl_type fidl_type_t;
 
 // Primitive types.
 
@@ -113,8 +118,11 @@ __BEGIN_CDECLS
 // The bound on a string type is not present in the serialized format,
 // but is checked as part of validation.
 
-typedef struct {
+typedef struct fidl_string {
+    // Number of UTF-8 code units (bytes), must be 0 if |data| is null.
     uint64_t size;
+
+    // Pointer to UTF-8 code units (bytes) or null
     char* data;
 } fidl_string_t;
 
@@ -160,8 +168,11 @@ typedef struct {
 // The bound on a vector type is not present in the serialized format,
 // but is checked as part of validation.
 
-typedef struct {
+typedef struct fidl_vector {
+    // Number of elements, must be 0 if |data| is null.
     uint64_t count;
+
+    // Pointer to element data or null.
     void* data;
 } fidl_vector_t;
 
@@ -271,8 +282,9 @@ typedef uint32_t fidl_union_tag_t;
 
 // All fidl messages share a common 16 byte header.
 
-typedef struct {
+typedef struct fidl_message_header {
     zx_txid_t txid;
+    // This reserved word is used by Epitaphs to represent an error value.
     uint32_t reserved0;
     uint32_t flags;
     uint32_t ordinal;
@@ -286,6 +298,61 @@ typedef struct {
 // The system reserves the high half of the ordinal space.
 
 #define FIDL_ORD_SYSTEM_MASK 0x80000000ul
+
+// A FIDL message.
+typedef struct fidl_msg {
+    // The bytes of the message.
+    //
+    // The bytes of the message might be in the encoded or decoded form.
+    // Functions that take a |fidl_msg_t| as an argument should document whether
+    // the expect encoded or decoded messages.
+    //
+    // See |num_bytes| for the number of bytes in the message.
+    void* bytes;
+
+    // The handles of the message.
+    //
+    // See |num_bytes| for the number of bytes in the message.
+    zx_handle_t* handles;
+
+    // The number of bytes in |bytes|.
+    uint32_t num_bytes;
+
+    // The number of handles in |handles|.
+    uint32_t num_handles;
+} fidl_msg_t;
+
+// An outstanding FIDL transaction.
+typedef struct fidl_txn fidl_txn_t;
+struct fidl_txn {
+    // Replies to the outstanding request and complete the FIDL transaction.
+    //
+    // Pass the |fidl_txn_t| object itself as the first parameter. The |msg|
+    // should already be encoded. This function always consumes any handles
+    // present in |msg|.
+    //
+    // Call |reply| only once for each |txn| object. After |reply| returns, the
+    // |txn| object is considered invalid and might have been freed or reused
+    // for another purpose.
+    zx_status_t (*reply)(fidl_txn_t* txn, const fidl_msg_t* msg);
+};
+
+// An epitaph is a message that a server sends just prior to closing the
+// connection.  It provides an indication of why the connection is being closed.
+// Epitaphs are defined in the FIDL wire format specification.  Once sent down
+// the wire, the channel should be closed.
+typedef struct fidl_epitaph {
+    FIDL_ALIGNDECL
+
+    // The error associated with this epitaph is stored in the reserved word of
+    // the message header.  System errors must be constants of type zx_status_t,
+    // which are all negative.  Positive numbers should be used for application
+    // errors.  A value of ZX_OK indicates no error.
+    fidl_message_header_t hdr;
+} fidl_epitaph_t;
+
+// This ordinal value is reserved for Epitaphs.
+#define FIDL_EPITAPH_ORDINAL 0xFFFFFFFF
 
 // Assumptions.
 
@@ -306,3 +373,5 @@ static_assert(alignof(fidl_union_tag_t) <= FIDL_ALIGNMENT, "");
 static_assert(alignof(fidl_message_header_t) <= FIDL_ALIGNMENT, "");
 
 __END_CDECLS
+
+#endif // ZIRCON_FIDL_H_

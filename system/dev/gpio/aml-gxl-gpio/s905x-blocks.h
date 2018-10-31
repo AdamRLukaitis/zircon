@@ -4,7 +4,11 @@
 
 #include <soc/aml-s905x/s905x-gpio.h>
 
-static aml_gpio_block_t s905x_gpio_blocks[] = {
+#include "aml-gxl-gpio.h"
+
+namespace gpio {
+
+constexpr AmlGpioBlock s905x_gpio_blocks[] = {
     // GPIOX Block
     {
         .pin_count = S905X_GPIOX_PINS,
@@ -13,7 +17,9 @@ static aml_gpio_block_t s905x_gpio_blocks[] = {
         .output_offset = S905X_GPIOX_OUT,
         .output_shift = 0,
         .mmio_index = 0,
-        .lock = MTX_INIT,
+        .pull_offset = S905X_PULL_UP_REG4,
+        .pull_en_offset = S905X_PULL_UP_EN_REG4,
+        .pin_start = S905X_GPIOX_PIN_START,
     },
     // GPIODV Block
     {
@@ -23,7 +29,9 @@ static aml_gpio_block_t s905x_gpio_blocks[] = {
         .output_offset = S905X_GPIODV_OUT,
         .output_shift = 0,
         .mmio_index = 0,
-        .lock = MTX_INIT,
+        .pull_offset = S905X_PULL_UP_REG0,
+        .pull_en_offset = S905X_PULL_UP_EN_REG0,
+        .pin_start = S905X_GPIODV_PIN_START,
     },
     // GPIOH Block
     {
@@ -31,9 +39,11 @@ static aml_gpio_block_t s905x_gpio_blocks[] = {
         .oen_offset = S905X_GPIOH_0EN,
         .input_offset = S905X_GPIOH_IN,
         .output_offset = S905X_GPIOH_OUT,
-        .output_shift = 0,
+        .output_shift = 20,
         .mmio_index = 0,
-        .lock = MTX_INIT,
+        .pull_offset = S905X_PULL_UP_REG1,
+        .pull_en_offset = S905X_PULL_UP_EN_REG1,
+        .pin_start = S905X_GPIOH_PIN_START,
     },
     // GPIOBOOT Block
     {
@@ -43,7 +53,9 @@ static aml_gpio_block_t s905x_gpio_blocks[] = {
         .output_offset = S905X_GPIOBOOT_OUT,
         .output_shift = 0,
         .mmio_index = 0,
-        .lock = MTX_INIT,
+        .pull_offset = S905X_PULL_UP_REG2,
+        .pull_en_offset = S905X_PULL_UP_EN_REG2,
+        .pin_start = S905X_GPIOBOOT_PIN_START,
     },
     // GPIOCARD Block
     {
@@ -51,9 +63,11 @@ static aml_gpio_block_t s905x_gpio_blocks[] = {
         .oen_offset = S905X_GPIOCARD_0EN,
         .input_offset = S905X_GPIOCARD_IN,
         .output_offset = S905X_GPIOCARD_OUT,
-        .output_shift = 0,
+        .output_shift = 20,
         .mmio_index = 0,
-        .lock = MTX_INIT,
+        .pull_offset = S905X_PULL_UP_REG2,
+        .pull_en_offset = S905X_PULL_UP_EN_REG2,
+        .pin_start = S905X_GPIOCARD_PIN_START,
     },
     // GPIOCLK Block
     {
@@ -61,9 +75,11 @@ static aml_gpio_block_t s905x_gpio_blocks[] = {
         .oen_offset = S905X_GPIOCLK_0EN,
         .input_offset = S905X_GPIOCLK_IN,
         .output_offset = S905X_GPIOCLK_OUT,
-        .output_shift = 0,
+        .output_shift = 28,
         .mmio_index = 0,
-        .lock = MTX_INIT,
+        .pull_offset = S905X_PULL_UP_REG3,
+        .pull_en_offset = S905X_PULL_UP_EN_REG3,
+        .pin_start = S905X_GPIOCLK_PIN_START,
     },
     // GPIOZ Block
     {
@@ -73,7 +89,9 @@ static aml_gpio_block_t s905x_gpio_blocks[] = {
         .output_offset = S905X_GPIOZ_OUT,
         .output_shift = 0,
         .mmio_index = 0,
-        .lock = MTX_INIT,
+        .pull_offset = S905X_PULL_UP_REG3,
+        .pull_en_offset = S905X_PULL_UP_EN_REG3,
+        .pin_start = S905X_GPIOZ_PIN_START,
     },
     // GPIOAO Block
     {
@@ -81,9 +99,12 @@ static aml_gpio_block_t s905x_gpio_blocks[] = {
         .oen_offset = S905X_AO_GPIO_OEN_OUT,
         .input_offset = S905X_AO_GPIO_IN,
         .output_offset = S905X_AO_GPIO_OEN_OUT,
-        .output_shift = 16, // output is shared with OEN
+        .output_shift = 0, // output is shared with OEN
+        .output_write_shift = 16, //OUT/EN share reg
         .mmio_index = 1,
-        .lock = MTX_INIT,
+        .pull_offset = 0, // not supported
+        .pull_en_offset = 0, // not supported
+        .pin_start = S905X_GPIOA0_PIN_START,
     },
 };
 
@@ -100,7 +121,16 @@ static aml_gpio_block_t s905x_gpio_blocks[] = {
 #define AO_REG S905X_AO_RTI_PIN_MUX_REG
 #define AO_REG_2 S905X_AO_RTI_PIN_MUX_REG2
 
-static const aml_pinmux_block_t s905x_pinmux_blocks[] = {
+constexpr AmlGpioInterrupt s905x_interrupt_block = {
+    .pin_0_3_select_offset =    S905X_GPIO_0_3_PIN_SELECT,
+    .pin_4_7_select_offset =    S905X_GPIO_4_7_PIN_SELECT,
+    .edge_polarity_offset =     S905X_GPIO_INT_EDGE_POLARITY,
+    .filter_select_offset =     S905X_GPIO_FILTER_SELECT,
+    .status_offset =            S905X_GPIO_INT_STATUS,
+    .mask_offset =              S905X_GPIO_INT_MASK,
+};
+
+constexpr AmlPinMuxBlock s905x_pinmux_blocks[] = {
     // GPIOX Block
     {
         .mux = {
@@ -264,3 +294,5 @@ static_assert(countof(s905x_gpio_blocks) == countof(s905x_pinmux_blocks), "");
 #undef REG_9
 #undef AO_REG
 #undef AO_REG_2
+
+}  // namespace gpio

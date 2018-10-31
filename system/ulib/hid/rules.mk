@@ -10,8 +10,12 @@ MODULE_TYPE := userlib
 
 MODULE_SRCS += \
     $(LOCAL_DIR)/acer12.c \
+    $(LOCAL_DIR)/ambient-light.c \
+    $(LOCAL_DIR)/buttons.c \
     $(LOCAL_DIR)/egalax.c \
-    $(LOCAL_DIR)/google_tablet_motion_control_device.c \
+    $(LOCAL_DIR)/eyoyo.c \
+    $(LOCAL_DIR)/ft3x27.c \
+    $(LOCAL_DIR)/gt92xx.c \
     $(LOCAL_DIR)/hid.c \
     $(LOCAL_DIR)/keymaps.c \
     $(LOCAL_DIR)/paradise.c \
@@ -24,5 +28,8 @@ MODULE_LIBS := \
     system/ulib/zircon \
     system/ulib/fdio \
     system/ulib/c
+
+MODULE_FIDL_LIBS := \
+    system/fidl/zircon-input \
 
 include make/module.mk

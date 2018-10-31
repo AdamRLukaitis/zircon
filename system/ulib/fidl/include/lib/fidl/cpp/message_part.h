@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#pragma once
+#ifndef LIB_FIDL_CPP_MESSAGE_PART_H_
+#define LIB_FIDL_CPP_MESSAGE_PART_H_
 
 #include <stdint.h>
 #include <string.h>
@@ -63,7 +64,7 @@ public:
     // The total amount of storage available for this part of the message.
     //
     // This part of the message might not actually use all of this storage. To
-    // determine how much storage is actually being used, see |capacity()|.
+    // determine how much storage is actually being used, see |actual()|.
     uint32_t capacity() const { return capacity_; }
 
     // The amount of storage that is actually being used for this part of the
@@ -92,3 +93,5 @@ using BytePart = MessagePart<uint8_t>;
 using HandlePart = MessagePart<zx_handle_t>;
 
 } // namespace fidl
+
+#endif // LIB_FIDL_CPP_MESSAGE_PART_H_

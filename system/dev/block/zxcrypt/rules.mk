@@ -11,18 +11,18 @@ MODULE_TYPE := driver
 MODULE_SRCS := \
     $(LOCAL_DIR)/binding.c \
     $(LOCAL_DIR)/device.cpp \
+    $(LOCAL_DIR)/extra.cpp \
     $(LOCAL_DIR)/worker.cpp \
 
 MODULE_LIBS := \
     system/ulib/c \
     system/ulib/zircon \
-    system/ulib/bitmap \
     system/ulib/crypto \
     system/ulib/driver \
-    system/ulib/fdio \
     system/ulib/zxcrypt \
 
 MODULE_STATIC_LIBS := \
+    system/ulib/bitmap \
     system/ulib/ddk \
     system/ulib/ddktl \
     system/ulib/fbl \

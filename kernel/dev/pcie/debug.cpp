@@ -5,8 +5,6 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
-#ifdef WITH_LIB_CONSOLE
-
 #include <ctype.h>
 #include <debug.h>
 #include <err.h>
@@ -566,12 +564,12 @@ int PcieDebugConsole::CmdLsPci(int argc, const cmd_args *argv, uint32_t flags) {
                     case 'e':
                         if (params.cfg_dump_amt < PCIE_EXTENDED_CONFIG_SIZE)
                             params.cfg_dump_amt = PCIE_EXTENDED_CONFIG_SIZE;
-                        // deliberate fall-thru
+                        __FALLTHROUGH;
 
                     case 'c':
                         if (params.cfg_dump_amt < PCIE_BASE_CONFIG_SIZE)
                             params.cfg_dump_amt = PCIE_BASE_CONFIG_SIZE;
-                        // deliberate fall-thru
+                        __FALLTHROUGH;
 
                     case 'l':
                         params.verbose = true;
@@ -776,5 +774,3 @@ STATIC_COMMAND("pciregions",
                "Dump information on present PCI address region allocations",
                &PcieDebugConsole::CmdPciRegionDump)
 STATIC_COMMAND_END(pcie);
-
-#endif  // WITH_LIB_CONSOLE

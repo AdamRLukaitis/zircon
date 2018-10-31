@@ -6,14 +6,13 @@
 
 #pragma once
 
+#include <zircon/boot/image.h>
 #include <zircon/compiler.h>
-#include <zircon/mdi.h>
-#include <mdi/mdi.h>
 
 __BEGIN_CDECLS
 
 // called at platform early init time
-// pass node reference to list of kernel drivers to init
-void pdev_init(const mdi_node_ref_t* drivers);
+// pointer to ZBI containing boot items for kernel drivers to load
+void pdev_init(const zbi_header_t* zbi);
 
 __END_CDECLS

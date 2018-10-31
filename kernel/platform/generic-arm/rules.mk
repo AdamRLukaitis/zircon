@@ -18,8 +18,10 @@ KERNEL_DEFINES += \
 
 MODULE_DEPS += \
 	kernel/lib/cbuf \
-	kernel/lib/mdi \
+	kernel/lib/lockdep \
+	kernel/lib/fbl \
 	kernel/lib/memory_limit \
+	kernel/lib/zbi \
 	kernel/dev/pcie \
 	kernel/dev/pdev \
 	kernel/dev/pdev/power \
@@ -30,6 +32,7 @@ MODULE_DEPS += \
 	kernel/dev/power/hisi \
 	kernel/dev/psci \
 	kernel/dev/uart/amlogic_s905 \
+	kernel/dev/uart/mt8167 \
 	kernel/dev/uart/nxp-imx \
 	kernel/dev/uart/pl011 \
 	kernel/dev/hdcp/amlogic_s912 \

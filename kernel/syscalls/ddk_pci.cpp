@@ -17,7 +17,7 @@
 #include <lib/user_copy/user_ptr.h>
 #include <object/handle.h>
 #include <object/process_dispatcher.h>
-#include <object/resources.h>
+#include <object/resource.h>
 #include <object/vm_object_dispatcher.h>
 #include <vm/vm_object_physical.h>
 
@@ -26,13 +26,13 @@
 #include <fbl/limits.h>
 #include <fbl/ref_ptr.h>
 #include <fbl/unique_free_ptr.h>
+#include <fbl/unique_ptr.h>
 #include <zircon/syscalls/pci.h>
 
 #include "priv.h"
 
 #define LOCAL_TRACE 0
 
-#if WITH_LIB_GFXCONSOLE
 // If we were built with the GFX console, make sure that it is un-bound when
 // user mode takes control of PCI.  Note: there should probably be a cleaner way
 // of doing this.  Not all system have PCI, and (eventually) not all systems
@@ -42,11 +42,9 @@
 static inline void shutdown_early_init_console() {
     gfxconsole_bind_display(nullptr, nullptr);
 }
-#else
-static inline void shutdown_early_init_console() {}
-#endif
 
-#if WITH_DEV_PCIE
+#ifdef WITH_KERNEL_PCIE
+#include <dev/address_provider/ecam_region.h>
 #include <dev/pcie_bus_driver.h>
 #include <dev/pcie_root.h>
 #include <object/pci_device_dispatcher.h>
@@ -108,6 +106,7 @@ static void pci_irq_swizzle_lut_remove_irq(zx_pci_irq_swizzle_lut_t* lut, uint32
     }
 }
 
+// zx_status_t zx_pci_add_subtract_io_range
 zx_status_t sys_pci_add_subtract_io_range(zx_handle_t handle, bool mmio, uint64_t base, uint64_t len, bool add) {
 
     LTRACEF("handle %x mmio %d base %#" PRIx64 " len %#" PRIx64 " add %d\n", handle, mmio, base, len, add);
@@ -133,6 +132,31 @@ zx_status_t sys_pci_add_subtract_io_range(zx_handle_t handle, bool mmio, uint64_
     }
 }
 
+static inline PciEcamRegion addr_window_to_pci_ecam_region(zx_pci_init_arg_t* arg, size_t index) {
+    ASSERT(index < arg->addr_window_count);
+
+    const PciEcamRegion result = {
+        .phys_base = static_cast<paddr_t>(arg->addr_windows[index].base),
+        .size = arg->addr_windows[index].size,
+        .bus_start = arg->addr_windows[index].bus_start,
+        .bus_end = arg->addr_windows[index].bus_end,
+    };
+
+    return result;
+}
+
+static inline bool is_designware(const zx_pci_init_arg_t* arg) {
+    for (size_t i = 0; i < arg->addr_window_count; i++) {
+        if ((arg->addr_windows[i].cfg_space_type == PCI_CFG_SPACE_TYPE_DW_ROOT) ||
+            (arg->addr_windows[i].cfg_space_type == PCI_CFG_SPACE_TYPE_DW_DS)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// zx_status_t zx_pci_init
 zx_status_t sys_pci_init(zx_handle_t handle, user_in_ptr<const zx_pci_init_arg_t> _init_buf, uint32_t len) {
     // TODO(ZX-971): finer grained validation
     // TODO(security): Add additional access checks
@@ -165,13 +189,21 @@ zx_status_t sys_pci_init(zx_handle_t handle, user_in_ptr<const zx_pci_init_arg_t
     }
 
     if (LOCAL_TRACE) {
+        const char* kAddrWindowTypes[] = {
+            "PIO", "MMIO", "DW Root Bridge (MMIO)", "DW Downstream (MMIO)",
+            "Unknown"
+        };
         TRACEF("%u address window%s found in init arg\n", arg->addr_window_count,
                (arg->addr_window_count == 1) ? "" : "s");
         for (uint32_t i = 0; i < arg->addr_window_count; i++) {
-            printf("[%u]\n\tis_mmio: %d\n\thas_ecam: %d\n\tbase: %#" PRIxPTR "\n"
+            const size_t window_type_idx =
+                MIN(fbl::count_of(kAddrWindowTypes) - 1, arg->addr_windows[i].cfg_space_type);
+            const char* window_type_name = kAddrWindowTypes[window_type_idx];
+
+            printf("[%u]\n\tcfg_space_type: %s\n\thas_ecam: %d\n\tbase: %#" PRIxPTR "\n"
                    "\tsize: %zu\n\tbus_start: %u\n\tbus_end: %u\n",
                    i,
-                   arg->addr_windows[i].is_mmio, arg->addr_windows[i].has_ecam,
+                   window_type_name, arg->addr_windows[i].has_ecam,
                    arg->addr_windows[i].base, arg->addr_windows[i].size,
                    arg->addr_windows[i].bus_start, arg->addr_windows[i].bus_end);
         }
@@ -212,9 +244,19 @@ zx_status_t sys_pci_init(zx_handle_t handle, user_in_ptr<const zx_pci_init_arg_t
             return status;
         }
     }
-    // TODO(teisenbe): For now assume there is only one ECAM
-    if (win_count != 1) {
-        return ZX_ERR_INVALID_ARGS;
+    // TODO(teisenbe): For now assume there is only one ECAM, unless it's a
+    // DesignWare Controller.
+    // The DesignWare controller needs exactly two windows: One specifying where
+    // the root bridge is and the other specifying where the downstream devices
+    // are.
+    if (is_designware(arg.get())) {
+        if (win_count != 2) {
+            return ZX_ERR_INVALID_ARGS;
+        }
+    } else {
+        if (win_count != 1) {
+            return ZX_ERR_INVALID_ARGS;
+        }
     }
 
     if (arg->addr_windows[0].bus_start != 0) {
@@ -250,7 +292,7 @@ zx_status_t sys_pci_init(zx_handle_t handle, user_in_ptr<const zx_pci_init_arg_t
     }
 #endif
 
-    if (arg->addr_windows[0].is_mmio) {
+    if (arg->addr_windows[0].cfg_space_type == PCI_CFG_SPACE_TYPE_MMIO) {
         if (arg->addr_windows[0].size < PCIE_ECAM_BYTE_PER_BUS) {
             return ZX_ERR_INVALID_ARGS;
         }
@@ -263,32 +305,103 @@ zx_status_t sys_pci_init(zx_handle_t handle, user_in_ptr<const zx_pci_init_arg_t
         // TODO(johngro): Update the syscall to pass a paddr_t for base instead of a uint64_t
         ASSERT(arg->addr_windows[0].base < fbl::numeric_limits<paddr_t>::max());
 
+        fbl::AllocChecker ac;
+        auto addr_provider = fbl::make_unique_checked<MmioPcieAddressProvider>(&ac);
+        if (!ac.check()) {
+            TRACEF("Failed to allocate PCIe Address Provider\n");
+            return ZX_ERR_NO_MEMORY;
+        }
+
         // TODO(johngro): Do not limit this to a single range.  Instead, fetch all
         // of the ECAM ranges from ACPI, as well as the appropriate bus start/end
         // ranges.
-        const PcieBusDriver::EcamRegion ecam = {
+        const PciEcamRegion ecam = {
             .phys_base = static_cast<paddr_t>(arg->addr_windows[0].base),
             .size = arg->addr_windows[0].size,
             .bus_start = 0x00,
             .bus_end = static_cast<uint8_t>((arg->addr_windows[0].size / PCIE_ECAM_BYTE_PER_BUS) - 1),
         };
 
-        zx_status_t ret = pcie->AddEcamRegion(ecam);
+        zx_status_t ret = addr_provider->AddEcamRegion(ecam);
         if (ret != ZX_OK) {
             TRACEF("Failed to add ECAM region to PCIe bus driver! (ret %d)\n", ret);
             return ret;
         }
-    }
 
+        ret = pcie->SetAddressTranslationProvider(fbl::move(addr_provider));
+        if (ret != ZX_OK) {
+            TRACEF("Failed to set Address Translation Provider, st = %d\n", ret);
+            return ret;
+        }
+    } else if (arg->addr_windows[0].cfg_space_type == PCI_CFG_SPACE_TYPE_PIO) {
+        // Create a PIO address provider.
+        fbl::AllocChecker ac;
+
+        auto addr_provider = fbl::make_unique_checked<PioPcieAddressProvider>(&ac);
+        if (!ac.check()) {
+            TRACEF("Failed to allocate PCIe address provider\n");
+            return ZX_ERR_NO_MEMORY;
+        }
+
+        zx_status_t ret = pcie->SetAddressTranslationProvider(fbl::move(addr_provider));
+        if (ret != ZX_OK) {
+            TRACEF("Failed to set Address Translation Provider, st = %d\n", ret);
+            return ret;
+        }
+    } else if (is_designware(arg.get())) {
+        fbl::AllocChecker ac;
+
+        if (win_count < 2) {
+            TRACEF("DesignWare Config Space requires at least 2 windows\n");
+            return ZX_ERR_INVALID_ARGS;
+        }
+
+        auto addr_provider = fbl::make_unique_checked<DesignWarePcieAddressProvider>(&ac);
+        if (!ac.check()) {
+            TRACEF("Failed to allocate PCIe address provider\n");
+            return ZX_ERR_NO_MEMORY;
+        }
+
+        PciEcamRegion dw_root_bridge{};
+        PciEcamRegion dw_downstream{};
+        for (size_t i = 0; i < win_count; i++) {
+            switch (arg->addr_windows[i].cfg_space_type) {
+            case PCI_CFG_SPACE_TYPE_DW_ROOT:
+                dw_root_bridge = addr_window_to_pci_ecam_region(arg.get(), i);
+                break;
+            case PCI_CFG_SPACE_TYPE_DW_DS:
+                dw_downstream = addr_window_to_pci_ecam_region(arg.get(), i);
+                break;
+            }
+        }
+
+        if (dw_root_bridge.size == 0 || dw_downstream.size == 0) {
+            TRACEF("Did not find DesignWare root and downstream device in init arg\n");
+            return ZX_ERR_INVALID_ARGS;
+        }
+
+        zx_status_t ret = addr_provider->Init(dw_root_bridge, dw_downstream);
+        if (ret != ZX_OK) {
+            TRACEF("Failed to initialize DesignWare PCIe Address Provider, error = %d\n", ret);
+            return ret;
+        }
+
+        ret = pcie->SetAddressTranslationProvider(fbl::move(addr_provider));
+        if (ret != ZX_OK) {
+            TRACEF("Failed to set Address Translation Provider, st = %d\n", ret);
+            return ret;
+        }
+
+    } else {
+        TRACEF("Unknown config space type!\n");
+        return ZX_ERR_INVALID_ARGS;
+    }
     // TODO(johngro): Change the user-mode and devmgr behavior to add all of the
     // roots in the system.  Do not assume that there is a single root, nor that
     // it manages bus ID 0.
     auto root = PcieRootLUTSwizzle::Create(*pcie, 0, arg->dev_pin_to_global_irq);
     if (root == nullptr)
         return ZX_ERR_NO_MEMORY;
-
-    // Enable PIO config space if the address window was not MMIO
-    pcie->EnablePIOWorkaround(!arg->addr_windows[0].is_mmio);
 
     zx_status_t ret = pcie->AddRoot(fbl::move(root));
     if (ret != ZX_OK) {
@@ -306,6 +419,7 @@ zx_status_t sys_pci_init(zx_handle_t handle, user_in_ptr<const zx_pci_init_arg_t
     return ZX_OK;
 }
 
+// zx_status_t zx_pci_get_nth_device
 zx_status_t sys_pci_get_nth_device(zx_handle_t hrsrc,
                                    uint32_t index,
                                    user_out_ptr<zx_pcie_device_info_t> out_info,
@@ -343,6 +457,7 @@ zx_status_t sys_pci_get_nth_device(zx_handle_t hrsrc,
     return out_handle->make(fbl::move(dispatcher), rights);
 }
 
+// zx_status_t zx_pci_config_read
 zx_status_t sys_pci_config_read(zx_handle_t handle, uint16_t offset, size_t width,
                                 user_out_ptr<uint32_t> out_val) {
     fbl::RefPtr<PciDeviceDispatcher> pci_device;
@@ -379,6 +494,7 @@ zx_status_t sys_pci_config_read(zx_handle_t handle, uint16_t offset, size_t widt
     return ZX_ERR_INVALID_ARGS;
 }
 
+// zx_status_t zx_pci_config_write
 zx_status_t sys_pci_config_write(zx_handle_t handle, uint16_t offset, size_t width, uint32_t val) {
     fbl::RefPtr<PciDeviceDispatcher> pci_device;
     fbl::RefPtr<Dispatcher> dispatcher;
@@ -418,6 +534,7 @@ zx_status_t sys_pci_config_write(zx_handle_t handle, uint16_t offset, size_t wid
 /* This is a transitional method to bootstrap legacy PIO access before
  * PCI moves to userspace.
  */
+// zx_status_t zx_pci_cfg_pio_rw
 zx_status_t sys_pci_cfg_pio_rw(zx_handle_t handle, uint8_t bus, uint8_t dev, uint8_t func,
                                uint8_t offset, user_inout_ptr<uint32_t> val, size_t width, bool write) {
 #if ARCH_X86
@@ -443,6 +560,7 @@ zx_status_t sys_pci_cfg_pio_rw(zx_handle_t handle, uint8_t bus, uint8_t dev, uin
 #endif
 }
 
+// zx_status_t zx_pci_enable_bus_master
 zx_status_t sys_pci_enable_bus_master(zx_handle_t dev_handle, bool enable) {
     /**
      * Enables or disables bus mastering for the PCI device associated with the handle.
@@ -461,6 +579,7 @@ zx_status_t sys_pci_enable_bus_master(zx_handle_t dev_handle, bool enable) {
     return pci_device->EnableBusMaster(enable);
 }
 
+// zx_status_t zx_pci_reset_device
 zx_status_t sys_pci_reset_device(zx_handle_t dev_handle) {
     /**
      * Resets the PCI device associated with the handle.
@@ -478,6 +597,7 @@ zx_status_t sys_pci_reset_device(zx_handle_t dev_handle) {
     return pci_device->ResetDevice();
 }
 
+// zx_status_t zx_pci_get_bar
 zx_status_t sys_pci_get_bar(zx_handle_t dev_handle,
                             uint32_t bar_num,
                             user_out_ptr<zx_pci_bar_t> out_bar,
@@ -507,7 +627,7 @@ zx_status_t sys_pci_get_bar(zx_handle_t dev_handle,
     // back to the caller as a VMO.
     zx_pci_bar_t bar = {};
     bar.size = info->size;
-    bar.type = (info->is_mmio) ? PCI_BAR_TYPE_MMIO : PCI_BAR_TYPE_PIO;
+    bar.type = (info->is_mmio) ? ZX_PCI_BAR_TYPE_MMIO : ZX_PCI_BAR_TYPE_PIO;
 
     // MMIO based bars are passed back using a VMO. If we end up creating one here
     // without errors then later a handle will be passed back to the caller.
@@ -558,6 +678,7 @@ zx_status_t sys_pci_get_bar(zx_handle_t dev_handle,
     return ZX_OK;
 }
 
+// zx_status_t zx_pci_map_interrupt
 zx_status_t sys_pci_map_interrupt(zx_handle_t dev_handle,
                                   int32_t which_irq,
                                   user_out_handle* out_handle) {
@@ -593,6 +714,7 @@ zx_status_t sys_pci_map_interrupt(zx_handle_t dev_handle,
  * @param mode The IRQ mode whose capabilities are to be queried.
  * @param out_len Out param which will hold the maximum number of IRQs supported by the mode.
  */
+// zx_status_t zx_pci_query_irq_mode
 zx_status_t sys_pci_query_irq_mode(zx_handle_t dev_handle,
                                    uint32_t mode,
                                    user_out_ptr<uint32_t> out_max_irqs) {
@@ -623,6 +745,7 @@ zx_status_t sys_pci_query_irq_mode(zx_handle_t dev_handle,
  * @param mode The IRQ mode to select.
  * @param requested_irq_count The number of IRQs to select request for the given mode.
  */
+// zx_status_t zx_pci_set_irq_mode
 zx_status_t sys_pci_set_irq_mode(zx_handle_t dev_handle,
                                  uint32_t mode,
                                  uint32_t requested_irq_count) {
@@ -637,56 +760,79 @@ zx_status_t sys_pci_set_irq_mode(zx_handle_t dev_handle,
 
     return pci_device->SetIrqMode((zx_pci_irq_mode_t)mode, requested_irq_count);
 }
-#else  // WITH_DEV_PCIE
+#else  // WITH_KERNEL_PCIE
+// zx_status_t zx_pci_init
 zx_status_t sys_pci_init(zx_handle_t, user_in_ptr<const zx_pci_init_arg_t>, uint32_t) {
     shutdown_early_init_console();
-    return ZX_ERR_NOT_SUPPORTED;
+    return ZX_OK;
 }
 
+// zx_status_t zx_pci_add_subtract_io_range
 zx_status_t sys_pci_add_subtract_io_range(zx_handle_t handle, bool mmio, uint64_t base, uint64_t len, bool add) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
+// zx_status_t zx_pci_config_read
 zx_status_t sys_pci_config_read(zx_handle_t handle, uint16_t offset, size_t width,
                                 user_out_ptr<uint32_t> out_val) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
+// zx_status_t zx_pci_config_write
 zx_status_t sys_pci_config_write(zx_handle_t handle, uint16_t offset, size_t width, uint32_t val) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
+// zx_status_t zx_pci_cfg_pio_rw
 zx_status_t sys_pci_cfg_pio_rw(zx_handle_t handle, uint8_t bus, uint8_t dev, uint8_t func,
                                uint8_t offset, user_inout_ptr<uint32_t> val, size_t width, bool write) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
+// zx_status_t zx_pci_get_nth_device
 zx_status_t sys_pci_get_nth_device(zx_handle_t, uint32_t, user_inout_ptr<zx_pcie_device_info_t>,
                                    user_out_handle*) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
+// zx_status_t zx_pci_enable_bus_master
 zx_status_t sys_pci_enable_bus_master(zx_handle_t, bool) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
+// zx_status_t zx_pci_reset_device
 zx_status_t sys_pci_reset_device(zx_handle_t) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
-zx_status_t sys_pci_get_bar(zx_handle_t, uint32_t, pci_resource_t**, user_out_handle*) {
+// zx_status_t zx_pci_get_nth_device
+zx_status_t sys_pci_get_nth_device(zx_handle_t hrsrc,
+                                   uint32_t index,
+                                   user_out_ptr<zx_pcie_device_info_t> out_info,
+                                   user_out_handle* out_handle) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
+// zx_status_t zx_pci_get_bar
+zx_status_t sys_pci_get_bar(zx_handle_t dev_handle,
+                            uint32_t bar_num,
+                            user_out_ptr<zx_pci_bar_t> out_bar,
+                            user_out_handle* out_handle) {
+    return ZX_ERR_NOT_SUPPORTED;
+}
+
+// zx_status_t zx_pci_map_interrupt
 zx_status_t sys_pci_map_interrupt(zx_handle_t, int32_t, user_out_handle*) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
+// zx_status_t zx_pci_query_irq_mode
 zx_status_t sys_pci_query_irq_mode(zx_handle_t, uint32_t, user_out_ptr<uint32_t>) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
+// zx_status_t zx_pci_set_irq_mode
 zx_status_t sys_pci_set_irq_mode(zx_handle_t, uint32_t, uint32_t) {
     return ZX_ERR_NOT_SUPPORTED;
 }
-#endif // WITH_DEV_PCIE
+#endif // WITH_KERNEL_PCIE

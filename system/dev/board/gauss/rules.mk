@@ -16,9 +16,13 @@ MODULE_SRCS += \
     $(LOCAL_DIR)/gauss-i2c.c \
     $(LOCAL_DIR)/gauss-pcie.c \
     $(LOCAL_DIR)/gauss-usb.c \
+    $(LOCAL_DIR)/gauss-rawnand.c \
+
+MODULE_HEADER_DEPS := \
+    system/dev/pci/designware
 
 MODULE_STATIC_LIBS := \
-    system/dev/soc/amlogic \
+    system/dev/lib/amlogic \
     system/ulib/ddk \
     system/ulib/sync
 

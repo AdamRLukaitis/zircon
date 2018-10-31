@@ -64,8 +64,7 @@ zx_status_t PciBackend::InterruptValid() {
 }
 
 zx_status_t PciBackend::WaitForInterrupt() {
-    uint64_t slots;
-    return zx_interrupt_wait(irq_handle_.get(), &slots);
+    return zx_interrupt_wait(irq_handle_.get(), nullptr);
 }
 
 } // namespace virtio

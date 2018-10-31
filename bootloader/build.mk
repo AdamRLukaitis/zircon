@@ -8,7 +8,7 @@ LOCAL_DIR := $(GET_LOCAL_DIR)
 
 EFI_LIBDIRS := system/ulib/tftp
 
-EFI_CFLAGS += -nostdinc -I$(LOCAL_DIR)/include -I$(LOCAL_DIR)/src
+EFI_CFLAGS += -I$(LOCAL_DIR)/include -I$(LOCAL_DIR)/src
 EFI_CFLAGS += -Isystem/public -Isystem/private
 EFI_CFLAGS += $(foreach LIBDIR,$(EFI_LIBDIRS),-I$(LIBDIR)/include)
 
@@ -33,6 +33,7 @@ endif
 # Bootloader sources
 EFI_SOURCES := \
     $(LOCAL_DIR)/src/osboot.c \
+    $(LOCAL_DIR)/src/diskio.c \
     $(LOCAL_DIR)/src/cmdline.c \
     $(LOCAL_DIR)/src/zircon.c \
     $(LOCAL_DIR)/src/misc.c \

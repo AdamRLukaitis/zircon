@@ -28,25 +28,30 @@ public:
         return *this;
     }
 
-    static zx_status_t create(const resource& resource, uint32_t options, interrupt* result);
+    static zx_status_t create(const resource& resource, uint32_t vector,
+                        uint32_t options, interrupt* result);
 
-    zx_status_t bind(uint32_t slot, const resource& resource, uint32_t vector, uint32_t options) {
-        return zx_interrupt_bind(get(), slot, resource.get(), vector, options);
+    zx_status_t wait(zx::time* timestamp) {
+        return zx_interrupt_wait(get(), timestamp->get_address());
     }
 
-    zx_status_t wait(uint64_t* slots) {
-        return zx_interrupt_wait(get(), slots);
+    zx_status_t destroy() {
+        return zx_interrupt_destroy(get());
     }
 
-    zx_status_t get_timestamp(uint32_t slot, zx::time* timestamp) {
-        return zx_interrupt_get_timestamp(get(), slot, timestamp->get_address());
+    zx_status_t trigger(uint32_t options, zx::time timestamp) {
+        return zx_interrupt_trigger(get(), options, timestamp.get());
     }
 
-    zx_status_t signal(uint32_t slot, zx::time timestamp) {
-        return zx_interrupt_signal(get(), slot, timestamp.get());
+    zx_status_t bind(zx_handle_t porth, uint64_t key, uint32_t options) {
+        return zx_interrupt_bind(get(), porth, key, options);
+    }
+
+    zx_status_t ack() {
+        return zx_interrupt_ack(get());
     }
 };
 
-using unowned_interrupt = const unowned<interrupt>;
+using unowned_interrupt = unowned<interrupt>;
 
 } // namespace zx

@@ -26,16 +26,42 @@ namespace fidl {
 
 class CGenerator {
 public:
-    explicit CGenerator(const flat::Library* library) : library_(library) {}
+    explicit CGenerator(const flat::Library* library)
+        : library_(library) {}
 
     ~CGenerator() = default;
 
-    std::ostringstream Produce();
+    std::ostringstream ProduceHeader();
+    std::ostringstream ProduceClient();
+    std::ostringstream ProduceServer();
 
     struct Member {
+        flat::Type::Kind kind;
+        flat::Decl::Kind decl_kind;
         std::string type;
         std::string name;
+        // Name of the element type for sequential collections.
+        // For (multidimensional-) arrays, it names the inner-most type.
+        // For FIDL vector<T>, it names T.
+        std::string element_type;
         std::vector<uint32_t> array_counts;
+        types::Nullability nullability;
+    };
+
+    struct NamedMessage {
+        std::string c_name;
+        std::string coded_name;
+        const std::vector<flat::Interface::Method::Parameter>& parameters;
+        const TypeShape& typeshape;
+    };
+
+    struct NamedMethod {
+        uint32_t ordinal;
+        std::string ordinal_name;
+        std::string identifier;
+        std::string c_name;
+        std::unique_ptr<NamedMessage> request;
+        std::unique_ptr<NamedMessage> response;
     };
 
 private:
@@ -49,20 +75,9 @@ private:
         const flat::Enum& enum_info;
     };
 
-    struct NamedMessage {
-        std::string c_name;
-        std::string coded_name;
-        const std::vector<flat::Interface::Method::Parameter>& parameters;
-    };
-
-    struct NamedMethod {
-        uint32_t ordinal;
-        std::string ordinal_name;
-        std::unique_ptr<NamedMessage> request;
-        std::unique_ptr<NamedMessage> response;
-    };
-
     struct NamedInterface {
+        std::string c_name;
+        std::string discoverable_name;
         std::vector<NamedMethod> methods;
     };
 
@@ -70,6 +85,12 @@ private:
         std::string c_name;
         std::string coded_name;
         const flat::Struct& struct_info;
+    };
+
+    struct NamedTable {
+        std::string c_name;
+        std::string coded_name;
+        const flat::Table& table_info;
     };
 
     struct NamedUnion {
@@ -82,6 +103,8 @@ private:
 
     void GenerateIntegerDefine(StringView name, types::PrimitiveSubtype subtype, StringView value);
     void GenerateIntegerTypedef(types::PrimitiveSubtype subtype, StringView name);
+    void GeneratePrimitiveDefine(StringView name, types::PrimitiveSubtype subtype, StringView value);
+    void GenerateStringDefine(StringView name, StringView value);
     void GenerateStructTypedef(StringView name);
 
     void GenerateStructDeclaration(StringView name, const std::vector<Member>& members);
@@ -95,6 +118,8 @@ private:
     NameInterfaces(const std::vector<std::unique_ptr<flat::Interface>>& interface_infos);
     std::map<const flat::Decl*, NamedStruct>
     NameStructs(const std::vector<std::unique_ptr<flat::Struct>>& struct_infos);
+    std::map<const flat::Decl*, NamedTable>
+    NameTables(const std::vector<std::unique_ptr<flat::Table>>& table_infos);
     std::map<const flat::Decl*, NamedUnion>
     NameUnions(const std::vector<std::unique_ptr<flat::Union>>& union_infos);
 
@@ -102,6 +127,7 @@ private:
     void ProduceEnumForwardDeclaration(const NamedEnum& named_enum);
     void ProduceInterfaceForwardDeclaration(const NamedInterface& named_interface);
     void ProduceStructForwardDeclaration(const NamedStruct& named_struct);
+    void ProduceTableForwardDeclaration(const NamedTable& named_table);
     void ProduceUnionForwardDeclaration(const NamedUnion& named_union);
 
     void ProduceInterfaceExternDeclaration(const NamedInterface& named_interface);
@@ -110,10 +136,17 @@ private:
     void ProduceMessageDeclaration(const NamedMessage& named_message);
     void ProduceInterfaceDeclaration(const NamedInterface& named_interface);
     void ProduceStructDeclaration(const NamedStruct& named_struct);
+    void ProduceTableDeclaration(const NamedStruct& named_struct);
     void ProduceUnionDeclaration(const NamedUnion& named_union);
 
+    void ProduceInterfaceClientDeclaration(const NamedInterface& named_interface);
+    void ProduceInterfaceClientImplementation(const NamedInterface& named_interface);
+
+    void ProduceInterfaceServerDeclaration(const NamedInterface& named_interface);
+    void ProduceInterfaceServerImplementation(const NamedInterface& named_interface);
+
     const flat::Library* library_;
-    std::ostringstream header_file_;
+    std::ostringstream file_;
 };
 
 } // namespace fidl

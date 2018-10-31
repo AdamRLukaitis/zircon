@@ -27,6 +27,10 @@ a process under such a job.)
 
 Job handles may be waited on (TODO(cpu): expand this)
 
+## RIGHTS
+
+TODO(ZX-2399)
+
 ## RETURN VALUE
 
 **job_create**() returns ZX_OK and a handle to the new job
@@ -41,11 +45,13 @@ is returned.
 
 **ZX_ERR_INVALID_ARGS**  *options* is nonzero, or *out* is an invalid pointer.
 
-**ZX_ERR_ACCESS_DENIED**  *job* does not have the **ZX_RIGHT_WRITE** right.
+**ZX_ERR_ACCESS_DENIED**  *job* does not have the **ZX_RIGHT_WRITE** or **ZX_RIGHT_MANAGE_JOB** right.
 
 **ZX_ERR_OUT_OF_RANGE**  The height of *job* is too large to create a child job.
 
-**ZX_ERR_NO_MEMORY**  (Temporary) Failure due to lack of memory.
+**ZX_ERR_NO_MEMORY**  Failure due to lack of memory.
+There is no good way for userspace to handle this (unlikely) error.
+In a future build this error will no longer occur.
 
 **ZX_ERR_BAD_STATE**  The parent job object is in the dead state.
 

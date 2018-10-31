@@ -2,8 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include <fstream>
 #include <iostream>
@@ -15,9 +17,10 @@
 
 #include <fidl/c_generator.h>
 #include <fidl/flat_ast.h>
-#include <fidl/identifier_table.h>
 #include <fidl/json_generator.h>
 #include <fidl/lexer.h>
+#include <fidl/library_zx.h>
+#include <fidl/names.h>
 #include <fidl/parser.h>
 #include <fidl/source_manager.h>
 #include <fidl/tables_generator.h>
@@ -27,6 +30,8 @@ namespace {
 void Usage() {
     std::cout
         << "usage: fidlc [--c-header HEADER_PATH]\n"
+           "             [--c-client CLIENT_PATH]\n"
+           "             [--c-server SERVER_PATH]\n"
            "             [--tables TABLES_PATH]\n"
            "             [--json JSON_PATH]\n"
            "             [--name LIBRARY_NAME]\n"
@@ -35,6 +40,12 @@ void Usage() {
            "\n"
            " * `--c-header HEADER_PATH`. If present, this flag instructs `fidlc` to output\n"
            "   a C header at the given path.\n"
+           "\n"
+           " * `--c-client CLIENT_PATH`. If present, this flag instructs `fidlc` to output\n"
+           "   the simple C client implementation at the given path.\n"
+           "\n"
+           " * `--c-server SERVER_PATH`. If present, this flag instructs `fidlc` to output\n"
+           "   the simple C server implementation at the given path.\n"
            "\n"
            " * `--tables TABLES_PATH`. If present, this flag instructs `fidlc` to output\n"
            "   coding tables at the given path. The coding tables are required to encode and\n"
@@ -86,7 +97,34 @@ void Usage() {
     exit(1);
 }
 
+void MakeParentDirectory(const std::string& filename) {
+    std::string::size_type slash = 0;
+
+    for (;;) {
+        slash = filename.find('/', slash);
+        if (slash == filename.npos) {
+            return;
+        }
+
+        std::string path = filename.substr(0, slash);
+        ++slash;
+        if (path.size() == 0u) {
+            // Skip creating "/".
+            continue;
+        }
+
+        if (mkdir(path.data(), 0755) != 0 && errno != EEXIST) {
+            Fail("Could not create directory %s for output file %s: error %s\n",
+                 path.data(), filename.data(), strerror(errno));
+        }
+    }
+}
+
 std::fstream Open(std::string filename, std::ios::openmode mode) {
+    if ((mode & std::ios::out) != 0) {
+        MakeParentDirectory(filename);
+    }
+
     std::fstream stream;
     stream.open(filename, mode);
     if (!stream.is_open()) {
@@ -121,6 +159,9 @@ public:
     bool Remaining() const override { return count_ > 0; }
 
     bool HeadIsResponseFile() {
+        if (count_ == 0) {
+            return false;
+        }
         return arguments_[0][0] == '@';
     }
 
@@ -131,14 +172,15 @@ private:
 
 class ResponseFileArguments : public Arguments {
 public:
-    ResponseFileArguments(fidl::StringView filename) : file_(Open(filename, std::ios::in)) {
+    ResponseFileArguments(fidl::StringView filename)
+        : file_(Open(filename, std::ios::in)) {
         ConsumeWhitespace();
     }
 
     std::string Claim() override {
         std::string argument;
         while (Remaining() && !IsWhitespace()) {
-            argument.push_back(file_.get());
+            argument.push_back(static_cast<char>(file_.get()));
         }
         ConsumeWhitespace();
         return argument;
@@ -169,14 +211,16 @@ private:
 };
 
 enum struct Behavior {
-    CHeader,
-    Tables,
-    JSON,
+    kCHeader,
+    kCClient,
+    kCServer,
+    kTables,
+    kJSON,
 };
 
-bool Parse(const fidl::SourceFile& source_file, fidl::IdentifierTable* identifier_table,
+bool Parse(const fidl::SourceFile& source_file,
            fidl::ErrorReporter* error_reporter, fidl::flat::Library* library) {
-    fidl::Lexer lexer(source_file, identifier_table);
+    fidl::Lexer lexer(source_file, error_reporter);
     fidl::Parser parser(&lexer, error_reporter);
     auto ast = parser.Parse();
     if (!parser.Ok()) {
@@ -188,19 +232,30 @@ bool Parse(const fidl::SourceFile& source_file, fidl::IdentifierTable* identifie
     return true;
 }
 
-template <typename Generator> void Generate(Generator* generator, std::fstream file) {
-    auto generated_output = generator->Produce();
-    file << generated_output.str();
+void Write(std::ostringstream output, std::fstream file) {
+    file << output.str();
     file.flush();
 }
 
 } // namespace
+
+// TODO(pascallouis): remove forward declaration, this was only introduced to
+// reduce diff size while breaking things up.
+int compile(fidl::ErrorReporter* error_reporter,
+            std::string library_name,
+            std::map<Behavior, std::fstream> outputs,
+            std::vector<fidl::SourceManager> source_managers);
 
 int main(int argc, char* argv[]) {
     auto argv_args = std::make_unique<ArgvArguments>(argc, argv);
 
     // Parse the program name.
     argv_args->Claim();
+
+    if (!argv_args->Remaining()) {
+        Usage();
+        exit(0);
+    }
 
     // Check for a response file. After this, |args| is either argv or
     // the response file contents.
@@ -229,11 +284,15 @@ int main(int argc, char* argv[]) {
             Usage();
             exit(0);
         } else if (behavior_argument == "--c-header") {
-            outputs.emplace(Behavior::CHeader, Open(args->Claim(), std::ios::out));
+            outputs.emplace(Behavior::kCHeader, Open(args->Claim(), std::ios::out));
+        } else if (behavior_argument == "--c-client") {
+            outputs.emplace(Behavior::kCClient, Open(args->Claim(), std::ios::out));
+        } else if (behavior_argument == "--c-server") {
+            outputs.emplace(Behavior::kCServer, Open(args->Claim(), std::ios::out));
         } else if (behavior_argument == "--tables") {
-            outputs.emplace(Behavior::Tables, Open(args->Claim(), std::ios::out));
+            outputs.emplace(Behavior::kTables, Open(args->Claim(), std::ios::out));
         } else if (behavior_argument == "--json") {
-            outputs.emplace(Behavior::JSON, Open(args->Claim(), std::ios::out));
+            outputs.emplace(Behavior::kJSON, Open(args->Claim(), std::ios::out));
         } else if (behavior_argument == "--name") {
             library_name = args->Claim();
         } else if (behavior_argument == "--files") {
@@ -244,8 +303,12 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Parse libraries.
+    // Prepare source files.
     std::vector<fidl::SourceManager> source_managers;
+    source_managers.push_back(fidl::SourceManager());
+    std::string library_zx_data(fidl::LibraryZX::kData, strlen(fidl::LibraryZX::kData) + 1);
+    source_managers.back().AddSourceFile(
+        std::make_unique<fidl::SourceFile>(fidl::LibraryZX::kFilename, std::move(library_zx_data)));
     source_managers.push_back(fidl::SourceManager());
     while (args->Remaining()) {
         std::string arg = args->Claim();
@@ -258,42 +321,51 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    fidl::IdentifierTable identifier_table;
+    // Ready. Set. Go.
     fidl::ErrorReporter error_reporter;
-    std::map<fidl::StringView, std::unique_ptr<fidl::flat::Library>> compiled_libraries;
+    auto status = compile(&error_reporter,
+                          library_name,
+                          std::move(outputs),
+                          std::move(source_managers));
+    error_reporter.PrintReports();
+    return status;
+}
+
+int compile(fidl::ErrorReporter* error_reporter,
+            std::string library_name,
+            std::map<Behavior, std::fstream> outputs,
+            std::vector<fidl::SourceManager> source_managers) {
+    fidl::flat::Libraries all_libraries;
     const fidl::flat::Library* final_library = nullptr;
     for (const auto& source_manager : source_managers) {
         if (source_manager.sources().empty()) {
             continue;
         }
-        auto library = std::make_unique<fidl::flat::Library>(&compiled_libraries, &error_reporter);
+        auto library = std::make_unique<fidl::flat::Library>(&all_libraries, error_reporter);
         for (const auto& source_file : source_manager.sources()) {
-            if (!Parse(*source_file, &identifier_table, &error_reporter, library.get())) {
-                error_reporter.PrintReports();
+            if (!Parse(*source_file, error_reporter, library.get())) {
                 return 1;
             }
         }
         if (!library->Compile()) {
-            error_reporter.PrintReports();
             return 1;
         }
         final_library = library.get();
-        auto name_and_library = std::make_pair(library->name(), std::move(library));
-        auto iter = compiled_libraries.insert(std::move(name_and_library));
-        if (!iter.second) {
-            auto name = iter.first->first;
-            Fail("Mulitple libraries with the same name: '%.*s'\n",
-                 static_cast<int>(name.size()), name.data());
+        if (!all_libraries.Insert(std::move(library))) {
+            const auto& name = library->name();
+            Fail("Mulitple libraries with the same name: '%s'\n",
+                 NameLibrary(name).data());
         }
     }
     if (final_library == nullptr) {
         Fail("No library was produced.\n");
     }
 
-    if (!library_name.empty() && final_library->name() != library_name) {
-        auto name = final_library->name();
-        Fail("Generated library '%.*s' did not match --name argument: %s\n",
-             static_cast<int>(name.size()), name.data(), library_name.c_str());
+    // Verify that the produced library's name matches the expected name.
+    std::string final_name = NameLibrary(final_library->name());
+    if (!library_name.empty() && final_name != library_name) {
+        Fail("Generated library '%s' did not match --name argument: %s\n",
+             final_name.data(), library_name.data());
     }
 
     // We recompile dependencies, and only emit output for the final
@@ -303,21 +375,32 @@ int main(int argc, char* argv[]) {
         auto& output_file = output.second;
 
         switch (behavior) {
-        case Behavior::CHeader: {
+        case Behavior::kCHeader: {
             fidl::CGenerator generator(final_library);
-            Generate(&generator, std::move(output_file));
+            Write(generator.ProduceHeader(), std::move(output_file));
             break;
         }
-        case Behavior::Tables: {
+        case Behavior::kCClient: {
+            fidl::CGenerator generator(final_library);
+            Write(generator.ProduceClient(), std::move(output_file));
+            break;
+        }
+        case Behavior::kCServer: {
+            fidl::CGenerator generator(final_library);
+            Write(generator.ProduceServer(), std::move(output_file));
+            break;
+        }
+        case Behavior::kTables: {
             fidl::TablesGenerator generator(final_library);
-            Generate(&generator, std::move(output_file));
+            Write(generator.Produce(), std::move(output_file));
             break;
         }
-        case Behavior::JSON: {
+        case Behavior::kJSON: {
             fidl::JSONGenerator generator(final_library);
-            Generate(&generator, std::move(output_file));
+            Write(generator.Produce(), std::move(output_file));
             break;
         }
         }
     }
+    return 0;
 }

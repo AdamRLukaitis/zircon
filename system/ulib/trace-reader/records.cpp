@@ -43,7 +43,7 @@ const char* ThreadStateToString(ThreadState state) {
 }
 
 const char* ObjectTypeToString(zx_obj_type_t type) {
-    static_assert(ZX_OBJ_TYPE_LAST == 27, "need to update switch below");
+    static_assert(ZX_OBJ_TYPE_LAST == 28, "need to update switch below");
 
     switch (type) {
     case ZX_OBJ_TYPE_PROCESS:
@@ -68,7 +68,7 @@ const char* ObjectTypeToString(zx_obj_type_t type) {
         return "socket";
     case ZX_OBJ_TYPE_RESOURCE:
         return "resource";
-    case ZX_OBJ_TYPE_EVENT_PAIR:
+    case ZX_OBJ_TYPE_EVENTPAIR:
         return "event-pair";
     case ZX_OBJ_TYPE_JOB:
         return "job";
@@ -90,6 +90,8 @@ const char* ObjectTypeToString(zx_obj_type_t type) {
         return "profile";
     case ZX_OBJ_TYPE_PMT:
         return "pmt";
+    case ZX_OBJ_TYPE_SUSPEND_TOKEN:
+        return "suspend-token";
     default:
         return "???";
     }
@@ -455,12 +457,15 @@ fbl::String Record::ToString() const {
         break;
     case RecordType::kContextSwitch:
         return fbl::StringPrintf("ContextSwitch(ts: %" PRIu64 ", cpu: %" PRIu32
-                                  ", os: %s, opt: %s, ipt: %s",
+                                  ", os: %s, opt: %s, ipt: %s"
+                                  ", oprio: %" PRIu32 ", iprio: %" PRIu32 ")",
                                   context_switch_.timestamp,
                                   context_switch_.cpu_number,
                                   ThreadStateToString(context_switch_.outgoing_thread_state),
                                   context_switch_.outgoing_thread.ToString().c_str(),
-                                  context_switch_.incoming_thread.ToString().c_str());
+                                  context_switch_.incoming_thread.ToString().c_str(),
+                                  context_switch_.outgoing_thread_priority,
+                                  context_switch_.incoming_thread_priority);
     case RecordType::kLog:
         return fbl::StringPrintf("Log(ts: %" PRIu64 ", pt: %s, \"%s\")",
                                   log_.timestamp, log_.process_thread.ToString().c_str(),

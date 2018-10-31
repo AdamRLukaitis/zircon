@@ -18,11 +18,8 @@
 #include <object/thread_dispatcher.h>
 
 #include <fbl/alloc_checker.h>
-#include <fbl/auto_lock.h>
 
 #include <trace.h>
-
-using fbl::AutoLock;
 
 #define LOCAL_TRACE 0
 
@@ -36,6 +33,7 @@ static PortPacket* MakePacket(uint64_t key, uint32_t type, zx_koid_t pid, zx_koi
 
     port_packet->packet.key = key;
     port_packet->packet.type = type;
+    port_packet->packet.status = ZX_OK;
     port_packet->packet.exception.pid = pid;
     port_packet->packet.exception.tid = tid;
     port_packet->packet.exception.reserved0 = 0;
@@ -76,8 +74,8 @@ void ExceptionPort::SetTarget(const fbl::RefPtr<JobDispatcher>& target) {
     canary_.Assert();
 
     LTRACE_ENTRY_OBJ;
-    AutoLock lock(&lock_);
-    DEBUG_ASSERT_MSG(type_ == Type::JOB,
+    Guard<fbl::Mutex> guard{&lock_};
+    DEBUG_ASSERT_MSG(type_ == Type::JOB || type_ == Type::JOB_DEBUGGER,
                      "unexpected type %d", static_cast<int>(type_));
     DEBUG_ASSERT(!IsBoundLocked());
     DEBUG_ASSERT(target != nullptr);
@@ -89,7 +87,7 @@ void ExceptionPort::SetTarget(const fbl::RefPtr<ProcessDispatcher>& target) {
     canary_.Assert();
 
     LTRACE_ENTRY_OBJ;
-    AutoLock lock(&lock_);
+    Guard<fbl::Mutex> guard{&lock_};
     DEBUG_ASSERT_MSG(type_ == Type::DEBUGGER || type_ == Type::PROCESS,
                      "unexpected type %d", static_cast<int>(type_));
     DEBUG_ASSERT(!IsBoundLocked());
@@ -102,7 +100,7 @@ void ExceptionPort::SetTarget(const fbl::RefPtr<ThreadDispatcher>& target) {
     canary_.Assert();
 
     LTRACE_ENTRY_OBJ;
-    AutoLock lock(&lock_);
+    Guard<fbl::Mutex> guard{&lock_};
     DEBUG_ASSERT_MSG(type_ == Type::THREAD,
                      "unexpected type %d", static_cast<int>(type_));
     DEBUG_ASSERT(!IsBoundLocked());
@@ -120,7 +118,7 @@ void ExceptionPort::OnPortZeroHandles() {
     static const bool default_quietness = false;
 
     LTRACE_ENTRY_OBJ;
-    AutoLock lock(&lock_);
+    Guard<fbl::Mutex> guard{&lock_};
     if (port_ == nullptr) {
         // Already unbound. This can happen when
         // PortDispatcher::on_zero_handles and a manual unbind (via
@@ -137,17 +135,18 @@ void ExceptionPort::OnPortZeroHandles() {
     // we release the lock.
     if (!IsBoundLocked()) {
         // Created but never bound.
-        lock.release();
+        guard.Release();
         // Simulate an unbinding to finish cleaning up.
         OnTargetUnbind();
     } else {
         switch (type_) {
-            case Type::JOB: {
+            case Type::JOB:
+            case Type::JOB_DEBUGGER: {
                 DEBUG_ASSERT(target_ != nullptr);
                 auto job = DownCastDispatcher<JobDispatcher>(&target_);
                 DEBUG_ASSERT(job != nullptr);
-                lock.release();  // The target may call our ::OnTargetUnbind
-                job->ResetExceptionPort(default_quietness);
+                guard.Release();  // The target may call our ::OnTargetUnbind
+                job->ResetExceptionPort(type_ == Type::JOB_DEBUGGER, default_quietness);
                 break;
             }
             case Type::PROCESS:
@@ -155,7 +154,7 @@ void ExceptionPort::OnPortZeroHandles() {
                 DEBUG_ASSERT(target_ != nullptr);
                 auto process = DownCastDispatcher<ProcessDispatcher>(&target_);
                 DEBUG_ASSERT(process != nullptr);
-                lock.release();  // The target may call our ::OnTargetUnbind
+                guard.Release();  // The target may call our ::OnTargetUnbind
                 process->ResetExceptionPort(type_ == Type::DEBUGGER, default_quietness);
                 break;
             }
@@ -163,7 +162,7 @@ void ExceptionPort::OnPortZeroHandles() {
                 DEBUG_ASSERT(target_ != nullptr);
                 auto thread = DownCastDispatcher<ThreadDispatcher>(&target_);
                 DEBUG_ASSERT(thread != nullptr);
-                lock.release();  // The target may call our ::OnTargetUnbind
+                guard.Release();  // The target may call our ::OnTargetUnbind
                 thread->ResetExceptionPort(default_quietness);
                 break;
             }
@@ -172,13 +171,13 @@ void ExceptionPort::OnPortZeroHandles() {
         }
     }
     // All cases must release the lock.
-    DEBUG_ASSERT(!lock_.IsHeld());
+    DEBUG_ASSERT(!lock_.lock().IsHeld());
 
 #if (LK_DEBUGLEVEL > 1)
     // The target should have called back into ::OnTargetUnbind by this point,
     // cleaning up our references.
     {
-        AutoLock lock2(&lock_);
+        Guard<fbl::Mutex> guard2{&lock_};
         DEBUG_ASSERT(port_ == nullptr);
         DEBUG_ASSERT(!IsBoundLocked());
     }
@@ -193,7 +192,7 @@ void ExceptionPort::OnTargetUnbind() {
     LTRACE_ENTRY_OBJ;
     fbl::RefPtr<PortDispatcher> port;
     {
-        AutoLock lock(&lock_);
+        Guard<fbl::Mutex> guard{&lock_};
         if (port_ == nullptr) {
             // Already unbound.
             // This could happen if ::OnPortZeroHandles releases the
@@ -221,8 +220,13 @@ void ExceptionPort::OnTargetUnbind() {
     LTRACE_EXIT_OBJ;
 }
 
+bool ExceptionPort::PortMatches(const PortDispatcher *port, bool allow_null) {
+    Guard<fbl::Mutex> guard{&lock_};
+    return (allow_null && port_ == nullptr) || port_.get() == port;
+}
+
 zx_status_t ExceptionPort::SendPacketWorker(uint32_t type, zx_koid_t pid, zx_koid_t tid) {
-    AutoLock lock(&lock_);
+    Guard<fbl::Mutex> guard{&lock_};
     LTRACEF("%s, type %u, pid %" PRIu64 ", tid %" PRIu64 "\n",
             port_ == nullptr ? "Not sending exception report on unbound port"
                 : "Sending exception report",
@@ -278,7 +282,32 @@ void ExceptionPort::OnThreadStartForDebugger(ThreadDispatcher* thread) {
     // There is no iframe at the moment. We'll need one (or equivalent) if/when
     // we want to make $pc, $sp available.
     memset(&context, 0, sizeof(context));
-    ThreadDispatcher::ExceptionStatus estatus;
+    ThreadState::Exception estatus;
+    auto status = thread->ExceptionHandlerExchange(fbl::RefPtr<ExceptionPort>(this), &report, &context, &estatus);
+    if (status != ZX_OK) {
+        // Ignore any errors. There's nothing we can do here, and
+        // we still want the thread to run. It's possible the thread was
+        // killed (status == ZX_ERR_INTERNAL_INTR_KILLED), the kernel will kill the
+        // thread shortly.
+    }
+}
+
+void ExceptionPort::OnProcessStartForDebugger(ThreadDispatcher* thread) {
+    canary_.Assert();
+
+    DEBUG_ASSERT(type_ == Type::JOB_DEBUGGER);
+
+    zx_koid_t pid = thread->process()->get_koid();
+    zx_koid_t tid = thread->get_koid();
+    LTRACEF("process %" PRIu64 ".%" PRIu64 " started\n", pid, tid);
+
+    zx_exception_report_t report;
+    BuildReport(&report, ZX_EXCP_PROCESS_STARTING);
+    arch_exception_context_t context;
+    // There is no iframe at the moment. We'll need one (or equivalent) if/when
+    // we want to make $pc, $sp available.
+    memset(&context, 0, sizeof(context));
+    ThreadState::Exception estatus;
     auto status = thread->ExceptionHandlerExchange(fbl::RefPtr<ExceptionPort>(this), &report, &context, &estatus);
     if (status != ZX_OK) {
         // Ignore any errors. There's nothing we can do here, and
@@ -306,7 +335,7 @@ void ExceptionPort::OnThreadExitForDebugger(ThreadDispatcher* thread) {
     // There is no iframe at the moment. We'll need one (or equivalent) if/when
     // we want to make $pc, $sp available.
     memset(&context, 0, sizeof(context));
-    ThreadDispatcher::ExceptionStatus estatus;
+    ThreadState::Exception estatus;
     // N.B. If the process is exiting it will have killed all threads. That
     // means all threads get marked with THREAD_SIGNAL_KILL which means this
     // exchange will return immediately with ZX_ERR_INTERNAL_INTR_KILLED.

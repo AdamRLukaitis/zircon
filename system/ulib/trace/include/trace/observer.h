@@ -16,9 +16,9 @@
 
 #ifdef __cplusplus
 
+#include <fbl/function.h>
 #include <lib/async/cpp/wait.h>
 #include <lib/zx/event.h>
-#include <fbl/function.h>
 
 namespace trace {
 
@@ -35,16 +35,16 @@ public:
     //
     // |async| the asynchronous dispatcher, must not be null.
     // |callback| the callback which is invoked whenever a state change is observed.
-    void Start(async_t* async, fbl::Closure callback);
+    void Start(async_dispatcher_t* dispatcher, fbl::Closure callback);
 
     // Stops watching for state changes.
     void Stop();
 
 private:
-    async_wait_result_t Handle(async_t* async, zx_status_t status,
-                               const zx_packet_signal_t* signal);
+    void Handle(async_dispatcher_t* dispatcher, async::WaitBase* wait, zx_status_t status,
+                const zx_packet_signal_t* signal);
+    void BeginWait(async_dispatcher_t* dispatcher);
 
-    async_t* async_ = nullptr;
     fbl::Closure callback_;
     zx::event event_;
     async::WaitMethod<TraceObserver, &TraceObserver::Handle> wait_{this};

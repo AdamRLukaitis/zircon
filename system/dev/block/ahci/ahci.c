@@ -7,16 +7,19 @@
 #include <ddk/device.h>
 #include <ddk/driver.h>
 #include <ddk/io-buffer.h>
+#include <ddk/mmio-buffer.h>
 #include <ddk/phys-iter.h>
 #include <ddk/protocol/pci.h>
+#include <ddk/protocol/pci-lib.h>
 
 #include <assert.h>
+#include <hw/pci.h>
 #include <zircon/listnode.h>
 #include <zircon/syscalls.h>
 #include <zircon/types.h>
 #include <zircon/assert.h>
 #include <pretty/hexdump.h>
-#include <sync/completion.h>
+#include <lib/sync/completion.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,8 +75,7 @@ struct ahci_device {
     zx_device_t* zxdev;
 
     ahci_hba_t* regs;
-    uint64_t regs_size;
-    zx_handle_t regs_handle;
+    mmio_buffer_t mmio;
 
     pci_protocol_t pci;
 
@@ -83,10 +85,10 @@ struct ahci_device {
     zx_handle_t bti_handle;
 
     thrd_t worker_thread;
-    completion_t worker_completion;
+    sync_completion_t worker_completion;
 
     thrd_t watchdog_thread;
-    completion_t watchdog_completion;
+    sync_completion_t watchdog_completion;
 
     uint32_t cap;
 
@@ -97,24 +99,24 @@ struct ahci_device {
 static inline zx_status_t ahci_wait_for_clear(const volatile uint32_t* reg, uint32_t mask,
                                               zx_time_t timeout) {
     int i = 0;
-    zx_time_t start_time = zx_clock_get(ZX_CLOCK_MONOTONIC);
+    zx_time_t start_time = zx_clock_get_monotonic();
     do {
         if (!(ahci_read(reg) & mask)) return ZX_OK;
         usleep(10 * 1000);
         i++;
-    } while (zx_clock_get(ZX_CLOCK_MONOTONIC) - start_time < timeout);
+    } while (zx_clock_get_monotonic() - start_time < timeout);
     return ZX_ERR_TIMED_OUT;
 }
 
 static inline zx_status_t ahci_wait_for_set(const volatile uint32_t* reg, uint32_t mask,
                                             zx_time_t timeout) {
     int i = 0;
-    zx_time_t start_time = zx_clock_get(ZX_CLOCK_MONOTONIC);
+    zx_time_t start_time = zx_clock_get_monotonic();
     do {
         if (ahci_read(reg) & mask) return ZX_OK;
         usleep(10 * 1000);
         i++;
-    } while (zx_clock_get(ZX_CLOCK_MONOTONIC) - start_time < timeout);
+    } while (zx_clock_get_monotonic() - start_time < timeout);
     return ZX_ERR_TIMED_OUT;
 }
 
@@ -228,7 +230,7 @@ static void ahci_port_complete_txn(ahci_device_t* dev, ahci_port_t* port, zx_sta
     port->completed |= done;
     mtx_unlock(&port->lock);
     // hit the worker thread to complete commands
-    completion_signal(&dev->worker_completion);
+    sync_completion_signal(&dev->worker_completion);
 }
 
 static zx_status_t ahci_do_txn(ahci_device_t* dev, ahci_port_t* port, int slot, sata_txn_t* txn) {
@@ -249,8 +251,8 @@ static zx_status_t ahci_do_txn(ahci_device_t* dev, ahci_port_t* port, int slot, 
     bool is_write = cmd_is_write(txn->cmd);
     uint32_t options = is_write ? ZX_BTI_PERM_READ : ZX_BTI_PERM_WRITE;
     zx_handle_t pmt;
-    zx_status_t st = zx_bti_pin_new(dev->bti_handle, options, vmo, offset_vmo & ~PAGE_MASK,
-                                    pagecount * PAGE_SIZE, pages, pagecount, &pmt);
+    zx_status_t st = zx_bti_pin(dev->bti_handle, options, vmo, offset_vmo & ~PAGE_MASK,
+                                pagecount * PAGE_SIZE, pages, pagecount, &pmt);
     if (st != ZX_OK) {
         zxlogf(SPEW, "ahci.%d: failed to pin pages, err = %d\n", port->nr, st);
         return st;
@@ -366,8 +368,8 @@ static zx_status_t ahci_do_txn(ahci_device_t* dev, ahci_port_t* port, int slot, 
 
     // set the watchdog
     // TODO: general timeout mechanism
-    txn->timeout = zx_clock_get(ZX_CLOCK_MONOTONIC) + ZX_SEC(1);
-    completion_signal(&dev->watchdog_completion);
+    txn->timeout = zx_clock_get_monotonic() + ZX_SEC(1);
+    sync_completion_signal(&dev->watchdog_completion);
     return ZX_OK;
 }
 
@@ -491,13 +493,14 @@ void ahci_queue(ahci_device_t* device, int portnr, sata_txn_t* txn) {
     list_add_tail(&port->txn_list, &txn->node);
 
     // hit the worker thread
-    completion_signal(&device->worker_completion);
+    sync_completion_signal(&device->worker_completion);
     mtx_unlock(&port->lock);
 }
 
 static void ahci_release(void* ctx) {
     // FIXME - join threads created by this driver
     ahci_device_t* device = ctx;
+    mmio_buffer_release(&device->mmio);
     zx_handle_close(device->irq_handle);
     zx_handle_close(device->bti_handle);
     free(device);
@@ -601,8 +604,8 @@ next:
             mtx_unlock(&port->lock);
         }
         // wait here until more commands are queued, or a port becomes idle
-        completion_wait(&dev->worker_completion, ZX_TIME_INFINITE);
-        completion_reset(&dev->worker_completion);
+        sync_completion_wait(&dev->worker_completion, ZX_TIME_INFINITE);
+        sync_completion_reset(&dev->worker_completion);
     }
     return 0;
 }
@@ -611,7 +614,7 @@ static int ahci_watchdog_thread(void* arg) {
     ahci_device_t* dev = (ahci_device_t*)arg;
     for (;;) {
         bool idle = true;
-        zx_time_t now = zx_clock_get(ZX_CLOCK_MONOTONIC);
+        zx_time_t now = zx_clock_get_monotonic();
         for (int i = 0; i < AHCI_MAX_PORTS; i++) {
             ahci_port_t* port = &dev->ports[i];
             if (!ahci_port_valid(dev, i)) {
@@ -643,8 +646,8 @@ static int ahci_watchdog_thread(void* arg) {
         }
 
         // no need to run the watchdog if there are no active xfers
-        completion_wait(&dev->watchdog_completion, idle ? ZX_TIME_INFINITE : 5ULL * 1000 * 1000 * 1000);
-        completion_reset(&dev->watchdog_completion);
+        sync_completion_wait(&dev->watchdog_completion, idle ? ZX_TIME_INFINITE : 5ULL * 1000 * 1000 * 1000);
+        sync_completion_reset(&dev->watchdog_completion);
     }
     return 0;
 }
@@ -673,8 +676,7 @@ static int ahci_irq_thread(void* arg) {
     ahci_device_t* dev = (ahci_device_t*)arg;
     zx_status_t status;
     for (;;) {
-        uint64_t slots;
-        status = zx_interrupt_wait(dev->irq_handle, &slots);
+        status = zx_interrupt_wait(dev->irq_handle, NULL);
         if (status) {
             zxlogf(ERROR, "ahci: error %d waiting for interrupt\n", status);
             continue;
@@ -780,7 +782,7 @@ fail:
 // implement driver object:
 
 static zx_status_t ahci_bind(void* ctx, zx_device_t* dev) {
-    // map resources and initalize the device
+    // map resources and initialize the device
     ahci_device_t* device = calloc(1, sizeof(ahci_device_t));
     if (!device) {
         zxlogf(ERROR, "ahci: out of memory\n");
@@ -793,16 +795,15 @@ static zx_status_t ahci_bind(void* ctx, zx_device_t* dev) {
     }
 
     // map register window
-    zx_status_t status = pci_map_bar(&device->pci,
+    zx_status_t status = pci_map_bar_buffer(&device->pci,
                                           5u,
                                           ZX_CACHE_POLICY_UNCACHED_DEVICE,
-                                          (void**)&device->regs,
-                                          &device->regs_size,
-                                          &device->regs_handle);
+                                          &device->mmio);
     if (status != ZX_OK) {
         zxlogf(ERROR, "ahci: error %d mapping register window\n", status);
         goto fail;
     }
+    device->regs = device->mmio.vaddr;
 
     zx_pcie_device_info_t config;
     status = pci_get_device_info(&device->pci, &config);
@@ -875,11 +876,11 @@ static zx_status_t ahci_bind(void* ctx, zx_device_t* dev) {
     }
 
     // start watchdog thread
-    device->watchdog_completion = COMPLETION_INIT;
+    device->watchdog_completion = SYNC_COMPLETION_INIT;
     thrd_create_with_name(&device->watchdog_thread, ahci_watchdog_thread, device, "ahci-watchdog");
 
     // start worker thread (for iotxn queue)
-    device->worker_completion = COMPLETION_INIT;
+    device->worker_completion = SYNC_COMPLETION_INIT;
     ret = thrd_create_with_name(&device->worker_thread, ahci_worker_thread, device, "ahci-worker");
     if (ret != thrd_success) {
         zxlogf(ERROR, "ahci: error %d in worker thread create\n", ret);

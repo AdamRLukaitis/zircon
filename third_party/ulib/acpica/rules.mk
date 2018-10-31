@@ -10,6 +10,10 @@ MODULE_TYPE := userlib
 
 SRC_DIR := third_party/lib/acpica/source
 
+ifeq ($(call TOBOOL, $(ENABLE_USER_PCI)), true)
+MODULE_DEFINES += ENABLE_USER_PCI=1
+endif
+
 # We currently only support ACPICA on x86, so compile to an empty
 # lib if we're on non-x86.
 ifeq ($(ARCH),x86)
@@ -178,18 +182,23 @@ else
 MODULE_SRCS += $(LOCAL_DIR)/empty.c
 endif
 
-# Disable these two warnings to prevent ACPICA from cluttering the
-# build output
+# Disable warnings we won't fix in third-party code.
+MODULE_CFLAGS += -Wno-implicit-fallthrough
 ifeq ($(call TOBOOL,$(USE_CLANG)),false)
-MODULE_CFLAGS += -Wno-discarded-qualifiers
+MODULE_CFLAGS += \
+    -Wno-discarded-qualifiers \
+    -Wno-format-signedness
 else
-MODULE_CFLAGS += -Wno-incompatible-pointer-types-discards-qualifiers -Wno-null-pointer-arithmetic
+MODULE_CFLAGS += \
+    -Wno-incompatible-pointer-types-discards-qualifiers \
+    -Wno-null-pointer-arithmetic
 endif
-# We need to specify -fno-strict-aliasing, since ACPICA has a habit of violating strict aliasing
-# rules in some of its macros.  Rewriting this code would increase the maintenance cost of
-# bringing in the latest upstream ACPICA, so instead we mitigate the problem with a compile-time
-# flag.  We take the more conservative approach of disabling strict-aliasing-based optimizations,
-# rather than disabling warnings.
+# We need to specify -fno-strict-aliasing, since ACPICA has a habit of
+# violating strict aliasing rules in some of its macros.  Rewriting this
+# code would increase the maintenance cost of bringing in the latest
+# upstream ACPICA, so instead we mitigate the problem with a compile-time
+# flag.  We take the more conservative approach of disabling
+# strict-aliasing-based optimizations, rather than disabling warnings.
 MODULE_CFLAGS += -fno-strict-aliasing
 
 MODULE_COMPILEFLAGS += -I$(SRC_DIR)/include/acpica
@@ -204,6 +213,7 @@ MODULE_STATIC_LIBS := \
     system/ulib/zxcpp \
 
 MODULE_LIBS := \
-    system/ulib/c
+    system/ulib/c \
+    system/ulib/pci \
 
 include make/module.mk

@@ -23,27 +23,15 @@ lines starting with # are ignored.  Whitespace is not allowed in names.
 If this option is set, the system will not use Address Space Layout
 Randomization.
 
-## crashlogger.disable
+## crashsvc.analyzer=\<service-host\>
 
-If this option is set, the crashlogger is not started. You should leave this
-option off unless you suspect the crashlogger is causing problems.
+If this is empty, the default crash analyzer in svchost will be used
+which logs exception information and a backtrace to the system log. If
+it is set, the crash analyzer will be found in the given service bundle.
+The only valid non-empty value for this currently is "from-appmgr".
 
-## crashlogger.pt=true
-
-If this option is set, the crashlogger will attempt to generate a
-"processor trace" dump along with the crash report. The dump files
-are written as /tmp/crash-pt.\*. This option requires processor tracing
-to be enabled in the kernel. This can be done by running "ipt" program after
-the system has booted. E.g., set zircon.autorun.system like this
-
-```
-zircon.autorun.system=ipt+--circular+--control+init+start
-```
-
-After the files are written, copy them to the host and print them
-with the "ipt-dump" program. See its docs for more info.
-
-This option is only supported on Intel x86 platforms.
+The analyzer process is passed two startup handles: the process and
+thread that sustained the exception.
 
 ## devmgr\.epoch=\<seconds\>
 
@@ -56,6 +44,28 @@ otherwise remain at 0.
 Instructs the devmgr that a /system volume is required.  Without this,
 devmgr assumes this is a standalone Zircon build and not a full Fuchsia
 system.
+
+## devmgr\.suspend-timeout-debug
+
+If this option is set, the system prints out debugging when mexec, suspend,
+reboot, or power off did not finish in 10 seconds.
+
+## devmgr\.suspend-timeout-fallback
+
+If this option is set, the system invokes kernel fallback to reboot or poweroff
+the device when the operation did not finish in 10 seconds.
+
+## devmgr\.devhost\.asan
+
+This option must be set if any drivers not included directly in /boot are built
+with `-fsanitize=address`.  If there are `-fsanitize=address` drivers in /boot,
+then all `-fsanitize=address` drivers will be supported regardless of this
+option.  If this option is not set and there are no such drivers in /boot, then
+drivers built with `-fsanitize=address` cannot be loaded and will be rejected.
+
+## devmgr\.verbose
+
+Turn on verbose logging.
 
 ## driver.\<name>.disable
 
@@ -98,6 +108,20 @@ needed for debugging it may speed up boot to disable it.
 
 This option asks the graphics console to use a specific font.  Currently
 only "9x16" (the default) and "18x32" (a double-size font) are supported.
+
+## iommu.enable=\<bool>
+
+This option (disabled by default) allows the system to use a hardware IOMMU
+if present.
+
+## kernel.bypass-debuglog=\<bool>
+
+When enabled, forces output to the console instead of buffering it. The reason
+we have both a compile switch and a cmdline parameter is to facilitate prints
+in the kernel before cmdline is parsed to be forced to go to the console.
+The compile switch setting overrides the cmdline parameter (if both are present).
+Note that both the compile switch and the cmdline parameter have the side effect
+of disabling irq driven uart Tx.
 
 ## kernel.entropy-mixin=\<hex>
 
@@ -160,6 +184,10 @@ jitterentropy, producing output data that looks closer to uniformly random. Note
 that even when set to false, the CPRNG will re-process the samples, so the
 processing inside of jitterentropy is somewhat redundant.
 
+## kernel.memory-limit-dbg=\<bool>
+
+This option enables verbose logging from the memory limit library.
+
 ## kernel.memory-limit-mb=\<num>
 
 This option tells the kernel to limit system memory to the MB value specified
@@ -205,7 +233,18 @@ This controls what serial port is used.  If provided, it overrides the serial
 port described by the system's bootdata.
 
 If set to "none", the kernel debug serial port will be disabled.
-On x64, if set to "legacy", the legacy COM1 interface is used.
+
+### x64 specific values
+
+On x64, some additional values are supported for configuring 8250-like UARTs:
+- If set to "legacy", the legacy COM1 interface is used.
+- A port-io UART can be specified using "ioport,\<portno>,\<irq>".
+- An MMIO UART can be specified using "mmio,\<physaddr>,\<irq>".
+
+For example, "ioport,0x3f8,4" would describe the legacy COM1 interface.
+
+All numbers may be in any base accepted by *strtoul*().
+
 All other values are currently undefined.
 
 ## kernel.shell=\<bool>
@@ -288,9 +327,11 @@ you to pass arguments to an executable.
 
 ## zircon.system.blob-init=\<command>
 
+**DEPRECATED** See [`zircon.system.pkgfs.cmd`](#zircon.system.pkgfs.cmd).
+
 This option requests that *command* be run once the blob partition is
 mounted. The given command is expected to mount /system, and then signal its
-process handle with `ZX_SIGNAL_USER0`.
+process handle with `ZX_USER_SIGNAL_0`.
 
 *command* may not assume that any other filesystem has been mounted. If
 `zircon.system.blob-init-arg` is set, it will be provided as the first
@@ -302,11 +343,35 @@ ramdisk is present. blob init will take precedence over a minfs
 partition with the system GUID, and the minfs partition will not be mounted
 if `zircon.system.blob-init` is set.
 
-## zircon.system.disable-automount=<\bool>
+## zircon.system.disable-automount=\<bool>
 
 This option prevents the fshost from auto-mounting any disk filesystems
 (/system, /data, etc), which can be useful for certain low level test setups.
 It is false by default.  It is implied by **netsvc.netboot=true**
+
+## zircon.system.pkgfs.cmd=\<command>
+
+This option requests that *command* be run once the blob partition is mounted.
+Any `+` characters in *command* are treated as argument separators, allowing
+you to pass arguments to an executable.
+
+The executable and its dependencies (dynamic linker and shared libraries) are
+found in the blob filesystem.  The executable *path* is *command* before the
+first `+`.  The dynamic linker (`PT_INTERP`) and shared library (`DT_NEEDED`)
+name strings sent to the loader service are prefixed with `lib/` to produce a
+*path*.  Each such *path* is resolved to a blob ID (i.e. merkleroot in ASCII
+hex) using the `zircon.system.pkgfs.file.`*path* command line argument.  In
+this way, `/boot/config/devmgr` contains a fixed manifest of files used to
+start the process.
+
+The new process receives a `PA_USER0` channel handle at startup that will be
+used as the client filesystem handle mounted at `/pkgfs`.  The command is
+expected to start serving on this channel and then signal its process handle
+with `ZX_USER_SIGNAL_0`.  Then `/pkgfs/system` will be mounted as `/system`.
+
+## zircon.system.pkgfs.file.*path*=\<blobid>
+
+Used with [`zircon.system.pkgfs.cmd`](#zircon.system.pkgfs.cmd), above.
 
 ## zircon.system.writable=\<bool>
 
@@ -324,6 +389,13 @@ It may be set to:
 "none" (default) which avoids mounting anything.
 
 A "/system" ramdisk provided by bootdata always supersedes this option.
+
+## zircon.system.filesystem-check=\<bool>
+
+This option requests that filesystems automatically mounted by the system
+are pre-verified using a filesystem consistency checker before being mounted.
+
+By default, this option is set to false.
 
 ## netsvc.netboot=\<bool>
 
@@ -368,6 +440,14 @@ libraries other than libc and the dynamic linker.
 
 Example: `userboot=bin/core-tests`
 
+## userboot.reboot
+
+If this option is set, userboot will attempt to reboot the machine after
+waiting 3 seconds when the process it launches exits.
+
+*If running with userboot=bin/core-tests in QEMU, this will cause the system to
+continually run tests and reboot.*
+
 ## userboot.shutdown
 
 If this option is set, userboot will attempt to power off the machine
@@ -376,12 +456,17 @@ when the process it launches exits.
 ## vdso.soft_ticks=\<bool>
 
 If this option is set, the `zx_ticks_get` and `zx_ticks_per_second` system
-calls will use `zx_clock_get(ZX_CLOCK_MONOTONIC)` in nanoseconds rather than
+calls will use `zx_clock_get_monotonic()` in nanoseconds rather than
 hardware cycle counters in a hardware-based time unit.  Defaults to false.
 
 ## virtcon.disable
 
 Do not launch the virtual console service if this option is present.
+
+## virtcon.hide-on-boot
+
+If this option is present, the virtual console will not take ownership of any
+displays until the user switches to it with a device control key combination.
 
 ## virtcon.keep-log-visible
 
@@ -429,7 +514,7 @@ This option sets the default boot device to netboot, use a local zircon.bin or t
 
 Pass each option using -c, for example:
 ```
-./scripts/run-zircon-x86-64 -c gfxconsole.font=18x32 -c gfxconsole.early=false
+./scripts/run-zircon-x64 -c gfxconsole.font=18x32 -c gfxconsole.early=false
 ```
 
 ## in GigaBoot20x6, when netbooting

@@ -23,9 +23,7 @@
 // for the operation.
 #define ZX_ERR_NO_MEMORY (-4)
 
-// ZX_ERR_CALL_FAILED: The second phase of zx_channel_call() did not complete
-// successfully.
-#define ZX_ERR_CALL_FAILED (-5)
+// -5 used to be ZX_ERR_CALL_FAILED.
 
 // ZX_ERR_INTERNAL_INTR_RETRY: The system call was interrupted, but should be
 // retried.  This should not be seen outside of the VDSO.
@@ -193,7 +191,7 @@
 // Unlike ZX_ERR_STOP, which implies that iteration on an object
 // should stop, and ZX_ERR_NEXT, which implies that iteration
 // should continue to the next item, ZX_ERR_ASYNC implies
-// that an asynchronous worker is responsible for continuing interation.
+// that an asynchronous worker is responsible for continuing iteration.
 //
 // Example: A notification callback will be called on every
 // event, but one event needs to handle some work asynchronously

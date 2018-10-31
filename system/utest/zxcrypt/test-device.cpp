@@ -11,19 +11,24 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <threads.h>
 #include <unistd.h>
 
 #include <fbl/algorithm.h>
 #include <fbl/auto_call.h>
+#include <fbl/auto_lock.h>
+#include <fbl/string.h>
 #include <fbl/unique_fd.h>
-#include <fdio/debug.h>
-#include <fdio/watcher.h>
+#include <fs-management/fvm.h>
+#include <fs-management/mount.h>
 #include <fs-management/ramdisk.h>
 #include <fvm/fvm.h>
+#include <lib/fdio/debug.h>
+#include <lib/fdio/watcher.h>
+#include <lib/zx/time.h>
 #include <unittest/unittest.h>
 #include <zircon/assert.h>
 #include <zircon/types.h>
-#include <lib/zx/time.h>
 #include <zxcrypt/volume.h>
 
 #include "test-device.h"
@@ -33,6 +38,12 @@
 namespace zxcrypt {
 namespace testing {
 namespace {
+
+// No test step should take longer than this
+const zx::duration kTimeout = zx::sec(3);
+
+// FVM driver library
+const char* kFvmDriver = "/boot/driver/fvm.so";
 
 // Takes a given |result|, e.g. from an ioctl, and translates into a zx_status_t.
 zx_status_t ToStatus(ssize_t result) {
@@ -53,20 +64,8 @@ char* Error(const char* fmt, ...) {
 bool WaitAndOpen(char* path, fbl::unique_fd* out) {
     BEGIN_HELPER;
 
-    // Recursively wait for parent directories to exist
-    char* parent = path;
-    char* sep = strrchr(path, '/');
-    char* child = sep + 1;
-    ASSERT_NONNULL(child);
-    *sep = '\0';
-    ASSERT_GT(strlen(parent), 0);
-    struct stat buf;
-    if (stat(parent, &buf) != 0) {
-        ASSERT_TRUE(WaitAndOpen(parent, nullptr), Error("failed to open %s", parent));
-    }
-    ASSERT_EQ(wait_for_driver_bind(parent, child), 0,
-              Error("failed while waiting to bind %s to %s", child, parent));
-    *sep = '/';
+    ASSERT_EQ(wait_for_device(path, ZX_SEC(3)), ZX_OK,
+              Error("failed while waiting to bind %s", path));
     fbl::unique_fd fd(open(path, O_RDWR));
     ASSERT_TRUE(fd, Error("failed to open %s", path));
     if (out) {
@@ -76,22 +75,11 @@ bool WaitAndOpen(char* path, fbl::unique_fd* out) {
     END_HELPER;
 }
 
-// Binds a given |driver| to a |parent| device, waits for the |child| device to show up in the
-// device tree, opens it, and returns the file descriptor via |out|.
-bool BindAndOpen(const fbl::unique_fd& parent, const char* child, const char* driver,
-                 fbl::unique_fd* out) {
-    BEGIN_HELPER;
-    char path[PATH_MAX];
-    ASSERT_OK(ToStatus(ioctl_device_bind(parent.get(), driver, strlen(driver))));
-    ASSERT_OK(ToStatus(ioctl_device_get_topo_path(parent.get(), path, sizeof(path))));
-    ASSERT_GE(snprintf(path, sizeof(path), "%s/%s", path, child), 0);
-    ASSERT_TRUE(WaitAndOpen(path, out), Error("failed to open %s", path));
-    END_HELPER;
-}
-
 } // namespace
 
-TestDevice::TestDevice() : block_count_(0), block_size_(0), client_(nullptr) {
+TestDevice::TestDevice()
+    : block_count_(0), block_size_(0), client_(nullptr), tid_(0), need_join_(false), wake_after_(0),
+      wake_deadline_(0) {
     memset(ramdisk_path_, 0, sizeof(ramdisk_path_));
     memset(fvm_part_path_, 0, sizeof(fvm_part_path_));
     memset(&req_, 0, sizeof(req_));
@@ -100,8 +88,10 @@ TestDevice::TestDevice() : block_count_(0), block_size_(0), client_(nullptr) {
 TestDevice::~TestDevice() {
     Disconnect();
     ramdisk_.reset();
-    if (strlen(ramdisk_path_) != 0) {
-        destroy_ramdisk(ramdisk_path_);
+    DestroyRamdisk();
+    if (need_join_) {
+        int res;
+        thrd_join(tid_, &res);
     }
 }
 
@@ -134,8 +124,9 @@ bool TestDevice::Create(size_t device_size, size_t block_size, bool fvm) {
         return rc;
     }
 #else
-    key_.Reset();
-    ASSERT_OK(key_.InitZero(kZx1130KeyLen));
+    uint8_t* buf;
+    ASSERT_OK(key_.Allocate(kZx1130KeyLen, &buf));
+    memset(buf, 0, key_.len());
 #endif
 
     END_HELPER;
@@ -151,20 +142,95 @@ bool TestDevice::Bind(Volume::Version version, bool fvm) {
 
 bool TestDevice::Rebind() {
     BEGIN_HELPER;
-    ASSERT_TRUE(Disconnect());
 
-    ASSERT_OK(ToStatus(ioctl_block_rr_part(ramdisk_.get())));
+    const char* sep = strrchr(ramdisk_path_, '/');
+    ASSERT_NONNULL(sep);
+    fbl::String path(ramdisk_path_, sep - ramdisk_path_);
+    DIR* dir = opendir(path.c_str());
+    ASSERT_NONNULL(dir);
+    auto close_dir = fbl::MakeAutoCall([&] { closedir(dir); });
+
+    zx::time deadline = zx::deadline_after(kTimeout);
+
+    Disconnect();
     zxcrypt_.reset();
     fvm_part_.reset();
-    ramdisk_.reset();
-    ASSERT_TRUE(WaitAndOpen(ramdisk_path_, &ramdisk_), Error("failed to open %s", ramdisk_path_));
+    ASSERT_EQ(fdio_watch_directory(dirfd(dir), RebindWatcher, deadline.get(), this), ZX_ERR_STOP);
+    ASSERT_TRUE(WaitAndOpen(ramdisk_path_, &ramdisk_));
     if (strlen(fvm_part_path_) != 0) {
-        ASSERT_TRUE(WaitAndOpen(fvm_part_path_, &fvm_part_),
-                    Error("failed to open %s", fvm_part_path_));
+        ASSERT_TRUE(WaitAndOpen(fvm_part_path_, &fvm_part_));
     }
-
     ASSERT_TRUE(Connect());
+
     END_HELPER;
+}
+
+zx_status_t TestDevice::RebindWatcher(int dirfd, int event, const char* fn, void* cookie) {
+    TestDevice* device = static_cast<TestDevice*>(cookie);
+    switch (event) {
+    case WATCH_EVENT_IDLE:
+        return ToStatus(ioctl_block_rr_part(device->ramdisk_.get()));
+    case WATCH_EVENT_REMOVE_FILE:
+        return strcmp(fn, "block") == 0 ? ZX_ERR_STOP : ZX_OK;
+    default:
+        return ZX_OK;
+    }
+}
+
+bool TestDevice::SleepUntil(uint64_t num, bool deferred) {
+    BEGIN_HELPER;
+    fbl::AutoLock lock(&lock_);
+    ASSERT_EQ(wake_after_, 0);
+    ASSERT_NE(num, 0);
+    wake_after_ = num;
+    wake_deadline_ = zx::deadline_after(kTimeout);
+    ASSERT_EQ(thrd_create(&tid_, TestDevice::WakeThread, this), thrd_success);
+    need_join_ = true;
+    if (deferred) {
+        uint32_t flags = RAMDISK_FLAG_RESUME_ON_WAKE;
+        ASSERT_OK(ToStatus(ioctl_ramdisk_set_flags(ramdisk_.get(), &flags)));
+    }
+    uint64_t sleep_after = 0;
+    ASSERT_OK(ToStatus(ioctl_ramdisk_sleep_after(ramdisk_.get(), &sleep_after)));
+    END_HELPER;
+}
+
+bool TestDevice::WakeUp() {
+    BEGIN_HELPER;
+    if (need_join_) {
+        fbl::AutoLock lock(&lock_);
+        ASSERT_NE(wake_after_, 0);
+        int res;
+        ASSERT_EQ(thrd_join(tid_, &res), thrd_success);
+        need_join_ = false;
+        wake_after_ = 0;
+        EXPECT_EQ(res, 0);
+    }
+    END_HELPER;
+}
+
+int TestDevice::WakeThread(void* arg) {
+    TestDevice* device = static_cast<TestDevice*>(arg);
+    fbl::AutoLock lock(&device->lock_);
+
+    // Always send a wake-up call; even if we failed to go to sleep.
+    auto cleanup = fbl::MakeAutoCall([&] { ioctl_ramdisk_wake_up(device->ramdisk_.get()); });
+
+    // Loop until timeout, |wake_after_| txns received, or error getting counts
+    ramdisk_blk_counts_t counts;
+    ssize_t res;
+    do {
+        zx::nanosleep(zx::deadline_after(zx::msec(100)));
+        if (device->wake_deadline_ < zx::clock::get_monotonic()) {
+            printf("Received %lu of %lu transactions before timing out.\n", counts.received,
+                   device->wake_after_);
+            return ZX_ERR_TIMED_OUT;
+        }
+        if ((res = ioctl_ramdisk_get_blk_counts(device->ramdisk_.get(), &counts)) < 0) {
+            return static_cast<zx_status_t>(res);
+        }
+    } while (counts.received < device->wake_after_);
+    return ZX_OK;
 }
 
 bool TestDevice::ReadFd(zx_off_t off, size_t len) {
@@ -234,7 +300,7 @@ bool TestDevice::CreateRamdisk(size_t device_size, size_t block_size) {
     ASSERT_TRUE(ac.check());
     memset(as_read_.get(), 0, block_size);
 
-    ASSERT_EQ(create_ramdisk(block_size, count, ramdisk_path_), 0);
+    ASSERT_EQ(create_ramdisk(block_size, count, ramdisk_path_), ZX_OK);
     ramdisk_.reset(open(ramdisk_path_, O_RDWR));
     ASSERT_TRUE(ramdisk_, Error("failed to open %s", ramdisk_path_));
 
@@ -242,6 +308,13 @@ bool TestDevice::CreateRamdisk(size_t device_size, size_t block_size) {
     block_count_ = count;
 
     END_HELPER;
+}
+
+void TestDevice::DestroyRamdisk() {
+    if (strlen(ramdisk_path_) != 0) {
+        destroy_ramdisk(ramdisk_path_);
+        ramdisk_path_[0] = '\0';
+    }
 }
 
 // Creates a ramdisk, formats it, and binds to it.
@@ -259,16 +332,19 @@ bool TestDevice::CreateFvmPart(size_t device_size, size_t block_size) {
     ASSERT_TRUE(CreateRamdisk(device_size + (new_meta * 2), block_size));
 
     // Format the ramdisk as FVM and bind to it
-    fbl::unique_fd fvm_fd;
     ASSERT_OK(fvm_init(ramdisk_.get(), FVM_BLOCK_SIZE));
-    ASSERT_TRUE(BindAndOpen(ramdisk_, "fvm", "/boot/driver/fvm.so", &fvm_fd),
-                Error("failed to bind and open fvm"));
+    ASSERT_OK(ToStatus(ioctl_device_bind(ramdisk_.get(), kFvmDriver, strlen(kFvmDriver))));
+
+    char path[PATH_MAX];
+    fbl::unique_fd fvm_fd;
+    snprintf(path, sizeof(path), "%s/fvm", ramdisk_path_);
+    ASSERT_TRUE(WaitAndOpen(path, &fvm_fd));
 
     // Allocate a FVM partition with the last slice unallocated.
     alloc_req_t req;
     memset(&req, 0, sizeof(alloc_req_t));
     req.slice_count = (kDeviceSize / FVM_BLOCK_SIZE) - 1;
-    memcpy(req.type, kTypeGuid, GUID_LEN);
+    memcpy(req.type, zxcrypt_magic, sizeof(zxcrypt_magic));
     for (uint8_t i = 0; i < GUID_LEN; ++i) {
         req.guid[i] = i;
     }
@@ -287,8 +363,8 @@ bool TestDevice::Connect() {
     BEGIN_HELPER;
     ZX_DEBUG_ASSERT(!zxcrypt_);
 
-    ASSERT_TRUE(BindAndOpen(parent(), "zxcrypt/block", "/boot/driver/zxcrypt.so", &zxcrypt_),
-                Error("failed to bind and open zxcrypt"));
+    ASSERT_OK(Volume::Unlock(parent(), key_, 0, &volume_));
+    ASSERT_OK(volume_->Open(kTimeout, &zxcrypt_));
 
     block_info_t blk;
     ASSERT_OK(ToStatus(ioctl_block_get_info(zxcrypt_.get(), &blk)));
@@ -297,7 +373,7 @@ bool TestDevice::Connect() {
 
     zx_handle_t fifo;
     ASSERT_OK(ToStatus(ioctl_block_get_fifos(zxcrypt_.get(), &fifo)));
-    ASSERT_OK(ToStatus(ioctl_block_alloc_txn(zxcrypt_.get(), &req_.txnid)));
+    req_.group = 0;
     ASSERT_OK(block_fifo_create_client(fifo, &client_));
 
     // Create the vmo and get a transferable handle to give to the block server
@@ -309,19 +385,17 @@ bool TestDevice::Connect() {
     END_HELPER;
 }
 
-bool TestDevice::Disconnect() {
-    BEGIN_HELPER;
+void TestDevice::Disconnect() {
     if (client_) {
-        ASSERT_OK(ToStatus(ioctl_block_free_txn(zxcrypt_.get(), &req_.txnid)));
         memset(&req_, 0, sizeof(req_));
         block_fifo_release_client(client_);
         client_ = nullptr;
     }
     zxcrypt_.reset();
+    volume_.reset();
     block_size_ = 0;
     block_count_ = 0;
     vmo_.reset();
-    END_HELPER;
 }
 
 } // namespace testing

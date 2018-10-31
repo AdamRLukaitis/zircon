@@ -562,6 +562,8 @@ _payload stream_ (variable size)
 
 The following blob types are defined:
 - `0x01`: Raw untyped data. Consumer is expected to know how to consume it, perhaps based on context.
+- `0x02`: Last Branch Record of Intel Performance Monitor. The format
+is defined by the Cpuperf Trace Provider.
 
 ### Userspace Object Record (record type = 6)
 
@@ -655,7 +657,9 @@ _header word_
 - `[24 .. 27]`: outgoing thread state (any of the values below except “running”)
 - `[28 .. 35]`: outgoing thread (thread ref)
 - `[36 .. 43]`: incoming thread (thread ref)
-- `[44 .. 63]`: reserved
+- `[44 .. 51]`: outgoing thread priority
+- `[52 .. 59]`: incoming thread priority
+- `[60 .. 63]`: reserved
 
 _timestamp word_
 - `[0 .. 63]`: number of ticks

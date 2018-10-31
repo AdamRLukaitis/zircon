@@ -5,7 +5,11 @@
 #pragma once
 
 /*
- * Macros for writing unit tests.
+ * The Unittest API.
+ *
+ * The API consists of some functions for invoking Unittest, all prefixed
+ * with unittest_, and some macros for registering testcases as well as
+ * performing tests.
  *
  * Sample usage:
  *
@@ -44,7 +48,18 @@
  *
  *      END_TEST;
  * }
+ *
+ * The main() function of the test is expected to call unittest_run_all_tests.
+ * By default it will run all registered tests, but it also provides an option
+ * for running individual tests. Run the test binary with --help for details.
+ *
+ * Test binaries may recognize their own command line options. Make sure they
+ * don't interfere with Unittests's options. See unittest/README.md for rules
+ * on argv processing. To have test-specific options included in --help
+ * output register a function that prints the test-specific help with
+ * unittest_register_test_help_printer().
  */
+
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -106,6 +121,11 @@ typedef enum test_type {
 
 extern test_type_t utest_test_type;
 
+// An environment variable may be used to specify the timeout.
+// An env var is used because runtests doesn't make assumptions about what
+// arguments we understand.
+#define WATCHDOG_ENV_NAME "RUNTESTS_WATCHDOG_TIMEOUT"
+
 /*
  * Type for unit test result Output
  */
@@ -145,6 +165,12 @@ void unittest_printf_critical(const char* format, ...)
  * the unit test output
  */
 void unittest_set_output_function(test_output_func fun, void* arg);
+
+/*
+ * Function to restore output callback to
+ * default_printf.
+ */
+void unittest_restore_output_function(void);
 
 /*
  * Function to set the verbosity level. This affects
@@ -259,11 +285,38 @@ int unittest_set_verbosity_level(int new_level);
  * Performance: Tests which are expected to pass, but which are measured
  * using other metrics (thresholds, statistical techniques) to identify
  * regressions.
-*/
+ */
+
+// TODO(INTK-312): Need to fine tune these. The current values are quite
+// conservative until the bots provide more appropriate values for bot
+// purposes.
+// TODO(ZX-2104): An alternative is to machine generate timeouts for each
+// test via training runs. Taking that on will require more research.
+#define DEFAULT_BASE_TIMEOUT_SECONDS 20
+
+// Timeout scale for each of the test classes, from the base timeout.
+#define TEST_TIMEOUT_FACTOR_SMALL       1
+// TODO(ZX-2103): fvm-test:TestSliceAccessNonContiguousPhysical is a medium
+// test that runs for 130 seconds. IWBN to make the medium timeout factor
+// smaller.
+#define TEST_TIMEOUT_FACTOR_MEDIUM      10
+// TODO(ZX-2107): Some large tests are really large.
+#define TEST_TIMEOUT_FACTOR_LARGE       100
+#define TEST_TIMEOUT_FACTOR_PERFORMANCE 100
+
+// Called by tests that for whatever reason want to disable their timeout.
+// An example is really long running tests (ZX-2107).
+void unittest_cancel_timeout(void);
+
 #define RUN_TEST_SMALL(test) RUN_NAMED_TEST_TYPE(#test, test, TEST_SMALL, false)
 #define RUN_TEST_MEDIUM(test) RUN_NAMED_TEST_TYPE(#test, test, TEST_MEDIUM, false)
 #define RUN_TEST_LARGE(test) RUN_NAMED_TEST_TYPE(#test, test, TEST_LARGE, false)
 #define RUN_TEST_PERFORMANCE(test) RUN_NAMED_TEST_TYPE(#test, test, TEST_PERFORMANCE, false)
+
+#define RUN_NAMED_TEST_SMALL(name, test) RUN_NAMED_TEST_TYPE(name, test, TEST_SMALL, false)
+#define RUN_NAMED_TEST_MEDIUM(name, test) RUN_NAMED_TEST_TYPE(name, test, TEST_MEDIUM, false)
+#define RUN_NAMED_TEST_LARGE(name, test) RUN_NAMED_TEST_TYPE(name, test, TEST_LARGE, false)
+#define RUN_NAMED_TEST_PERFORMANCE(name, test) RUN_NAMED_TEST_TYPE(name, test, TEST_PERFORMANCE, false)
 
 // "RUN_TEST" implies the test is small
 #define RUN_TEST(test) RUN_NAMED_TEST_TYPE(#test, test, TEST_SMALL, false)
@@ -490,6 +543,25 @@ int unittest_set_verbosity_level(int new_level);
         }                                                                   \
     } while (0)
 
+/* Check that str1 contains str2. */
+#define UT_STR_STR(str1, str2, ret, ...)                                    \
+    do {                                                                    \
+        UT_ASSERT_VALID_TEST_STATE;                                         \
+        UNITTEST_TRACEF(2, "str_str(%s, %s)\n", #str1, #str2);              \
+        /* Note that we should not do the following here:                   \
+         *   const char* str1_val = str1;                                   \
+         * That does not work in C++ if str1 is string.c_str(): the         \
+         * storage for the C string will get deallocated before the         \
+         * string is used.  Instead we must use a helper function. */       \
+        if (!unittest_expect_str_str((str1), (str2), #str1, #str2,          \
+                                    unittest_get_message(__VA_ARGS__),      \
+                                    __FILE__, __LINE__,                     \
+                                    __PRETTY_FUNCTION__)) {                 \
+            current_test_info->all_ok = false;                              \
+            ret;                                                            \
+        }                                                                   \
+    } while (0)
+
 #define EXPECT_CMP(op, lhs, rhs, lhs_str, rhs_str, ...) \
     UT_CMP(op, lhs, rhs, lhs_str, rhs_str, DONOT_RET, ##__VA_ARGS__)
 
@@ -543,6 +615,7 @@ int unittest_set_verbosity_level(int new_level);
 #define ASSERT_BYTES_NE(bytes1, bytes2, length, msg) UT_BYTES_NE(bytes1, bytes2, length, msg, RET_FALSE)
 #define ASSERT_STR_EQ(str1, str2, ...) UT_STR_EQ(str1, str2, RET_FALSE, ##__VA_ARGS__)
 #define ASSERT_STR_NE(str1, str2, ...) UT_STR_NE(str1, str2, RET_FALSE, ##__VA_ARGS__)
+#define ASSERT_STR_STR(str1, str2, ...) UT_STR_STR(str1, str2, RET_FALSE, ##__VA_ARGS__)
 
 #ifdef UNITTEST_CRASH_HANDLER_SUPPORTED
 
@@ -612,6 +685,14 @@ bool unittest_run_all_tests(int argc, char** argv);
 bool unittest_run_one_test(struct test_case_element* elem, test_type_t type);
 
 /*
+ * Register a function to print test-specific options in the output of --help.
+ * Only one help printer may be registered, each new call replaces any
+ * previously registered function.
+ */
+typedef void unittest_help_printer_type(FILE* output);
+void unittest_register_test_help_printer(unittest_help_printer_type* func);
+
+/*
  * Returns false if expected does not equal actual and prints msg and a hexdump8
  * of the input buffers.
  */
@@ -625,6 +706,12 @@ bool unittest_expect_str_eq(const char* str1_value, const char* str2_value,
                             const char* source_function);
 
 bool unittest_expect_str_ne(const char* str1_value, const char* str2_value,
+                            const char* str1_expr, const char* str2_expr,
+                            const char* msg,
+                            const char* source_filename, int source_line_num,
+                            const char* source_function);
+
+bool unittest_expect_str_str(const char* str1_value, const char* str2_value,
                             const char* str1_expr, const char* str2_expr,
                             const char* msg,
                             const char* source_filename, int source_line_num,

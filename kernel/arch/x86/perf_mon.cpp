@@ -45,8 +45,8 @@
 #include <arch/x86/mmu.h>
 #include <arch/x86/perf_mon.h>
 #include <assert.h>
-#include <dev/pci_common.h>
 #include <err.h>
+#include <fbl/algorithm.h>
 #include <fbl/alloc_checker.h>
 #include <fbl/macros.h>
 #include <fbl/ref_ptr.h>
@@ -63,10 +63,10 @@
 #include <vm/vm_object_physical.h>
 #include <lib/ktrace.h>
 #include <lib/pci/pio.h>
-#include <zircon/device/cpu-trace/cpu-perf.h>
-#include <zircon/device/cpu-trace/intel-pm.h>
-#include <zircon/ktrace.h>
-#include <zircon/mtrace.h>
+#include <lib/zircon-internal/device/cpu-trace/cpu-perf.h>
+#include <lib/zircon-internal/device/cpu-trace/intel-pm.h>
+#include <lib/zircon-internal/ktrace.h>
+#include <lib/zircon-internal/mtrace.h>
 #include <zircon/thread_annotations.h>
 #include <zxcpp/new.h>
 #include <pow2.h>
@@ -75,19 +75,24 @@
 
 #define LOCAL_TRACE 0
 
+// TODO(cja): Sort out headers so the kernel can include these sorts of definitions
+// without needing DDK access
+#define PCI_CONFIG_VENDOR_ID        0x00
+#define PCI_CONFIG_DEVICE_ID        0x02
+
 // There's only a few misc events, and they're non-homogenous,
 // so handle them directly.
 typedef enum {
-#define DEF_MISC_SKL_EVENT(symbol, id, offset, size, flags, name, description) \
-    symbol ## _ID = CPUPERF_MAKE_EVENT_ID(CPUPERF_UNIT_MISC, id),
-#include <zircon/device/cpu-trace/skylake-misc-events.inc>
+#define DEF_MISC_SKL_EVENT(symbol, event_name, id, offset, size, flags, readable_name, description) \
+    symbol ## _ID = CPUPERF_MAKE_EVENT_ID(CPUPERF_GROUP_MISC, id),
+#include <lib/zircon-internal/device/cpu-trace/skylake-misc-events.inc>
 } misc_event_id_t;
 
 // h/w address of misc events.
 typedef enum {
-#define DEF_MISC_SKL_EVENT(symbol, id, offset, size, flags, name, description) \
+#define DEF_MISC_SKL_EVENT(symbol, event_name, id, offset, size, flags, readable_name, description) \
     symbol ## _OFFSET = offset,
-#include <zircon/device/cpu-trace/skylake-misc-events.inc>
+#include <lib/zircon-internal/device/cpu-trace/skylake-misc-events.inc>
 } misc_event_offset_t;
 
 // TODO(dje): Freeze-on-PMI doesn't work in skylake.
@@ -123,6 +128,17 @@ typedef enum {
 
 #define IA32_DEBUGCTL 0x1d9
 
+#define SKL_LAST_BRANCH_SELECT  0x1c8
+#define SKL_LAST_BRANCH_TOS     0x1c9
+
+// N.B. These values have changed across models.
+#define SKL_LAST_BRANCH_FROM_0  0x680
+#define SKL_LAST_BRANCH_FROM_16 0x690
+#define SKL_LAST_BRANCH_TO_0    0x6c0
+#define SKL_LAST_BRANCH_TO_16   0x6d0
+#define SKL_LAST_BRANCH_INFO_0  0xdc0
+#define SKL_LAST_BRANCH_INFO_16 0xdd0
+
 // Vendor,device ids of the device with MCHBAR stats registers.
 #define INTEL_MCHBAR_PCI_VENDOR_ID 0x8086
 const uint16_t supported_mem_device_ids[] = {
@@ -148,33 +164,39 @@ const uint16_t supported_mem_device_ids[] = {
 #define UNC_IMC_STATS_END   0x5983 // MISC_PKG_GT_TEMP
 
 // Verify all values are within [BEGIN,END].
-#define DEF_MISC_SKL_EVENT(symbol, id, offset, size, flags, name, description) \
+#define DEF_MISC_SKL_EVENT(symbol, event_name, id, offset, size, flags, readable_name, description) \
     && (offset >= UNC_IMC_STATS_BEGIN && (offset + size/8) <= UNC_IMC_STATS_END + 1)
 static_assert(1
-#include <zircon/device/cpu-trace/skylake-misc-events.inc>
+#include <lib/zircon-internal/device/cpu-trace/skylake-misc-events.inc>
     , "");
 
 // These aren't constexpr as we iterate to fill in values for each counter.
 static uint64_t kGlobalCtrlWritableBits;
 static uint64_t kFixedCounterCtrlWritableBits;
 
+// While the last-branch record is far larger, it is not emitted for each
+// event.
 static constexpr size_t kMaxEventRecordSize = sizeof(cpuperf_pc_record_t);
 
 // Commented out values represent currently unsupported features.
 // They remain present for documentation purposes.
+// Note: Making this const assumes at least PM version >= 2 (e.g.,
+// IA32_DEBUGCTL_FREEZE_LBRS_ON_PMI_MASK).
+// Note: At least FREEZE_WHILE_SMM needs to be set based on a runtime
+// determination (need to check PERF_CAPABILITIES).
 static constexpr uint64_t kDebugCtrlWritableBits =
-    (/*IA32_DEBUGCTL_LBR_MASK |*/
+    (IA32_DEBUGCTL_LBR_MASK |
      /*IA32_DEBUGCTL_BTF_MASK |*/
      /*IA32_DEBUGCTL_TR_MASK |*/
      /*IA32_DEBUGCTL_BTS_MASK |*/
      /*IA32_DEBUGCTL_BTINT_MASK |*/
      /*IA32_DEBUGCTL_BTS_OFF_OS_MASK |*/
      /*IA32_DEBUGCTL_BTS_OFF_USR_MASK |*/
-     /*IA32_DEBUGCTL_FREEZE_LBRS_ON_PMI_MASK |*/
+     IA32_DEBUGCTL_FREEZE_LBRS_ON_PMI_MASK |
 #if TRY_FREEZE_ON_PMI
      IA32_DEBUGCTL_FREEZE_PERFMON_ON_PMI_MASK |
 #endif
-     /*IA32_DEBUGCTL_FREEZE_WHILE_SMM_EN_MASK |*/
+     /*IA32_DEBUGCTL_FREEZE_WHILE_SMM_MASK |*/
      /*IA32_DEBUGCTL_RTM_MASK |*/
      0);
 static constexpr uint64_t kEventSelectWritableBits =
@@ -190,6 +212,12 @@ static constexpr uint64_t kEventSelectWritableBits =
      IA32_PERFEVTSEL_INV_MASK |
      IA32_PERFEVTSEL_CMASK_MASK);
 
+enum LbrFormat {
+    LBR_FORMAT_32 = 0,
+    // The format contains LBR_INFO in addition to LBR_FROM/LBR_TO.
+    LBR_FORMAT_INFO = 0b101,
+};
+
 static bool supports_perfmon = false;
 
 static uint32_t perfmon_version = 0;
@@ -203,6 +231,9 @@ static uint32_t perfmon_capabilities = 0;
 // Maximum counter values, derived from their width.
 static uint64_t perfmon_max_fixed_counter_value = 0;
 static uint64_t perfmon_max_programmable_counter_value = 0;
+
+// Number of entries we can write in an LBR record.
+static uint32_t perfmon_lbr_stack_size = 0;
 
 // Counter bits in GLOBAL_STATUS to check on each interrupt.
 static uint64_t perfmon_counter_status_bits = 0;
@@ -282,6 +313,9 @@ struct PerfmonState {
     unsigned num_used_programmable = 0;
     unsigned num_used_misc = 0;
 
+    // True if last branch records have been requested.
+    bool request_lbr_record = false;
+
     // Number of entries in |cpu_data|.
     const unsigned num_cpus;
 
@@ -325,6 +359,10 @@ static fbl::unique_ptr<PerfmonState> perfmon_state TA_GUARDED(perfmon_lock);
 
 // This is accessed atomically as it is also accessed by the PMI handler.
 static int perfmon_active = false;
+
+static inline bool x86_perfmon_lbr_is_supported() {
+    return perfmon_lbr_stack_size > 0;
+}
 
 zx_status_t PerfmonState::Create(unsigned n_cpus, fbl::unique_ptr<PerfmonState>* out_state) {
     fbl::AllocChecker ac;
@@ -397,10 +435,42 @@ static void x86_perfmon_init_mchbar() {
         // See PCI spec 6.2.5.1.
         perfmon_mchbar_bar = bar & ~15u;
         perfmon_num_misc_events =
-            countof(static_cast<zx_x86_ipm_config_t*>(nullptr)->misc_ids);
+            static_cast<uint32_t>(fbl::count_of(static_cast<zx_x86_ipm_config_t*>(nullptr)->misc_ids));
     } else {
         TRACEF("perfmon: error %d reading mchbar\n", status);
     }
+}
+
+// Return the size of the LBR stack, or zero if not supported.
+static unsigned x86_perfmon_lbr_stack_size() {
+    static const struct {
+        x86_microarch_list microarch;
+        uint8_t stack_size;
+    } supported_chips[] = {
+        { X86_MICROARCH_INTEL_SKYLAKE, 32 },
+        { X86_MICROARCH_INTEL_KABYLAKE, 32 },
+    };
+
+    unsigned lbr_format =
+        perfmon_capabilities & ((1u << IA32_PERF_CAPABILITIES_LBR_FORMAT_LEN) - 1);
+    // TODO(dje): KISS and only support these formats for now.
+    switch (lbr_format) {
+    case LBR_FORMAT_INFO:
+        break;
+    default:
+        return 0;
+    }
+
+    for (const auto& chip : supported_chips) {
+        if (chip.microarch == x86_microarch)
+            return chip.stack_size;
+    }
+
+    return 0;
+}
+
+static void x86_perfmon_init_lbr(uint32_t lbr_stack_size) {
+    perfmon_lbr_stack_size = lbr_stack_size;
 }
 
 void x86_perfmon_init(void)
@@ -487,6 +557,17 @@ void x86_perfmon_init(void)
     if (x86_perfmon_have_mchbar_data()) {
         x86_perfmon_init_mchbar();
     }
+
+    unsigned lbr_stack_size = x86_perfmon_lbr_stack_size();
+    if (lbr_stack_size != 0) {
+        // Don't crash if the h/w supports more than we do, just clip it.
+        if (lbr_stack_size > CPUPERF_MAX_NUM_LAST_BRANCH) {
+            TRACEF("WARNING: H/W LBR stack size is %u, clipping to %u\n",
+                   lbr_stack_size, CPUPERF_MAX_NUM_LAST_BRANCH);
+            lbr_stack_size = CPUPERF_MAX_NUM_LAST_BRANCH;
+        }
+        x86_perfmon_init_lbr(lbr_stack_size);
+    }
 }
 
 static void x86_perfmon_clear_overflow_indicators() {
@@ -509,14 +590,25 @@ static void x86_perfmon_clear_overflow_indicators() {
 // Return the h/w register number for fixed event id |id|
 // or IPM_MAX_FIXED_COUNTERS if not found.
 static unsigned x86_perfmon_lookup_fixed_counter(cpuperf_event_id_t id) {
-    if (CPUPERF_EVENT_ID_UNIT(id) != CPUPERF_UNIT_FIXED)
+    if (CPUPERF_EVENT_ID_GROUP(id) != CPUPERF_GROUP_FIXED)
         return IPM_MAX_FIXED_COUNTERS;
     switch (CPUPERF_EVENT_ID_EVENT(id)) {
-#define DEF_FIXED_EVENT(symbol, id, regnum, flags, name, description) \
+#define DEF_FIXED_EVENT(symbol, event_name, id, regnum, flags, readable_name, description) \
     case id: return regnum;
-#include <zircon/device/cpu-trace/intel-pm-events.inc>
+#include <lib/zircon-internal/device/cpu-trace/intel-pm-events.inc>
     default: return IPM_MAX_FIXED_COUNTERS;
     }
+}
+
+size_t get_max_space_needed_for_all_records(PerfmonState* state) {
+    size_t num_events = (state->num_used_programmable +
+                         state->num_used_fixed +
+                         state->num_used_misc);
+    size_t space_needed = (sizeof(cpuperf_time_record_t) +
+                           num_events * kMaxEventRecordSize);
+    if (state->request_lbr_record)
+        space_needed += sizeof(cpuperf_last_branch_record_t);
+    return space_needed;
 }
 
 static void x86_perfmon_write_header(cpuperf_record_header_t* hdr,
@@ -589,6 +681,7 @@ zx_status_t x86_ipm_get_properties(zx_x86_ipm_properties_t* props) {
     props->fixed_counter_width = perfmon_fixed_counter_width;
     props->programmable_counter_width = perfmon_programmable_counter_width;
     props->perf_capabilities = perfmon_capabilities;
+    props->lbr_stack_size = perfmon_lbr_stack_size;
     return ZX_OK;
 }
 
@@ -703,6 +796,12 @@ static zx_status_t x86_ipm_verify_fixed_config(
                 TRACEF("Unused bits set in |fixed_flags[%u]|\n", i);
                 return ZX_ERR_INVALID_ARGS;
             }
+            if (!x86_perfmon_lbr_is_supported() &&
+                (config->fixed_flags[i] & IPM_CONFIG_FLAG_LBR) != 0) {
+                TRACEF("Last branch records requested for |fixed_flags[%u]|,"
+                       " but not supported\n", i);
+                return ZX_ERR_NOT_SUPPORTED;
+            }
             if ((config->fixed_flags[i] & IPM_CONFIG_FLAG_TIMEBASE) &&
                     config->timebase_id == CPUPERF_EVENT_ID_NONE) {
                 TRACEF("Timebase requested for |fixed_flags[%u]|, but not provided\n", i);
@@ -761,6 +860,12 @@ static zx_status_t x86_ipm_verify_programmable_config(
                 TRACEF("Unused bits set in |programmable_flags[%u]|\n", i);
                 return ZX_ERR_INVALID_ARGS;
             }
+            if (!x86_perfmon_lbr_is_supported() &&
+                (config->programmable_flags[i] & IPM_CONFIG_FLAG_LBR) != 0) {
+                TRACEF("Last branch records requested for |programmable_flags[%u]|,"
+                       " but not supported\n", i);
+                return ZX_ERR_NOT_SUPPORTED;
+            }
             if ((config->programmable_flags[i] & IPM_CONFIG_FLAG_TIMEBASE) &&
                     config->timebase_id == CPUPERF_EVENT_ID_NONE) {
                 TRACEF("Timebase requested for |programmable_flags[%u]|, but not provided\n", i);
@@ -777,9 +882,9 @@ static zx_status_t x86_ipm_verify_misc_config(
         const zx_x86_ipm_config_t* config,
         unsigned* out_num_used) {
     bool seen_last = false;
-    unsigned max_num_used = countof(config->misc_ids);
-    unsigned num_used = max_num_used;
-    for (unsigned i = 0; i < max_num_used; ++i) {
+    size_t max_num_used = fbl::count_of(config->misc_ids);
+    size_t num_used = max_num_used;
+    for (size_t i = 0; i < max_num_used; ++i) {
         cpuperf_event_id_t id = config->misc_ids[i];
         if (id != 0 && seen_last) {
             TRACEF("Active misc events not front-filled\n");
@@ -792,38 +897,38 @@ static zx_status_t x86_ipm_verify_misc_config(
         }
         if (seen_last) {
             if (config->misc_flags[i] != 0) {
-                TRACEF("Unused |misc_flags[%u]| not zero\n", i);
+                TRACEF("Unused |misc_flags[%zu]| not zero\n", i);
                 return ZX_ERR_INVALID_ARGS;
             }
         } else {
             if (config->misc_flags[i] & ~IPM_CONFIG_FLAG_MASK) {
-                TRACEF("Unused bits set in |misc_flags[%u]|\n", i);
+                TRACEF("Unused bits set in |misc_flags[%zu]|\n", i);
                 return ZX_ERR_INVALID_ARGS;
             }
             // Currently we only support the MCHBAR events.
             // They cannot provide pc. We ignore the OS/USER bits.
-            if (config->misc_flags[i] & IPM_CONFIG_FLAG_PC) {
-                TRACEF("Invalid bits (0x%x) in |misc_flags[%u]|\n",
+            if (config->misc_flags[i] & (IPM_CONFIG_FLAG_PC | IPM_CONFIG_FLAG_LBR)) {
+                TRACEF("Invalid bits (0x%x) in |misc_flags[%zu]|\n",
                        config->misc_flags[i], i);
                 return ZX_ERR_INVALID_ARGS;
             }
             if ((config->misc_flags[i] & IPM_CONFIG_FLAG_TIMEBASE) &&
                     config->timebase_id == CPUPERF_EVENT_ID_NONE) {
-                TRACEF("Timebase requested for |misc_flags[%u]|, but not provided\n", i);
+                TRACEF("Timebase requested for |misc_flags[%zu]|, but not provided\n", i);
                 return ZX_ERR_INVALID_ARGS;
             }
             switch (CPUPERF_EVENT_ID_EVENT(id)) {
-#define DEF_MISC_SKL_EVENT(symbol, id, offset, size, flags, name, description) \
+#define DEF_MISC_SKL_EVENT(symbol, event_name, id, offset, size, flags, readable_name, description) \
             case id: break;
-#include <zircon/device/cpu-trace/skylake-misc-events.inc>
+#include <lib/zircon-internal/device/cpu-trace/skylake-misc-events.inc>
             default:
-                TRACEF("Invalid misc event id |misc_ids[%u]|\n", i);
+                TRACEF("Invalid misc event id |misc_ids[%zu]|\n", i);
                 return ZX_ERR_INVALID_ARGS;
             }
         }
     }
 
-    *out_num_used = num_used;
+    *out_num_used = static_cast<unsigned>(num_used);
     return ZX_OK;
 }
 
@@ -904,7 +1009,7 @@ static void x86_ipm_stage_fixed_config(const zx_x86_ipm_config_t* config,
     memcpy(state->fixed_flags, config->fixed_flags,
            sizeof(state->fixed_flags));
 
-    for (unsigned i = 0; i < countof(state->fixed_hw_map); ++i) {
+    for (unsigned i = 0; i < fbl::count_of(state->fixed_hw_map); ++i) {
         state->fixed_hw_map[i] = x86_perfmon_lookup_fixed_counter(config->fixed_ids[i]);
     }
 }
@@ -948,9 +1053,9 @@ static void x86_ipm_stage_misc_config(const zx_x86_ipm_config_t* config,
         // All misc events currently come from MCHBAR.
         // When needed we can add a flag to the event to denote origin.
         switch (CPUPERF_EVENT_ID_EVENT(state->misc_ids[i])) {
-#define DEF_MISC_SKL_EVENT(symbol, id, offset, size, flags, name, description) \
+#define DEF_MISC_SKL_EVENT(symbol, event_name, id, offset, size, flags, readable_name, description) \
         case id:
-#include <zircon/device/cpu-trace/skylake-misc-events.inc>
+#include <lib/zircon-internal/device/cpu-trace/skylake-misc-events.inc>
             state->need_mchbar = true;
             break;
         default:
@@ -989,6 +1094,14 @@ zx_status_t x86_ipm_stage_config(zx_x86_ipm_config_t* config) {
     state->fixed_ctrl = config->fixed_ctrl;
     state->debug_ctrl = config->debug_ctrl;
     state->timebase_id = config->timebase_id;
+
+    if (state->debug_ctrl & IA32_DEBUGCTL_LBR_MASK) {
+        if (!x86_perfmon_lbr_is_supported()) {
+            TRACEF("Last branch records requested in |debug_ctrl|, but not supported\n");
+            return ZX_ERR_NOT_SUPPORTED;
+        }
+        state->request_lbr_record = true;
+    }
 
     x86_ipm_stage_fixed_config(config, state);
     x86_ipm_stage_programmable_config(config, state);
@@ -1191,7 +1304,7 @@ static ReadMiscResult read_mc_gt_freq_clamping_reasons(PerfmonState* state) {
 
 static ReadMiscResult read_mc_rp_slice_freq(PerfmonState* state) {
     uint32_t value = read_mc_value32(
-        get_mc_addr32(state, MISC_PKG_RP_SLICE_FREQ_OFFSET));
+        get_mc_addr32(state, MISC_PKG_RP_GT_SLICE_FREQ_OFFSET));
     value = (value >> 17) & 0x1ff;
     // Convert the value to Mhz.
     // We can't do floating point, and this doesn't have to be perfect.
@@ -1201,7 +1314,7 @@ static ReadMiscResult read_mc_rp_slice_freq(PerfmonState* state) {
 
 static ReadMiscResult read_mc_rp_unslice_freq(PerfmonState* state) {
     uint32_t value = read_mc_value32(
-        get_mc_addr32(state, MISC_PKG_RP_UNSLICE_FREQ_OFFSET));
+        get_mc_addr32(state, MISC_PKG_RP_GT_UNSLICE_FREQ_OFFSET));
     value = (value >> 8) & 0x1ff;
     // Convert the value to Mhz.
     // We can't do floating point, and this doesn't have to be perfect.
@@ -1209,9 +1322,9 @@ static ReadMiscResult read_mc_rp_unslice_freq(PerfmonState* state) {
     return ReadMiscResult{scaled_value, CPUPERF_RECORD_VALUE};
 }
 
-static ReadMiscResult read_mc_rp_volt(PerfmonState* state) {
+static ReadMiscResult read_mc_rp_gt_volt(PerfmonState* state) {
     uint32_t value = read_mc_value32(
-        get_mc_addr32(state, MISC_PKG_RP_VOLT_OFFSET));
+        get_mc_addr32(state, MISC_PKG_RP_GT_VOLT_OFFSET));
     return ReadMiscResult{value & 0xff, CPUPERF_RECORD_VALUE};
 }
 
@@ -1272,12 +1385,12 @@ static ReadMiscResult read_misc_event(PerfmonState* state,
         return read_mc_ia_freq_clamping_reasons(state);
     case MISC_PKG_GT_FREQ_CLAMPING_REASONS_ID:
         return read_mc_gt_freq_clamping_reasons(state);
-    case MISC_PKG_RP_SLICE_FREQ_ID:
+    case MISC_PKG_RP_GT_SLICE_FREQ_ID:
         return read_mc_rp_slice_freq(state);
-    case MISC_PKG_RP_UNSLICE_FREQ_ID:
+    case MISC_PKG_RP_GT_UNSLICE_FREQ_ID:
         return read_mc_rp_unslice_freq(state);
-    case MISC_PKG_RP_VOLT_ID:
-        return read_mc_rp_volt(state);
+    case MISC_PKG_RP_GT_VOLT_ID:
+        return read_mc_rp_gt_volt(state);
     case MISC_PKG_EDRAM_TEMP_ID:
         return read_mc_edram_temp(state);
     case MISC_PKG_PKG_TEMP_ID:
@@ -1516,6 +1629,100 @@ zx_status_t x86_ipm_start() {
 }
 
 // This is invoked via mp_sync_exec which thread safety analysis cannot follow.
+static void x86_ipm_write_last_records(PerfmonState* state, uint32_t cpu) TA_NO_THREAD_SAFETY_ANALYSIS {
+    PerfmonCpuData* data = &state->cpu_data[cpu];
+    cpuperf_record_header_t* next = data->buffer_next;
+
+    zx_time_t now = rdtsc();
+    next = x86_perfmon_write_time_record(next, CPUPERF_EVENT_ID_NONE, now);
+
+    // If the counter triggers interrupts then the PMI handler will
+    // continually reset it to its initial value. To keep things simple
+    // just always subtract out the initial value from the current value
+    // and write the difference out. For non-interrupt triggering events
+    // the user should normally initialize the counter to zero to get
+    // correct results.
+    // Counters that don't trigger interrupts could overflow and we won't
+    // necessarily catch it, but there's nothing we can do about it.
+    // We can handle the overflowed-once case, which should catch the
+    // vast majority of cases.
+    // TODO(dje): Counters that trigger interrupts should never have
+    // an overflowed value here, but that's what I'm seeing.
+
+    for (unsigned i = 0; i < state->num_used_programmable; ++i) {
+        cpuperf_event_id_t id = state->programmable_ids[i];
+        DEBUG_ASSERT(id != 0);
+        uint64_t count = read_msr(IA32_PMC_FIRST + i);
+        if (count >= state->programmable_initial_value[i]) {
+            count -= state->programmable_initial_value[i];
+        } else {
+            // The max counter value is generally not 64 bits.
+            count += (perfmon_max_programmable_counter_value -
+                      state->programmable_initial_value[i] + 1);
+        }
+        next = x86_perfmon_write_count_record(next, id, count);
+    }
+    for (unsigned i = 0; i < state->num_used_fixed; ++i) {
+        cpuperf_event_id_t id = state->fixed_ids[i];
+        DEBUG_ASSERT(id != 0);
+        unsigned hw_num = state->fixed_hw_map[i];
+        DEBUG_ASSERT(hw_num < perfmon_num_fixed_counters);
+        uint64_t count = read_msr(IA32_FIXED_CTR0 + hw_num);
+        if (count >= state->fixed_initial_value[i]) {
+            count -= state->fixed_initial_value[i];
+        } else {
+            // The max counter value is generally not 64 bits.
+            count += (perfmon_max_fixed_counter_value -
+                      state->fixed_initial_value[i] + 1);
+        }
+        next = x86_perfmon_write_count_record(next, id, count);
+    }
+    // Misc events are currently all non-cpu-specific.
+    // Just report for cpu 0. See pmi_interrupt_handler.
+    if (cpu == 0) {
+        for (unsigned i = 0; i < state->num_used_misc; ++i) {
+            cpuperf_event_id_t id = state->misc_ids[i];
+            ReadMiscResult typed_value = read_misc_event(state, id);
+            switch (typed_value.type) {
+            case CPUPERF_RECORD_COUNT:
+                next = x86_perfmon_write_count_record(next, id, typed_value.value);
+                break;
+            case CPUPERF_RECORD_VALUE:
+                next = x86_perfmon_write_value_record(next, id, typed_value.value);
+                break;
+            default:
+                __UNREACHABLE;
+            }
+        }
+    }
+
+    data->buffer_next = next;
+}
+
+// This is invoked via mp_sync_exec which thread safety analysis cannot follow.
+static void x86_ipm_finalize_buffer(PerfmonState* state, uint32_t cpu) TA_NO_THREAD_SAFETY_ANALYSIS {
+    LTRACEF("Collecting last data for cpu %u\n", cpu);
+
+    PerfmonCpuData* data = &state->cpu_data[cpu];
+    cpuperf_buffer_header_t* hdr = data->buffer_start;
+
+    // KISS. There may be enough space to write some of what we want to write
+    // here, but don't try. Just use the same simple check that
+    // |pmi_interrupt_handler()| does.
+    size_t space_needed = get_max_space_needed_for_all_records(state);
+    if (reinterpret_cast<char*>(data->buffer_next) + space_needed > data->buffer_end) {
+        hdr->flags |= CPUPERF_BUFFER_FLAG_FULL;
+        LTRACEF("Buffer overflow on cpu %u\n", cpu);
+    } else {
+        x86_ipm_write_last_records(state, cpu);
+    }
+
+    hdr->capture_end =
+        reinterpret_cast<char*>(data->buffer_next) -
+        reinterpret_cast<char*>(data->buffer_start);
+}
+
+// This is invoked via mp_sync_exec which thread safety analysis cannot follow.
 static void x86_ipm_stop_cpu_task(void* raw_context) TA_NO_THREAD_SAFETY_ANALYSIS {
     // Disable all counters ASAP.
     write_msr(IA32_PERF_GLOBAL_CTRL, 0);
@@ -1528,99 +1735,11 @@ static void x86_ipm_stop_cpu_task(void* raw_context) TA_NO_THREAD_SAFETY_ANALYSI
     auto state = reinterpret_cast<PerfmonState*>(raw_context);
     auto cpu = arch_curr_cpu_num();
     auto data = &state->cpu_data[cpu];
-    auto now = rdtsc();
 
     // Retrieve final event values and write into the trace buffer.
 
     if (data->buffer_start) {
-        LTRACEF("Collecting last data for cpu %u\n", cpu);
-        auto hdr = data->buffer_start;
-        auto next = data->buffer_next;
-        auto last =
-            reinterpret_cast<cpuperf_record_header_t*>(data->buffer_end) - 1;
-
-        next = x86_perfmon_write_time_record(next, CPUPERF_EVENT_ID_NONE, now);
-
-        // If the counter triggers interrupts then the PMI handler will
-        // continually reset it to its initial value. To keep things simple
-        // just always subtract out the initial value from the current value
-        // and write the difference out. For non-interrupt triggering events
-        // the user should normally initialize the counter to zero to get
-        // correct results.
-        // Counters that don't trigger interrupts could overflow and we won't
-        // necessarily catch it, but there's nothing we can do about it.
-        // We can handle the overflowed-once case, which should catch the
-        // vast majority of cases.
-        // TODO(dje): Counters that trigger interrupts should never have
-        // an overflowed value here, but that's what I'm seeing.
-
-        for (unsigned i = 0; i < state->num_used_programmable; ++i) {
-            if (next > last) {
-                hdr->flags |= CPUPERF_BUFFER_FLAG_FULL;
-                break;
-            }
-            cpuperf_event_id_t id = state->programmable_ids[i];
-            DEBUG_ASSERT(id != 0);
-            uint64_t count = read_msr(IA32_PMC_FIRST + i);
-            if (count >= state->programmable_initial_value[i]) {
-                count -= state->programmable_initial_value[i];
-            } else {
-                // The max counter value is generally not 64 bits.
-                count += (perfmon_max_programmable_counter_value -
-                          state->programmable_initial_value[i] + 1);
-            }
-            next = x86_perfmon_write_count_record(next, id, count);
-        }
-        for (unsigned i = 0; i < state->num_used_fixed; ++i) {
-            if (next > last) {
-                hdr->flags |= CPUPERF_BUFFER_FLAG_FULL;
-                break;
-            }
-            cpuperf_event_id_t id = state->fixed_ids[i];
-            DEBUG_ASSERT(id != 0);
-            unsigned hw_num = state->fixed_hw_map[i];
-            DEBUG_ASSERT(hw_num < perfmon_num_fixed_counters);
-            uint64_t count = read_msr(IA32_FIXED_CTR0 + hw_num);
-            if (count >= state->fixed_initial_value[i]) {
-                count -= state->fixed_initial_value[i];
-            } else {
-                // The max counter value is generally not 64 bits.
-                count += (perfmon_max_fixed_counter_value -
-                          state->fixed_initial_value[i] + 1);
-            }
-            next = x86_perfmon_write_count_record(next, id, count);
-        }
-        // Misc events are currently all non-cpu-specific.
-        // Just report for cpu 0. See pmi_interrupt_handler.
-        if (cpu == 0) {
-            for (unsigned i = 0; i < state->num_used_misc; ++i) {
-                if (next > last) {
-                    hdr->flags |= CPUPERF_BUFFER_FLAG_FULL;
-                    break;
-                }
-                cpuperf_event_id_t id = state->misc_ids[i];
-                ReadMiscResult typed_value = read_misc_event(state, id);
-                switch (typed_value.type) {
-                case CPUPERF_RECORD_COUNT:
-                    next = x86_perfmon_write_count_record(next, id, typed_value.value);
-                    break;
-                case CPUPERF_RECORD_VALUE:
-                    next = x86_perfmon_write_value_record(next, id, typed_value.value);
-                    break;
-                default:
-                    __UNREACHABLE;
-                }
-            }
-        }
-
-        data->buffer_next = next;
-        hdr->capture_end =
-            reinterpret_cast<char*>(data->buffer_next) -
-            reinterpret_cast<char*>(data->buffer_start);
-
-        if (hdr->flags & CPUPERF_BUFFER_FLAG_FULL) {
-            LTRACEF("Buffer overflow on cpu %u\n", cpu);
-        }
+        x86_ipm_finalize_buffer(state, cpu);
     }
 
     x86_perfmon_clear_overflow_indicators();
@@ -1700,8 +1819,43 @@ zx_status_t x86_ipm_fini() {
 
     return ZX_OK;
 }
-
+
 // Interrupt handling.
+
+// Write out a |cpuperf_last_branch_record_t| record.
+static cpuperf_record_header_t* x86_perfmon_write_last_branches(
+        PerfmonState* state, uint64_t cr3, cpuperf_record_header_t* hdr,
+        cpuperf_event_id_t id) {
+    auto rec = reinterpret_cast<cpuperf_last_branch_record_t*>(hdr);
+    auto num_entries = perfmon_lbr_stack_size;
+    static_assert(CPUPERF_MAX_NUM_LAST_BRANCH ==
+                  countof(cpuperf_last_branch_record_t::branches), "");
+    DEBUG_ASSERT(num_entries > 0 && num_entries <= CPUPERF_MAX_NUM_LAST_BRANCH);
+    x86_perfmon_write_header(&rec->header, CPUPERF_RECORD_LAST_BRANCH, id);
+    rec->num_branches = num_entries;
+    rec->aspace = cr3;
+
+    auto branches = &rec->branches[0];
+    unsigned tos = ((read_msr(SKL_LAST_BRANCH_TOS) & IA32_LBR_TOS_TOS_MASK) >>
+                    IA32_LBR_TOS_TOS_SHIFT);
+    for (unsigned i = 0; i < num_entries; ++i) {
+        unsigned msr_offset = (tos - i) % num_entries;
+        branches[i].from = read_msr(SKL_LAST_BRANCH_FROM_0 + msr_offset);
+        branches[i].to = read_msr(SKL_LAST_BRANCH_TO_0 + msr_offset);
+        uint64_t info = read_msr(SKL_LAST_BRANCH_INFO_0 + msr_offset);
+        // Only write these bits out.
+        info &= (IA32_LBR_INFO_CYCLE_COUNT_MASK | IA32_LBR_INFO_MISPRED_MASK);
+        branches[i].info = info;
+    }
+
+    // Get a pointer to the end of this record. Since this record is
+    // variable length it's more complicated than just "rec + 1".
+    auto next = reinterpret_cast<cpuperf_record_header_t*>(
+        reinterpret_cast<char*>(rec) + CPUPERF_LAST_BRANCH_RECORD_SIZE(rec));
+    LTRACEF("LBR record: num branches %u, @%p, next @%p\n",
+            num_entries, hdr, next);
+    return next;
+}
 
 // Helper function so that there is only one place where we enable/disable
 // interrupts (our caller).
@@ -1717,17 +1871,13 @@ static bool pmi_interrupt_handler(x86_iframe_t *frame, PerfmonState* state) {
 
     // On x86 zx_ticks_get uses rdtsc.
     zx_time_t now = rdtsc();
-    LTRACEF("cpu %u: now %" PRIu64 ", sp %p\n", cpu, now, __GET_FRAME());
+    LTRACEF("cpu %u: now %" PRIi64 ", sp %p\n", cpu, now, __GET_FRAME());
 
     // Rather than continually checking if we have enough space, just
     // conservatively check for the maximum amount we'll need.
-    size_t space_needed = (sizeof(cpuperf_time_record_t) +
-                           (state->num_used_programmable +
-                            state->num_used_fixed +
-                            state->num_used_misc) *
-                           kMaxEventRecordSize);
+    size_t space_needed = get_max_space_needed_for_all_records(state);
     if (reinterpret_cast<char*>(data->buffer_next) + space_needed > data->buffer_end) {
-        TRACEF("cpu %u: @%" PRIu64 " pmi buffer full\n", cpu, now);
+        TRACEF("cpu %u: @%" PRIi64 " pmi buffer full\n", cpu, now);
         data->buffer_start->flags |= CPUPERF_BUFFER_FLAG_FULL;
         return false;
     }
@@ -1749,6 +1899,10 @@ static bool pmi_interrupt_handler(x86_iframe_t *frame, PerfmonState* state) {
 
         auto next = data->buffer_next;
         bool saw_timebase = false;
+        bool request_lbr = false;
+        // We can't record every event that requested LBR data.
+        // It is unspecified which one we pick.
+        cpuperf_event_id_t lbr_id = CPUPERF_EVENT_ID_NONE;
 
         next = x86_perfmon_write_time_record(next, CPUPERF_EVENT_ID_NONE, now);
 
@@ -1775,6 +1929,10 @@ static bool pmi_interrupt_handler(x86_iframe_t *frame, PerfmonState* state) {
             } else {
                 next = x86_perfmon_write_tick_record(next, id);
             }
+            if (state->programmable_flags[i] & IPM_CONFIG_FLAG_LBR) {
+                request_lbr = true;
+                lbr_id = id;
+            }
             LTRACEF("cpu %u: resetting PMC %u to 0x%" PRIx64 "\n",
                     cpu, i, state->programmable_initial_value[i]);
             write_msr(IA32_PMC_FIRST + i, state->programmable_initial_value[i]);
@@ -1798,6 +1956,10 @@ static bool pmi_interrupt_handler(x86_iframe_t *frame, PerfmonState* state) {
                 next = x86_perfmon_write_pc_record(next, id, cr3, frame->ip);
             } else {
                 next = x86_perfmon_write_tick_record(next, id);
+            }
+            if (state->fixed_flags[i] & IPM_CONFIG_FLAG_LBR) {
+                request_lbr = true;
+                lbr_id = id;
             }
             LTRACEF("cpu %u: resetting FIXED %u to 0x%" PRIx64 "\n",
                     cpu, hw_num, state->fixed_initial_value[i]);
@@ -1865,6 +2027,10 @@ static bool pmi_interrupt_handler(x86_iframe_t *frame, PerfmonState* state) {
             }
         }
 
+        if (request_lbr) {
+            next = x86_perfmon_write_last_branches(state, cr3, next, lbr_id);
+        }
+
         data->buffer_next = next;
     }
 
@@ -1926,7 +2092,7 @@ void apic_pmi_interrupt_handler(x86_iframe_t *frame) TA_NO_THREAD_SAFETY_ANALYSI
     // TODO(dje): We may want this anyway. If we want to be able to handle
     // page faults inside this handler we'll need to turn interrupts back
     // on. At the moment we can't do this as we don't handle recursive PMIs.
-    arch_set_in_int_handler(false);
+    arch_set_blocking_disallowed(false);
     arch_enable_ints();
 #endif
 
@@ -1934,7 +2100,7 @@ void apic_pmi_interrupt_handler(x86_iframe_t *frame) TA_NO_THREAD_SAFETY_ANALYSI
 
 #if 0
     arch_disable_ints();
-    arch_set_in_int_handler(true);
+    arch_set_blocking_disallowed(true);
 #endif
 
     // This is done here instead of in the caller so that we have full control

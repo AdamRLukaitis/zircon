@@ -6,7 +6,10 @@
 
 #ifndef __ASSEMBLER__
 
-#if __GNUC__ || defined(__clang__)
+#if !defined(__GNUC__) && !defined(__clang__)
+#error "Unrecognized compiler!"
+#endif
+
 #define likely(x)       __builtin_expect(!!(x), 1)
 #define unlikely(x)     __builtin_expect(!!(x), 0)
 #define __UNUSED __attribute__((__unused__))
@@ -30,6 +33,7 @@
 #define __SRAM __NO_INLINE __SECTION(".sram.text")
 #define __CONSTRUCTOR __attribute__((__constructor__))
 #define __DESTRUCTOR __attribute__((__destructor__))
+#define __RESTRICT __restrict
 
 #ifndef __clang__
 #define __LEAF_FN __attribute__((__leaf__))
@@ -42,11 +46,7 @@
 #define __LEAF_FN
 #define __OPTIMIZE(x)
 #define __EXTERNALLY_VISIBLE
-#ifndef DISABLE_THREAD_ANNOTATIONS
 #define __THREAD_ANNOTATION(x) __attribute__((x))
-#else
-#define __THREAD_ANNOTATION(x)
-#endif
 #define __NO_SAFESTACK __attribute__((__no_sanitize__("safe-stack")))
 #endif
 
@@ -61,6 +61,16 @@
 #define __LOCAL  __attribute__ ((__visibility__("hidden")))
 #define __THREAD __thread
 #define __offsetof(type, field) __builtin_offsetof(type, field)
+
+#if defined(__cplusplus) && __cplusplus >= 201703L
+#define __FALLTHROUGH [[fallthrough]]
+#elif defined(__cplusplus) && defined(__clang__)
+#define __FALLTHROUGH [[clang::fallthrough]]
+#elif __GNUC__ >= 7
+#define __FALLTHROUGH __attribute__((__fallthrough__))
+#else
+#define __FALLTHROUGH do {} while (0)
+#endif
 
 // Publicly exposed thread annotation macros. These have a long and ugly name to
 // minimize the chance of collision with consumers of Zircon's public headers.
@@ -77,64 +87,16 @@
 #define __TA_SCOPED_CAPABILITY __THREAD_ANNOTATION(__scoped_lockable__)
 #define __TA_NO_THREAD_SAFETY_ANALYSIS __THREAD_ANNOTATION(__no_thread_safety_analysis__)
 
-#define __DEPRECATE __attribute__((__deprecated__))
-
-#if ENABLE_DDK_DEPRECATIONS
-#define __DDK_DEPRECATE __DEPRECATE
-#else
-#define __DDK_DEPRECATE
-#endif
-
-#else  // if __GNUC__ || defined(__clang__)
-
-#warning "Unrecognized compiler!  Please update global/include/compiler.h"
-
-#define likely(x)
-#define unlikely(x)
-#define __UNUSED
-#define __USED
-#define __PACKED
-#define __ALIGNED(x)
-#define __PRINTFLIKE(__fmt,__varargs)
-#define __SCANFLIKE(__fmt,__varargs)
-#define __SECTION(x)
-#define __PURE
-#define __LEAF_FN
-#define __CONST
-#define __NO_RETURN
-#define __MALLOC
-#define __WEAK
-#define __GNU_INLINE
-#define __GET_CALLER(x)
-#define __GET_FRAME(x)
-#define __NAKED
-#define __ISCONSTANT(x)
-#define __NO_INLINE
-#define __SRAM
-#define __CONSTRUCTOR
-#define __DESTRUCTOR
-#define __OPTIMIZE(x)
-#define __ALWAYS_INLINE
-#define __MAY_ALIAS
-#define __NONNULL(x)
-#define __WARN_UNUSED_RESULT
-#define __EXTERNALLY_VISIBLE
-#define __UNREACHABLE
-#define __WEAK_ALIAS(x)
-#define __ALIAS(x)
-#define __EXPORT
-#define __LOCAL
-#define __THREAD
-
-#if !defined __DEPRECATE
-#define __DEPRECATE
-#endif
-
-#endif  // if __GNUC__ || defined(__clang__)
 #endif  // ifndef __ASSEMBLER__
 
+#if !defined(__DEPRECATE)
+#define __DEPRECATE __attribute__((__deprecated__))
+#endif
+
 /* TODO: add type check */
+#if !defined(countof)
 #define countof(a) (sizeof(a) / sizeof((a)[0]))
+#endif
 
 /* CPP header guards */
 #ifdef __cplusplus

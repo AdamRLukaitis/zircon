@@ -2,8 +2,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#pragma once
+
 #include <stdbool.h>
 #include <stdint.h>
+
+#include <zircon/compiler.h>
 
 #define GPT_MAGIC (0x5452415020494645ull) // 'EFI PART'
 #define GPT_HEADER_SIZE 0x5c
@@ -27,7 +31,7 @@ typedef struct gpt_header {
     uint32_t entries_count;
     uint32_t entries_size;
     uint32_t entries_crc;
-} gpt_header_t;
+} __PACKED gpt_header_t;
 
 typedef struct gpt_entry {
     uint8_t type[GPT_GUID_LEN];
@@ -36,7 +40,7 @@ typedef struct gpt_entry {
     uint64_t last;
     uint64_t flags;
     uint8_t name[GPT_NAME_LEN];  // UTF-16 on disk
-} gpt_entry_t;
+} __PACKED gpt_entry_t;
 
 #define GUID_EMPTY_VALUE {                         \
     0x00, 0x00, 0x00, 0x00,                        \
@@ -117,4 +121,28 @@ typedef struct gpt_entry {
     0xef, 0x2d, \
     0xbe, 0x46, \
     0xa8, 0x0c, 0xa2, 0x06, 0x7c, 0x37, 0xcd, 0x49 \
+}
+
+#define GUID_SYS_CONFIG_STRING "4E5E989E-4C86-11E8-A15B-480FCF35F8E6"
+#define GUID_SYS_CONFIG_VALUE { \
+    0x9e, 0x98, 0x5e, 0x4e,                        \
+    0x86, 0x4c,                                    \
+    0xe8, 0x11,                                    \
+    0xa1, 0x5b, 0x48, 0x0f, 0xcf, 0x35, 0xf8, 0xe6 \
+}
+
+#define GUID_FACTORY_CONFIG_STRING "5A3A90BE-4C86-11E8-A15B-480FCF35F8E6"
+#define GUID_FACTORY_CONFIG_VALUE { \
+    0xbe, 0x90, 0x3a, 0x5a,                        \
+    0x86, 0x4c,                                    \
+    0xe8, 0x11,                                    \
+    0xa1, 0x5b, 0x48, 0x0f, 0xcf, 0x35, 0xf8, 0xe6 \
+}
+
+#define GUID_BOOTLOADER_STRING "5ECE94FE-4C86-11E8-A15B-480FCF35F8E6"
+#define GUID_BOOTLOADER_VALUE { \
+    0xfe, 0x94, 0xce, 0x5e,                        \
+    0x86, 0x4c,                                    \
+    0xe8, 0x11,                                    \
+    0xa1, 0x5b, 0x48, 0x0f, 0xcf, 0x35, 0xf8, 0xe6 \
 }

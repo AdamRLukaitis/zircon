@@ -2,28 +2,29 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include <fcntl.h>
-#include <launchpad/launchpad.h>
-#include <launchpad/vmo.h>
-#include <limits.h>
-#include <zircon/process.h>
-#include <zircon/processargs.h>
-#include <zircon/process.h>
-#include <zircon/syscalls.h>
-#include <zircon/syscalls/object.h>
-#include <zircon/types.h>
-#include <math.h>
-#include <fdio/io.h>
 #include <fbl/algorithm.h>
 #include <fbl/array.h>
 #include <fbl/auto_call.h>
 #include <fbl/unique_ptr.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <lib/fdio/io.h>
+#include <lib/fdio/spawn.h>
+#include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include <zircon/process.h>
+#include <zircon/processargs.h>
+#include <zircon/process.h>
+#include <zircon/syscalls.h>
+#include <zircon/syscalls/object.h>
+#include <zircon/types.h>
 
 struct ReportInfo {
     uintptr_t exec_addr = 0;
@@ -43,7 +44,7 @@ unsigned int AnalyzeField(const fbl::Array<ReportInfo>& reports,
 double ApproxBinomialCdf(double p, double N, double n);
 int TestRunMain(int argc, char** argv);
 zx_status_t LaunchTestRun(const char* bin, zx_handle_t h, zx_handle_t* out);
-int JoinProcess(zx_handle_t proc);
+int64_t JoinProcess(zx_handle_t proc);
 } // namespace
 
 int main(int argc, char** argv) {
@@ -169,12 +170,12 @@ int GatherReports(const char* test_bin, fbl::Array<ReportInfo>* reports) {
             return -1;
         }
 
-        int ret = JoinProcess(proc);
+        int64_t ret = JoinProcess(proc);
         zx_handle_close(proc);
 
         if (ret != 0) {
             zx_handle_close(handles[0]);
-            printf("Failed to join testrun: %d\n", ret);
+            printf("Failed to join testrun: %" PRId64 "\n", ret);
             return -1;
         }
 
@@ -195,7 +196,7 @@ int GatherReports(const char* test_bin, fbl::Array<ReportInfo>* reports) {
 
 int TestRunMain(int argc, char** argv) {
     zx_handle_t report_pipe =
-        zx_get_startup_handle(PA_HND(PA_USER1, 0));
+        zx_take_startup_handle(PA_HND(PA_USER1, 0));
 
     ReportInfo report;
 
@@ -217,38 +218,26 @@ int TestRunMain(int argc, char** argv) {
 }
 
 // This function unconditionally consumes the handle h.
-zx_status_t LaunchTestRun(const char* bin, zx_handle_t h, zx_handle_t* out) {
-    launchpad_t* lp;
-    zx_handle_t proc;
-    zx_handle_t hnd[1];
-    zx_handle_t job;
-    uint32_t ids[1];
-    const char* args[] = {bin, "testrun"};
-    const char* errmsg;
+zx_status_t LaunchTestRun(const char* bin, zx_handle_t h, zx_handle_t* proc) {
+    const char* argv[] = {bin, "testrun", nullptr};
 
-    zx_status_t status = zx_handle_duplicate(zx_job_default(), ZX_RIGHT_SAME_RIGHTS, &job);
-    if (status != ZX_OK) {
-        return status;
-    }
+    fdio_spawn_action_t actions[2];
+    actions[0].action = FDIO_SPAWN_ACTION_SET_NAME;
+    actions[0].name.data = "testrun";
+    actions[1].action = FDIO_SPAWN_ACTION_ADD_HANDLE;
+    actions[1].h = {.id = PA_USER1, .handle = h};
 
-    ids[0] = PA_USER1;
-    hnd[0] = h;
-    launchpad_create(job, "testrun", &lp);
-    launchpad_load_from_file(lp, bin);
-    launchpad_set_args(lp, static_cast<int>(fbl::count_of(args)), args);
-    launchpad_add_handles(lp, fbl::count_of(hnd), hnd, ids);
+    char err_msg[FDIO_SPAWN_ERR_MSG_MAX_LENGTH];
+    zx_status_t status = fdio_spawn_etc(ZX_HANDLE_INVALID, FDIO_SPAWN_CLONE_LDSVC, bin, argv,
+                                        nullptr, fbl::count_of(actions), actions, proc, err_msg);
 
-    status = launchpad_go(lp, &proc, &errmsg);
-    if (status != ZX_OK) {
-        printf("launch failed (%d): %s\n", status, errmsg);
-        return status;
-    }
+    if (status != ZX_OK)
+        printf("launch failed (%d): %s\n", status, err_msg);
 
-    *out = proc;
     return ZX_OK;
 }
 
-int JoinProcess(zx_handle_t proc) {
+int64_t JoinProcess(zx_handle_t proc) {
     zx_status_t status =
         zx_object_wait_one(proc, ZX_PROCESS_TERMINATED, ZX_TIME_INFINITE, NULL);
     if (status != ZX_OK) {

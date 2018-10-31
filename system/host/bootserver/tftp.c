@@ -67,7 +67,8 @@ err:
 tftp_status file_read(void* data, size_t* length, off_t offset, void* cookie) {
     xferdata* xd = cookie;
     if (xd->fd < 0) {
-        if ((offset > xd->datalen) || (offset + *length > xd->datalen)) {
+        if (((size_t)offset > xd->datalen) ||
+            (offset + *length > xd->datalen)) {
             return TFTP_ERR_IO;
         }
         memcpy(data, &xd->data[offset], *length);
@@ -211,13 +212,19 @@ int tftp_xfer(struct sockaddr_in6* addr, const char* fn, const char* name) {
     if (!strcmp(fn, "(cmdline)")) {
         xd.data = name;
         xd.datalen = strlen(name) + 1;
-        name = use_filename_prefix ? NB_CMDLINE_FILENAME : "cmdline";
+        name = NB_CMDLINE_FILENAME;
     }
 
     void* session_data = NULL;
     char* inbuf = NULL;
     char* outbuf = NULL;
 
+    transport_state ts = {
+        .socket = -1,
+        .connected = false,
+        .previous_timeout_ms = 0,
+        .target_addr = {0},
+    };
     tftp_session* session = NULL;
     size_t session_data_sz = tftp_sizeof_session();
 
@@ -236,7 +243,6 @@ int tftp_xfer(struct sockaddr_in6* addr, const char* fn, const char* name) {
     tftp_file_interface file_ifc = {file_open_read, NULL, file_read, NULL, file_close};
     tftp_session_set_file_interface(session, &file_ifc);
 
-    transport_state ts;
     if (transport_init(&ts, INITIAL_CONNECTION_TIMEOUT, addr) < 0) {
         goto done;
     }
@@ -272,6 +278,9 @@ int tftp_xfer(struct sockaddr_in6* addr, const char* fn, const char* name) {
     }
 
 done:
+    if (ts.socket >= 0) {
+        close(ts.socket);
+    }
     if (session_data) {
         free(session_data);
     }

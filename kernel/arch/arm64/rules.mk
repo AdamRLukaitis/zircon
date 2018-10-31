@@ -19,9 +19,10 @@ MODULE_SRCS += \
 	$(LOCAL_DIR)/exceptions_c.cpp \
 	$(LOCAL_DIR)/feature.cpp \
 	$(LOCAL_DIR)/fpu.cpp \
-	$(LOCAL_DIR)/header.S \
 	$(LOCAL_DIR)/mexec.S \
 	$(LOCAL_DIR)/mmu.cpp \
+	$(LOCAL_DIR)/periphmap.cpp \
+	$(LOCAL_DIR)/smccc.S \
 	$(LOCAL_DIR)/spinlock.cpp \
 	$(LOCAL_DIR)/start.S \
 	$(LOCAL_DIR)/sysreg.cpp \
@@ -33,17 +34,17 @@ MODULE_SRCS += \
 MODULE_DEPS += \
 	kernel/dev/iommu/dummy \
 	kernel/lib/bitmap \
+	kernel/lib/crashlog \
 	kernel/object \
 
 KERNEL_DEFINES += \
 	ARM_ISA_ARMV8=1 \
 	ARM_ISA_ARMV8A=1
 
-# unless otherwise specified, limit to 2 clusters and 8 CPUs per cluster
-SMP_CPU_MAX_CLUSTERS ?= 2
-SMP_CPU_MAX_CLUSTER_CPUS ?= 8
-
 SMP_MAX_CPUS ?= 16
+
+SMP_CPU_MAX_CLUSTERS ?= 2
+SMP_CPU_MAX_CLUSTER_CPUS ?= $(SMP_MAX_CPUS)
 
 MODULE_SRCS += \
 	$(LOCAL_DIR)/mp.cpp
@@ -65,7 +66,9 @@ GLOBAL_DEFINES += \
 	USER_ASPACE_SIZE=$(USER_ASPACE_SIZE)
 
 # kernel is linked to run at the arbitrary address of -4GB
+# peripherals will be mapped just below this mark
 KERNEL_BASE := 0xffffffff00000000
+BOOT_HEADER_SIZE ?= 0x50
 
 KERNEL_DEFINES += \
 	KERNEL_BASE=$(KERNEL_BASE) \
@@ -85,6 +88,9 @@ GLOBAL_LDFLAGS += -m aarch64elf
 GLOBAL_MODULE_LDFLAGS += -m aarch64elf
 endif
 GLOBAL_LDFLAGS += -z max-page-size=4096
+
+# The linker writes instructions to work around a CPU bug.
+GLOBAL_LDFLAGS += --fix-cortex-a53-843419
 
 # kernel hard disables floating point
 KERNEL_COMPILEFLAGS += -mgeneral-regs-only

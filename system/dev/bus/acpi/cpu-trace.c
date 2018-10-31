@@ -5,7 +5,7 @@
 #include <ddk/binding.h>
 #include <ddk/debug.h>
 #include <ddk/device.h>
-#include <ddk/protocol/platform-defs.h>
+#include <ddk/platform-defs.h>
 #include <ddk/protocol/platform-device.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,18 +35,17 @@ static zx_status_t cpu_trace_get_device_info(void* ctx, pdev_device_info_t* out_
     return ZX_OK;
 }
 
-static zx_status_t cpu_trace_map_mmio(void* ctx, uint32_t index, uint32_t cache_policy,
-                                      void** out_vaddr, size_t* out_size, zx_handle_t* out_handle) {
+static zx_status_t cpu_trace_get_mmio(void* ctx, uint32_t index, pdev_mmio_t* mmio) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
-static zx_status_t cpu_trace_map_interrupt(void* ctx, uint32_t index, zx_handle_t* out_handle) {
+static zx_status_t cpu_trace_get_interrupt(void* ctx, uint32_t index, uint32_t flags, zx_handle_t* out_handle) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
-static platform_device_protocol_ops_t cpu_trace_proto_ops = {
-    .map_mmio = cpu_trace_map_mmio,
-    .map_interrupt = cpu_trace_map_interrupt,
+static pdev_protocol_ops_t cpu_trace_proto_ops = {
+    .get_mmio = cpu_trace_get_mmio,
+    .get_interrupt = cpu_trace_get_interrupt,
     .get_bti = cpu_trace_get_bti,
     .get_device_info = cpu_trace_get_device_info,
 };
@@ -80,7 +79,7 @@ zx_status_t publish_cpu_trace(zx_handle_t bti, zx_device_t* sys_root) {
         .name = "cpu-trace",
         .ctx = dev,
         .ops = &cpu_trace_dev_proto,
-        .proto_id = ZX_PROTOCOL_PLATFORM_DEV,
+        .proto_id = ZX_PROTOCOL_PDEV,
         .proto_ops = &cpu_trace_proto_ops,
         .props = props,
         .prop_count = countof(props),

@@ -10,7 +10,7 @@
 #include <object/handle.h>
 #include <object/port_dispatcher.h>
 #include <object/process_dispatcher.h>
-#include <object/resources.h>
+#include <object/resource.h>
 #include <object/vcpu_dispatcher.h>
 #include <object/vm_object_dispatcher.h>
 
@@ -18,8 +18,9 @@
 
 #include "priv.h"
 
-zx_status_t sys_guest_create(zx_handle_t resource, uint32_t options, zx_handle_t physmem_vmo,
-                             user_out_handle* out) {
+// zx_status_t zx_guest_create
+zx_status_t sys_guest_create(zx_handle_t resource, uint32_t options, user_out_handle* guest_handle,
+                             user_out_handle* vmar_handle) {
     if (options != 0u)
         return ZX_ERR_INVALID_ARGS;
 
@@ -27,21 +28,20 @@ zx_status_t sys_guest_create(zx_handle_t resource, uint32_t options, zx_handle_t
     if (status != ZX_OK)
         return status;
 
-    auto up = ProcessDispatcher::GetCurrent();
-    fbl::RefPtr<VmObjectDispatcher> physmem;
-    zx_rights_t rights = ZX_RIGHT_READ | ZX_RIGHT_WRITE | ZX_RIGHT_EXECUTE;
-    status = up->GetDispatcherWithRights(physmem_vmo, rights, &physmem);
+    fbl::RefPtr<Dispatcher> guest_dispatcher, vmar_dispatcher;
+    zx_rights_t guest_rights, vmar_rights;
+    status =
+        GuestDispatcher::Create(&guest_dispatcher, &guest_rights, &vmar_dispatcher, &vmar_rights);
     if (status != ZX_OK)
         return status;
 
-    fbl::RefPtr<Dispatcher> dispatcher;
-    status = GuestDispatcher::Create(physmem->vmo(), &dispatcher, &rights);
+    status = guest_handle->make(fbl::move(guest_dispatcher), guest_rights);
     if (status != ZX_OK)
         return status;
-
-    return out->make(fbl::move(dispatcher), rights);
+    return vmar_handle->make(fbl::move(vmar_dispatcher), vmar_rights);
 }
 
+// zx_status_t zx_guest_set_trap
 zx_status_t sys_guest_set_trap(zx_handle_t guest_handle, uint32_t kind, zx_vaddr_t addr, size_t len,
                                zx_handle_t port_handle, uint64_t key) {
     auto up = ProcessDispatcher::GetCurrent();
@@ -61,6 +61,7 @@ zx_status_t sys_guest_set_trap(zx_handle_t guest_handle, uint32_t kind, zx_vaddr
     return guest->SetTrap(kind, addr, len, fbl::move(port), key);
 }
 
+// zx_status_t zx_vcpu_create
 zx_status_t sys_vcpu_create(zx_handle_t guest_handle, uint32_t options,
                             zx_vaddr_t entry, user_out_handle* out) {
     if (options != 0u)
@@ -68,7 +69,7 @@ zx_status_t sys_vcpu_create(zx_handle_t guest_handle, uint32_t options,
 
     auto up = ProcessDispatcher::GetCurrent();
     fbl::RefPtr<GuestDispatcher> guest;
-    zx_status_t status = up->GetDispatcherWithRights(guest_handle, ZX_RIGHT_WRITE, &guest);
+    zx_status_t status = up->GetDispatcherWithRights(guest_handle, ZX_RIGHT_MANAGE_PROCESS, &guest);
     if (status != ZX_OK)
         return status;
 
@@ -81,6 +82,7 @@ zx_status_t sys_vcpu_create(zx_handle_t guest_handle, uint32_t options,
     return out->make(fbl::move(dispatcher), rights);
 }
 
+// zx_status_t zx_vcpu_resume
 zx_status_t sys_vcpu_resume(zx_handle_t vcpu_handle, user_out_ptr<zx_port_packet_t> user_packet) {
     auto up = ProcessDispatcher::GetCurrent();
 
@@ -101,6 +103,7 @@ zx_status_t sys_vcpu_resume(zx_handle_t vcpu_handle, user_out_ptr<zx_port_packet
     return ZX_OK;
 }
 
+// zx_status_t zx_vcpu_interrupt
 zx_status_t sys_vcpu_interrupt(zx_handle_t vcpu_handle, uint32_t vector) {
     auto up = ProcessDispatcher::GetCurrent();
 
@@ -112,8 +115,9 @@ zx_status_t sys_vcpu_interrupt(zx_handle_t vcpu_handle, uint32_t vector) {
     return vcpu->Interrupt(vector);
 }
 
+// zx_status_t zx_vcpu_read_state
 zx_status_t sys_vcpu_read_state(zx_handle_t vcpu_handle, uint32_t kind,
-                                user_out_ptr<void> user_buffer, uint32_t len) {
+                                user_out_ptr<void> user_buffer, size_t len) {
     auto up = ProcessDispatcher::GetCurrent();
 
     fbl::RefPtr<VcpuDispatcher> vcpu;
@@ -133,8 +137,9 @@ zx_status_t sys_vcpu_read_state(zx_handle_t vcpu_handle, uint32_t kind,
     return ZX_OK;
 }
 
+// zx_status_t zx_vcpu_write_state
 zx_status_t sys_vcpu_write_state(zx_handle_t vcpu_handle, uint32_t kind,
-                                 user_in_ptr<const void> user_buffer, uint32_t len) {
+                                 user_in_ptr<const void> user_buffer, size_t len) {
     auto up = ProcessDispatcher::GetCurrent();
 
     fbl::RefPtr<VcpuDispatcher> vcpu;

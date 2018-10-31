@@ -14,23 +14,26 @@
 class InterruptEventDispatcher final : public InterruptDispatcher {
 public:
     static zx_status_t Create(fbl::RefPtr<Dispatcher>* dispatcher,
-                              zx_rights_t* rights);
+                              zx_rights_t* rights,
+                              uint32_t vector,
+                              uint32_t options);
 
     InterruptEventDispatcher(const InterruptDispatcher &) = delete;
     InterruptEventDispatcher& operator=(const InterruptDispatcher &) = delete;
 
-    zx_status_t Bind(uint32_t slot, uint32_t vector, uint32_t options) final;
-
 protected:
-    void MaskInterrupt(uint32_t vector) final;
-    void UnmaskInterrupt(uint32_t vector) final;
-    zx_status_t RegisterInterruptHandler(uint32_t vector, void* data) final;
-    void UnregisterInterruptHandler(uint32_t vector) final;
+    void MaskInterrupt() final;
+    void UnmaskInterrupt() final;
+    void UnregisterInterruptHandler() final;
 
 private:
-    explicit InterruptEventDispatcher() {}
+    explicit InterruptEventDispatcher(uint32_t vector)
+        : vector_(vector) {}
+    zx_status_t RegisterInterruptHandler();
 
     static void IrqHandler(void* ctx);
+
+    const uint32_t vector_;
 
     fbl::Canary<fbl::magic("INED")> canary_;
 };
